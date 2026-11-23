@@ -66,4 +66,4 @@ if ! grep -q 'posthaste smoke: first frame rendered' "$log"; then
     exit 1
 fi
 
-grep 'posthaste smoke: first frame rendered' "$log"
+grep -E 'posthaste smoke: first frame rendered|resolved (ui|mono) font family' "$log"

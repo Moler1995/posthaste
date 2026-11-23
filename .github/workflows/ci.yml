@@ -122,6 +122,10 @@ jobs:
       - name: Runtime smoke (virtual display)
         if: runner.os == 'Linux'
         timeout-minutes: 5
+        # info makes the launch log name the font families it selected, which
+        # is the other thing this job should show.
+        env:
+          RUST_LOG: info
         run: |
           xvfb-run -a -s "-screen 0 1280x800x24" sh -c '
             openbox >/dev/null 2>&1 &
@@ -132,6 +136,8 @@ jobs:
       - name: Runtime smoke
         if: runner.os == 'macOS'
         timeout-minutes: 5
+        env:
+          RUST_LOG: info
         run: sh scripts/smoke-launch.sh target/debug/posthaste
 
       - name: Shim tests
