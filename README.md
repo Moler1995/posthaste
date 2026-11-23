@@ -60,17 +60,33 @@ no telemetry.
 Posthaste is a native GPUI application: no browser engine or web runtime sits
 between the process and the window.
 
-| Startup | Time |
+| Scenario | Time |
 | --- | --- |
-| Warm start, median of 15 launches | **235 ms** |
-| Warm start, observed range | 228–267 ms |
+| Launch with an empty workspace | **303 ms** (median of 10 launches, 296–314 ms) |
+| First open of a 4,000-request workspace | **7.5 s** (7.4 s, 7.5 s, 7.6 s on three fresh copies) |
+| Open of that workspace once indexed | **679 ms** (median of 10 launches, 664–709 ms) |
+
+Times run from process creation to the app being ready for input. The window
+frame appears earlier, while the workspace is still loading, so window
+appearance is not used as the end point. The large workspace held 80
+collections and 4,000 requests as plain JSON — 18 MB across about 4,100 files.
+Its first open parses every request file and writes a per-workspace index;
+later opens read the index and parse only what changed. In a first open the
+process used about one second of CPU and read 8.6 MB, so most of the wait is
+per-file I/O, most likely Windows Defender's on-access scanning.
 
 Measured on an Intel Core i5-10400 (6 cores), 32 GB RAM, a SATA hard disk, and
-Windows 10 (build 18363), on the `dist` release build with an empty workspace —
-from process creation to the main window appearing. A first launch after a
-reboot or install is slower, while the OS loads the 35 MB executable from disk.
-Reproduce on your own machine with `pwsh scripts/bench-startup.ps1`; it uses a
-temporary workspace and does not read or write your own data.
+Windows 10 (build 18363), on the `dist` release build. A cold start — the first
+launch after a reboot or install, with the executable not in the file cache —
+is not reported: flushing that cache reliably needs administrator rights, so it
+cannot be measured from an ordinary shell.
+
+Reproduce on your own machine with `pwsh scripts/bench-startup.ps1` for the
+empty workspace, or add `-Workspace <path>` to open a workspace of your own
+(`-Runs 1 -SkipWarmup` measures a first open). The script opens a temporary
+workspace and redirects preferences, recents, and cookies, so it leaves no
+state in your own; the one exception is the per-workspace request index, which
+the app writes under the platform cache directory by design.
 
 ## Download
 

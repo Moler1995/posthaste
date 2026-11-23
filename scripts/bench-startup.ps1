@@ -5,8 +5,9 @@
 
 .DESCRIPTION
     Launches the executable once to warm the file cache, then runs it a number
-    of times and reports the time from process creation to the main window
-    being created, with the minimum, median, and maximum.
+    of times and reports the time from process creation to the app being ready
+    for input, with the minimum, median, and maximum. The window appears before
+    the workspace finishes loading, so input idle is the honest end point.
 
     The launch uses a temporary workspace and redirects the preference, cookie,
     and recents paths under target/bench, so it does not read or write the
@@ -20,16 +21,31 @@
 .PARAMETER Runs
     Number of measured launches after the warm-up. Defaults to 15.
 
+.PARAMETER Workspace
+    Workspace to open. Defaults to an empty workspace under target/bench.
+    Pass a large workspace to measure loading it; its request index is cached
+    under the platform cache directory, so the first launch of a workspace
+    built without one is slower than later launches.
+
+.PARAMETER SkipWarmup
+    Skip the unmeasured warm-up launch. Use this for a first launch whose
+    cost is the measurement, such as opening a workspace with no cached index.
+
 .EXAMPLE
     pwsh scripts/bench-startup.ps1
 
 .EXAMPLE
     pwsh scripts/bench-startup.ps1 -Runs 30 -Exe target/x86_64-pc-windows-gnu/debug/posthaste.exe
+
+.EXAMPLE
+    pwsh scripts/bench-startup.ps1 -Workspace target/bench/large-workspace-1
 #>
 [CmdletBinding()]
 param(
     [int]$Runs = 15,
-    [string]$Exe
+    [string]$Exe,
+    [string]$Workspace,
+    [switch]$SkipWarmup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,7 +66,17 @@ if ($Runs -lt 1) {
 }
 
 $Bench = Join-Path $Root 'target/bench'
-$Workspace = Join-Path $Bench 'workspace'
+if ($Workspace) {
+    if (-not [System.IO.Path]::IsPathRooted($Workspace)) {
+        $Workspace = Join-Path $Root $Workspace
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Workspace 'workspace.json'))) {
+        throw "$Workspace does not look like a workspace: workspace.json is missing."
+    }
+    $Workspace = (Resolve-Path -LiteralPath $Workspace).Path
+} else {
+    $Workspace = Join-Path $Bench 'workspace'
+}
 New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
 $workspaceDocument = Join-Path $Workspace 'workspace.json'
 if (-not (Test-Path -LiteralPath $workspaceDocument)) {
@@ -72,15 +98,14 @@ function Measure-Startup {
     $process = Start-Process -FilePath $Exe -PassThru
     $started = $process.StartTime
     try {
-        # Poll without sleeping: Start-Sleep rounds up to the system timer tick,
-        # which would add up to ~15 ms of error to every measurement.
-        while (-not $process.HasExited) {
-            $process.Refresh()
-            if ($process.MainWindowHandle -ne 0) {
-                return ([DateTime]::Now - $started).TotalMilliseconds
-            }
+        # The window handle appears before the workspace is loaded, so the
+        # measurement waits for the app to be ready for input instead. Boot
+        # blocks the UI thread while the documents load, which keeps the
+        # process busy until the message loop is idle.
+        if (-not $process.WaitForInputIdle(120000)) {
+            throw 'Posthaste did not become ready for input within 120 s.'
         }
-        throw "Posthaste exited with code $($process.ExitCode) before its window appeared."
+        return ([DateTime]::Now - $started).TotalMilliseconds
     } finally {
         if (-not $process.HasExited) {
             Stop-Process -Id $process.Id -Force
@@ -90,8 +115,12 @@ function Measure-Startup {
 }
 
 Write-Host "Measuring $Exe"
-Write-Host 'Warming the file cache...'
-Measure-Startup | Out-Null
+if ($SkipWarmup) {
+    Write-Host "Skipping the warm-up (first launch of $Workspace is measured)."
+} else {
+    Write-Host 'Warming the file cache...'
+    Measure-Startup | Out-Null
+}
 
 $times = @()
 for ($i = 0; $i -lt $Runs; $i++) {
@@ -109,7 +138,13 @@ $median = if ($Runs % 2 -eq 1) {
 }
 
 Write-Host ''
-Write-Host ("launches:  {0} measured after one warm-up" -f $Runs)
+Write-Host ("workspace: {0}" -f $Workspace)
+$launches = if ($SkipWarmup) {
+    "launches:  {0} measured, no warm-up" -f $Runs
+} else {
+    "launches:  {0} measured after one warm-up" -f $Runs
+}
+Write-Host $launches
 Write-Host ("min:       {0:N0} ms" -f $sorted[0])
 Write-Host ("median:    {0:N0} ms" -f $median)
 Write-Host ("max:       {0:N0} ms" -f $sorted[-1])
