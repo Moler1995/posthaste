@@ -75,7 +75,19 @@ Cmd on macOS.
 Add a row to the table below only after the application has actually been run
 on that platform. Record the platform, the application version or commit, the
 date, who verified it, and the overall result; note the individual item numbers
-that failed, if any.
+that failed, if any. An automated launch covers item 1 and reports which font
+families were selected, but it does not check what they look like; it is
+recorded in its own table.
+
+### Automated launch
+
+| Platform | Commit | Date | Verifier | Result |
+| --- | --- | --- | --- | --- |
+| Windows 10 (x86_64-pc-windows-gnu) | `4ee37ca` | 2026-11-23 | Local run of `scripts/smoke-launch.sh` | Passed: first frame rendered; Segoe UI, Consolas |
+| Linux (Ubuntu runner; Xvfb, lavapipe, openbox) | `4ee37ca` | 2026-11-23 | CI ([run](https://github.com/Moler1995/posthaste/actions/runs/45159840470)) | Passed: first frame rendered; Ubuntu, DejaVu Sans Mono |
+| macOS (runner session) | `4ee37ca` | 2026-11-23 | CI ([run](https://github.com/Moler1995/posthaste/actions/runs/45159840470)) | Passed: first frame rendered; Helvetica Neue, Menlo |
+
+### Manual checklist
 
 | Platform | Version / commit | Date | Verifier | Result |
 | --- | --- | --- | --- | --- |
