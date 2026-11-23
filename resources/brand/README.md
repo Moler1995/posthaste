@@ -29,6 +29,9 @@ and print sheet, at the sizes they actually ship at.
 
 ## Rules
 
+- The lockups float the seal on the document background — cream in `lockup.svg`,
+  near-black in `lockup-dark.svg` — with no icon tile behind it. The seal is sized
+  to the slot the badge tile used to occupy.
 - **C3 is normally kept at 128px and up.** Its rim, sheen and shadow have no room below that, and
   a flat cut stops being wax. The application icon is the deliberate exception: it uses the
   transparent seal (without the badge background or wordmark) at every Windows icon size, because
