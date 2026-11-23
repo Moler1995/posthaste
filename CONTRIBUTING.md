@@ -28,10 +28,13 @@ MinGW-w64 toolchain must provide `x86_64-w64-mingw32-gcc`, `windres`, `ld`,
 `dlltool`, and `ar` on `PATH`:
 
 ```powershell
-$env:PATH = "D:\tools\mingw64\bin;$env:PATH"
+$env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
 x86_64-w64-mingw32-gcc --version
 windres --version
 ```
+
+Any MinGW-w64 distribution works; put the directory that contains `windres`
+and `x86_64-w64-mingw32-gcc` on `PATH`.
 
 `windres` is required because gpui embeds a Windows manifest that activates
 comctl32 v6; without it the executable fails at startup with
@@ -83,7 +86,7 @@ cargo fmt --all -- --check                                   # formatting
 cargo clippy --workspace --all-targets -- -D warnings        # lints
 cargo test --workspace                                       # tests
 cargo build                                                  # debug build
-cargo run -p posthaste-app                                      # run the app
+cargo run -p posthaste-app                                   # run the app
 ```
 
 `tools/fxc-shim` is deliberately outside the workspace (it compiles gpui's
@@ -94,33 +97,42 @@ cargo fmt --manifest-path tools/fxc-shim/Cargo.toml -- --check
 cargo test --manifest-path tools/fxc-shim/Cargo.toml
 ```
 
+CI runs these commands on Windows (GNU), Linux, and macOS for every pull
+request and every push to `main`; a run is green only when all three pass. Lint
+warnings fail the run. The gpui smoke tests are gated behind gpui's
+`test-support` feature, which the Windows dev-dependency enables automatically.
+
 To see gpui's stderr diagnostics on Windows, build with the console subsystem:
 
 ```bash
 cargo run -p posthaste-app --features windows-console
 ```
 
+In an empty workspace nothing is selected, so the request pane edits an
+unsaved draft that stays in memory. To start the app with that draft prefilled:
+
+```bash
+POSTHASTE_DRAFT_URL=https://example.com cargo run -p posthaste-app
+```
+
 The first build compiles several hundred crates and takes roughly 5–10
-minutes. See the README for debug and release build details.
+minutes. See [Building a release](docs/release.md) for the distributable
+archive.
 
 ## Proposing and reviewing changes
 
-Posthaste uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) to keep each
-change's proposal, specification delta, design, and tasks in the repository
-before code lands:
+- Open an issue for a bug or a feature before a large change, so scope can be
+  agreed before code is written. Small fixes can go straight to a pull request.
+- Branch from `main`, keep one focused change per pull request, and describe the
+  motivation and the behavior change in the summary.
+- If implementation reveals that the approach is wrong, say so in the pull
+  request and adjust the scope there rather than absorbing unrelated work
+  silently.
+- Update `CHANGELOG.md` for user-visible changes, and update the user guide or
+  README when behavior or setup changes.
 
-1. Propose the change: create a change under `openspec/changes/<name>/` with
-   the schema's artifacts (proposal, delta specs, design, tasks). The
-   `/opsx:propose` workflow does this interactively.
-2. Implement it task by task with `/opsx:apply`, checking off `tasks.md` as
-   each verified step completes.
-3. Validate the specs with `openspec validate --all --strict`.
-4. Archive the change with `/opsx:archive` once it is verified and accepted;
-   the delta specs are merged into `openspec/specs/` at that point.
-
-One milestone-sized change per pull request, ideally. If implementation
-reveals that the design is wrong, update the change's `design.md` before
-expanding scope rather than absorbing the extra work silently.
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+Security problems go through [SECURITY.md](SECURITY.md), never a public issue.
 
 ### Pull requests
 
@@ -218,7 +230,9 @@ pwsh scripts/build-dist.ps1
 
 This writes `dist/posthaste-<version>-windows-x86_64.zip` containing
 `posthaste.exe`, `README.md`, and `SHA256SUMS`, and leaves the same files in
-`target/dist-staging` for the release workflow to upload.
+`target/dist-staging` for the release workflow to upload. Prerequisites,
+archive contents, checksum verification, the shader shim, and icon
+regeneration are covered in [Building a release](docs/release.md).
 
 ### Signing status
 
@@ -246,10 +260,22 @@ date; CI never edits the changelog.
 ## UI framework
 
 Posthaste uses gpui 0.2.2 for its UI. UI changes follow the design tokens in
-`crates/posthaste-app/src/theme.rs` and `crates/posthaste-app/src/metrics.rs`; literal
-colors and sizes in views fail the token test. The visual contract is the
-`ui-design-system` spec under `openspec/specs/`, and the upgrade checklist is
+`crates/posthaste-app/src/theme.rs` and `crates/posthaste-app/src/metrics.rs`;
+literal colors and sizes in views fail the token test. The upgrade checklist is
 [`docs/upgrading-gpui.md`](docs/upgrading-gpui.md).
+
+### Design tokens
+
+All colors live in `crates/posthaste-app/src/theme.rs`, organized by role
+(`surface`, `text`, `border`, `accent`, `status`, `http_method`, `syntax`).
+Type roles, the 4 px spacing grid, radii, and control heights live in
+`crates/posthaste-app/src/metrics.rs`; views apply them with `text_role(...)` and
+the `space` / `radius` / `layout` constants.
+
+Views must use these tokens instead of literal colors or sizes. A unit test
+(`theme::tests::views_do_not_hardcode_colors`) scans
+`crates/posthaste-app/src/views` and fails if an `rgb(...)` / `rgba(...)` call
+reappears there.
 
 ## License
 

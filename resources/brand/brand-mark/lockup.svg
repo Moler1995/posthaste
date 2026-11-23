@@ -1,7 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="320" viewBox="0 0 1024 320">
     <rect width="1024" height="320" fill="#F2EDE3"/>
-    <rect x="64" y="56" width="200" height="200" rx="44" fill="#11161C"/>
-    <g transform="translate(64 56) scale(0.390625)"><g transform="translate(256 256) scale(1.15) translate(-256 -256)">
+    <g transform="translate(164 156) scale(0.65) translate(-256 -256)"><g transform="translate(256 256) scale(1.15) translate(-256 -256)">
     <defs>
       <radialGradient id="waxg3" cx="35%" cy="24%" r="88%">
         <stop offset="0" stop-color="#F78C72"/>

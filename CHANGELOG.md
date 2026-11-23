@@ -44,16 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The product is now **Posthaste**: the window title, executable, Windows
-  version resource, and application icon carry the new name, and the packages
-  are `posthaste-core` and `posthaste-app`.
-- Per-user data is stored under `Posthaste` only. Data written under the
-  previous name is not read, moved, or deleted; the app starts with fresh
-  documents.
-- Bundles are written and recognized only as `.posthaste.json` with `"kind":
-  "posthaste-bundle"`.
-- Environment variables use the `POSTHASTE_*` prefix only, and temporary files
-  are named `.posthaste-tmp`.
+- **First public release.** The product, executable, Windows version resource,
+  application icon, and packages carry the Posthaste name. Pre-release builds
+  under an earlier name are not compatible: per-user data, environment
+  variables, bundles, and temporary files use the `Posthaste` names only.
 - Workspace documents are UTF-8 JSON with LF line endings, so a shared
   checkout stays clean across platforms.
 - History and session files moved outside the workspace directory; older

@@ -19,6 +19,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.99"
+description = "A fast, native API client built with Rust and GPUI."
+repository = "https://github.com/Moler1995/posthaste"
+homepage = "https://github.com/Moler1995/posthaste"
+keywords = ["api-client", "http-client", "gpui", "desktop", "rest"]
+categories = ["development-tools", "web-programming::http-client"]
 
 [workspace.dependencies]
 anyhow = "1"
