@@ -27,6 +27,7 @@ no telemetry.
 ## Contents
 
 - [Features](#features)
+- [Performance](#performance)
 - [Download](#download)
 - [Build from source](#build-from-source)
 - [Documentation](#documentation)
@@ -53,6 +54,23 @@ no telemetry.
   and their presented responses.
 - **Made to live in** — English and 简体中文, dark/light/system themes, configurable
   limits, and a compact native window.
+
+## Performance
+
+Posthaste is a native GPUI application: no browser engine or web runtime sits
+between the process and the window.
+
+| Startup | Time |
+| --- | --- |
+| Warm start, median of 15 launches | **235 ms** |
+| Warm start, observed range | 228–267 ms |
+
+Measured on an Intel Core i5-10400 (6 cores), 32 GB RAM, a SATA hard disk, and
+Windows 10 (build 18363), on the `dist` release build with an empty workspace —
+from process creation to the main window appearing. A first launch after a
+reboot or install is slower, while the OS loads the 35 MB executable from disk.
+Reproduce on your own machine with `pwsh scripts/bench-startup.ps1`; it uses a
+temporary workspace and does not read or write your own data.
 
 ## Download
 
@@ -102,7 +120,7 @@ crates/
   posthaste-app/    # gpui views and the `posthaste` binary
 docs/               # user guide, release build, and gpui upgrade checklist
 resources/          # brand assets, application icons, window glyphs
-scripts/            # release archive and icon packers
+scripts/            # release archive, icon packers, startup benchmark
 tools/fxc-shim/     # shader compiler for builds without the Windows SDK
 ```
 
