@@ -121,6 +121,7 @@ To build the distributable archive instead, run
 | --- | --- |
 | [User guide](docs/guide.md) | Workspaces, storage, preferences, imports, variables, cookies, WebSocket sessions, response viewer, history, layout |
 | [Contributing](CONTRIBUTING.md) | Prerequisites, commands, pull requests, required checks, release process, design tokens |
+| [Platform support](docs/platform-support.md) | Per-platform status, the automated launch check, and the manual verification checklist |
 | [Building a release](docs/release.md) | Portable archive, checksum verification, shader shim, icon regeneration |
 | [Changelog](CHANGELOG.md) | Released and unreleased changes |
 | [Roadmap](ROADMAP.md) | Current state and planned work |
@@ -134,7 +135,7 @@ To build the distributable archive instead, run
 crates/
   posthaste-core/   # UI-free domain model, HTTP/WebSocket executor, storage
   posthaste-app/    # gpui views and the `posthaste` binary
-docs/               # user guide, release build, and gpui upgrade checklist
+docs/               # user guide, platform status, release build, gpui checklist
 resources/          # brand assets, application icons, window glyphs
 scripts/            # release archive, icon packers, startup benchmark
 tools/fxc-shim/     # shader compiler for builds without the Windows SDK

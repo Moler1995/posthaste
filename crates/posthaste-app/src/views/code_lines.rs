@@ -17,7 +17,7 @@ use gpui::{
     TextRun, UniformListScrollHandle, Window, canvas, div, px, uniform_list,
 };
 
-use crate::metrics::{MONO_FONT, TypeStyle as _, resolve_type_role, space, type_role};
+use crate::metrics::{TypeStyle as _, mono_font, resolve_type_role, space, type_role};
 use crate::theme;
 use crate::views::json_syntax::{self, ScanState, TokenKind};
 
@@ -659,7 +659,7 @@ pub(crate) fn offset_for_point(
 /// The font the code role paints with. The row's runs and the geometry that
 /// maps between pixels and bytes both have to agree on it.
 fn code_font() -> Font {
-    gpui::font(MONO_FONT)
+    gpui::font(mono_font())
 }
 
 /// Shapes a row's text with the code role, for measuring positions inside it.
@@ -684,7 +684,7 @@ fn shape_row(text: &str, window: &mut Window) -> ShapedLine {
 /// count so every row shares one width, and capped at six digits.
 pub(crate) fn gutter_width(window: &mut Window, line_count: usize) -> Pixels {
     let digits = line_count.max(1).to_string().len().min(6);
-    let font = gpui::font(MONO_FONT);
+    let font = gpui::font(mono_font());
     let font_id = window.text_system().resolve_font(&font);
     let advance = window
         .text_system()

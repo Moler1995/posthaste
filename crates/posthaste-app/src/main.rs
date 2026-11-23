@@ -18,17 +18,25 @@ mod workspace;
 mod ws_session;
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, KeyBinding, Pixels, TitlebarOptions, WindowBounds,
-    WindowOptions, actions, point, px, size,
+    App, AppContext as _, Application, Bounds, KeyBinding, Pixels, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, point, px, size,
 };
 use posthaste_core::preferences::{Preferences, PreferencesStore, ThemeChoice};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Default window size on a clean launch.
 const DEFAULT_WINDOW_SIZE: gpui::Size<Pixels> = size(px(1280.), px(800.));
 /// Smallest window the application opens or restores.
 const MIN_WINDOW_SIZE: gpui::Size<Pixels> = size(px(1080.), px(600.));
+
+/// Set to any non-empty value to exit after the first rendered frame. Runtime
+/// verification uses it; it stays out of the user-facing command line.
+const SMOKE_EXIT_AFTER_FRAME_ENV: &str = "POSTHASTE_SMOKE_EXIT_AFTER_FRAME";
+/// How long a smoke launch waits for a frame before reporting failure. The
+/// bound lives in the application so a hung startup fails on its own.
+const SMOKE_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 actions!(posthaste, [Quit]);
 
@@ -45,6 +53,9 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+    let smoke_exit = smoke_exit_after_frame_enabled(posthaste_core::paths::env_value(
+        SMOKE_EXIT_AFTER_FRAME_ENV,
+    ));
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -70,6 +81,9 @@ fn main() {
             let mut preferences_store = PreferencesStore::resolve();
             let preferences = preferences_store.load().preferences;
             metrics::set_editor_font_size(preferences.editing.font_size);
+            // Pick text families the host actually has before the first frame,
+            // so a missing preferred face cannot reach font resolution.
+            metrics::install_fonts(&cx.text_system().all_font_names());
             match preferences.appearance.theme {
                 ThemeChoice::Dark => theme::set_mode(theme::Mode::Dark),
                 ThemeChoice::Light => theme::set_mode(theme::Mode::Light),
@@ -98,13 +112,23 @@ fn main() {
             };
 
             let workspace = workspace.clone();
-            cx.open_window(options, move |window, cx| {
+            let opened = cx.open_window(options, move |window, cx| {
                 theme::set_mode(theme::resolve_theme(theme_choice, window.appearance()));
                 #[cfg(target_os = "windows")]
                 views::window_frame::install(window);
+                if smoke_exit {
+                    arm_smoke_exit(window, cx);
+                }
                 cx.new(|cx| views::AppShell::new_with_workspace(window, cx, workspace.clone()))
-            })
-            .expect("failed to open the Posthaste window");
+            });
+            match opened {
+                Ok(_) => {}
+                Err(error) if smoke_exit => {
+                    eprintln!("posthaste smoke: window creation failed: {error:?}");
+                    std::process::exit(3);
+                }
+                Err(error) => panic!("failed to open the Posthaste window: {error:?}"),
+            }
 
             cx.activate(true);
         });
@@ -141,6 +165,30 @@ fn window_bounds_for(
     }
 }
 
+/// `true` when the smoke variable is set. An empty value was already dropped
+/// by [`posthaste_core::paths::env_value`], so presence alone enables it.
+fn smoke_exit_after_frame_enabled(value: Option<OsString>) -> bool {
+    value.is_some()
+}
+
+/// Reports the first rendered frame and exits successfully. A launch that
+/// never frames fails on its own timer instead of waiting on the caller.
+fn arm_smoke_exit(window: &mut Window, cx: &mut App) {
+    window.on_next_frame(|_, cx| {
+        eprintln!("posthaste smoke: first frame rendered");
+        cx.quit();
+    });
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(SMOKE_FRAME_TIMEOUT).await;
+        eprintln!(
+            "posthaste smoke: no frame within {} s",
+            SMOKE_FRAME_TIMEOUT.as_secs()
+        );
+        std::process::exit(3);
+    })
+    .detach();
+}
+
 /// Reads `--workspace <path>` or `--workspace=<path>` from the arguments
 /// after the executable. Unknown arguments are ignored, and the first
 /// occurrence wins. A flag with no value, or an empty one, names no workspace.
@@ -170,6 +218,12 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_smoke_variable_is_off_until_it_is_set() {
+        assert!(!smoke_exit_after_frame_enabled(None));
+        assert!(smoke_exit_after_frame_enabled(Some(OsString::from("1"))));
     }
 
     #[test]

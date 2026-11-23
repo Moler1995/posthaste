@@ -20,7 +20,7 @@ use posthaste_core::variables::{VariableCatalog, VariableScope, open_placeholder
 use super::TextInput;
 use crate::i18n::{self, Key};
 use crate::metrics::{
-    MONO_FONT, TypeStyle as _, layout, radius, resolve_type_role, space, type_role,
+    TypeStyle as _, layout, mono_font, radius, resolve_type_role, space, type_role,
 };
 use crate::theme;
 use crate::views::ui;
@@ -747,7 +747,7 @@ fn value_index_for_x(text: &str, x: Pixels, window: &Window) -> usize {
 
 /// Shapes the value line in the card's face, for measuring positions in it.
 fn shape_value(text: &str, window: &Window) -> ShapedLine {
-    let font = gpui::font(MONO_FONT);
+    let font = gpui::font(mono_font());
     window.text_system().shape_line(
         SharedString::from(text.to_owned()),
         resolve_type_role(type_role::CODE_COMPACT).size(),

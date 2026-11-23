@@ -65,7 +65,9 @@ sudo apt-get install -y --no-install-recommends \
 ```
 
 The CI job is the source of truth: if the build asks for a package that is not
-in this list, add it here and to the workflow in the same pull request.
+in this list, add it here and to the workflow in the same pull request. The
+runtime launch check additionally needs `xvfb`, `openbox`, and
+`mesa-vulkan-drivers` (lavapipe); they are installed for it, not for building.
 
 ### macOS
 
@@ -102,11 +104,34 @@ request and every push to `main`; a run is green only when all three pass. Lint
 warnings fail the run. The gpui smoke tests are gated behind gpui's
 `test-support` feature, which the Windows dev-dependency enables automatically.
 
+On Linux and macOS the run also builds the application and starts it once
+through `scripts/smoke-launch.sh`: Linux under Xvfb with Mesa's software Vulkan
+driver and a minimal window manager (openbox), macOS in the runner's own
+session. The step fails when the window is not
+created or the first frame is not reported, which is the part the headless tests
+cannot cover. It is part of the same three required checks, not a separate
+optional job. Windows runtime behavior stays on the manual checklist because
+hosted Windows runners have no interactive desktop. What each platform has been
+verified for, and the checklist a person runs, are on the
+[platform support](docs/platform-support.md) page.
+
 To see gpui's stderr diagnostics on Windows, build with the console subsystem:
 
 ```bash
 cargo run -p posthaste-app --features windows-console
 ```
+
+To verify that a build starts and paints, set `POSTHASTE_SMOKE_EXIT_AFTER_FRAME`
+to any non-empty value. The application exits successfully directly after its
+first rendered frame and prints `posthaste smoke: first frame rendered` to
+stderr; if no frame arrives within 30 seconds it exits non-zero instead. It is
+a verification aid: it adds no command-line option and is off by default.
+
+`scripts/smoke-launch.sh <binary>` wraps that check: it creates a temporary
+workspace, redirects preferences, recents, and cookies, launches the binary
+with the variable set, waits at most 120 seconds, and fails unless the
+first-frame confirmation is present and the application exited successfully.
+It is the same launch the platform runtime checks run in CI.
 
 In an empty workspace nothing is selected, so the request pane edits an
 unsaved draft that stays in memory. To start the app with that draft prefilled:
@@ -142,7 +167,8 @@ Security problems go through [SECURITY.md](SECURITY.md), never a public issue.
   platform-specific behavior by hand, and the changelog decision.
 - The pull request is mergeable only when the **CI** workflow is green on
   every platform: `Check (Windows (GNU))`, `Check (Linux)`, and
-  `Check (macOS)`.
+  `Check (macOS)`. The Linux and macOS jobs include the runtime launch, so a
+  window that cannot be created or painted fails the check.
 - User-visible changes add a `CHANGELOG.md` entry under `Unreleased`.
 - Formatting and lint warnings fail the run; there is no separate style
   review.

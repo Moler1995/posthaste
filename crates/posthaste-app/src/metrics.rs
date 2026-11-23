@@ -18,26 +18,191 @@
 //! role supplies size, line height, and weight; callers pass already-uppercase
 //! copy where the design calls for it.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui::{FontWeight, Pixels, Styled, px};
 use posthaste_core::preferences::{DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE};
 
-/// UI face. Windows first; other platforms fall back to their system sans.
+/// Fallback UI face, used until the host's installed families are known and
+/// whenever resolution does not run (tests, headless harnesses). Resolution
+/// normally replaces it with a family the platform font database reported.
 #[cfg(target_os = "windows")]
-pub const UI_FONT: &str = "Segoe UI";
+const UI_FONT_FALLBACK: &str = "Segoe UI";
 #[cfg(target_os = "macos")]
-pub const UI_FONT: &str = "SF Pro Text";
+const UI_FONT_FALLBACK: &str = "Helvetica Neue";
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub const UI_FONT: &str = "system-ui";
+const UI_FONT_FALLBACK: &str = "DejaVu Sans";
 
-/// Monospace face for URLs, bodies, and JSON.
+/// Fallback code face, resolved the same way as [`UI_FONT_FALLBACK`].
 #[cfg(target_os = "windows")]
-pub const MONO_FONT: &str = "Consolas";
+const MONO_FONT_FALLBACK: &str = "Consolas";
 #[cfg(target_os = "macos")]
-pub const MONO_FONT: &str = "SF Mono";
+const MONO_FONT_FALLBACK: &str = "Menlo";
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub const MONO_FONT: &str = "monospace";
+const MONO_FONT_FALLBACK: &str = "DejaVu Sans Mono";
+
+/// Interface families, most native first. Every entry is a family the
+/// platform commonly installs; the first one present wins.
+#[cfg(target_os = "windows")]
+const UI_FONT_PREFERENCES: &[&str] = &["Segoe UI", "Tahoma", "Arial"];
+#[cfg(target_os = "macos")]
+const UI_FONT_PREFERENCES: &[&str] = &[
+    ".AppleSystemUIFont",
+    "SF Pro Text",
+    "Helvetica Neue",
+    "Helvetica",
+];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const UI_FONT_PREFERENCES: &[&str] = &[
+    "Ubuntu",
+    "Cantarell",
+    "Adwaita Sans",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+];
+
+/// Code families, most native first.
+#[cfg(target_os = "windows")]
+const MONO_FONT_PREFERENCES: &[&str] = &["Consolas", "Cascadia Mono", "Courier New"];
+#[cfg(target_os = "macos")]
+const MONO_FONT_PREFERENCES: &[&str] = &["Menlo", "SF Mono", "Monaco"];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const MONO_FONT_PREFERENCES: &[&str] = &[
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Ubuntu Mono",
+    "Noto Sans Mono",
+];
+
+/// Second tier, tried before accepting an arbitrary installed family.
+#[cfg(target_os = "windows")]
+const UI_FONT_SECOND_TIER: &[&str] = &["Tahoma", "Arial"];
+#[cfg(target_os = "macos")]
+const UI_FONT_SECOND_TIER: &[&str] = &["Helvetica Neue", "Helvetica"];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const UI_FONT_SECOND_TIER: &[&str] = &["Noto Sans", "DejaVu Sans", "Liberation Sans"];
+
+#[cfg(target_os = "windows")]
+const MONO_FONT_SECOND_TIER: &[&str] = &["Cascadia Mono", "Courier New"];
+#[cfg(target_os = "macos")]
+const MONO_FONT_SECOND_TIER: &[&str] = &["Menlo", "Monaco"];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const MONO_FONT_SECOND_TIER: &[&str] = &["DejaVu Sans Mono", "Liberation Mono"];
+
+/// Where a selected family came from. Reported in the startup log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilySource {
+    /// The platform's native or most preferred face.
+    Preferred,
+    /// A documented fallback face.
+    SecondTier,
+    /// Any installed family that is not an icon or symbol face.
+    Other,
+}
+
+/// A resolved font family and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyChoice {
+    pub family: String,
+    pub source: FamilySource,
+}
+
+/// Picks the first family the host reports, trying `preferences`, then
+/// `second_tier`, then any installed family that is not an icon or symbol
+/// face. Matching ignores ASCII case; the returned spelling is the host's.
+pub fn select_family(
+    available: &[String],
+    preferences: &[&str],
+    second_tier: &[&str],
+) -> Option<FamilyChoice> {
+    let find = |wanted: &str| {
+        available
+            .iter()
+            .find(|family| family.eq_ignore_ascii_case(wanted))
+            .cloned()
+    };
+
+    for (families, source) in [
+        (preferences, FamilySource::Preferred),
+        (second_tier, FamilySource::SecondTier),
+    ] {
+        for wanted in families {
+            if let Some(family) = find(wanted) {
+                return Some(FamilyChoice { family, source });
+            }
+        }
+    }
+
+    let mut candidates: Vec<&String> = available
+        .iter()
+        .filter(|family| !looks_like_an_icon_face(family))
+        .collect();
+    candidates.sort_by_key(|family| family.to_ascii_lowercase());
+    candidates.first().map(|family| FamilyChoice {
+        family: (*family).clone(),
+        source: FamilySource::Other,
+    })
+}
+
+/// Faces that carry glyphs for icons rather than text. Accepting one as a
+/// text family renders unreadable interface text.
+fn looks_like_an_icon_face(family: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    ["icon", "emoji", "symbol", "dingbat", "wingding", "webding"]
+        .iter()
+        .any(|marker| family.contains(marker))
+}
+
+/// Process-wide families, installed once from the host's font database.
+static UI_FAMILY: OnceLock<&'static str> = OnceLock::new();
+static MONO_FAMILY: OnceLock<&'static str> = OnceLock::new();
+
+/// Resolves the interface and code families from the host's installed
+/// families and logs the result. Call once per launch, before the first
+/// window renders. Later calls are ignored.
+pub fn install_fonts(available: &[String]) {
+    for (slot, preferences, second_tier, fallback, label) in [
+        (
+            &UI_FAMILY,
+            UI_FONT_PREFERENCES,
+            UI_FONT_SECOND_TIER,
+            UI_FONT_FALLBACK,
+            "ui",
+        ),
+        (
+            &MONO_FAMILY,
+            MONO_FONT_PREFERENCES,
+            MONO_FONT_SECOND_TIER,
+            MONO_FONT_FALLBACK,
+            "mono",
+        ),
+    ] {
+        let choice = select_family(available, preferences, second_tier);
+        let (family, source) = match choice {
+            Some(choice) => (choice.family, choice.source),
+            None => (fallback.to_owned(), FamilySource::Other),
+        };
+        let family: &'static str = Box::leak(family.into_boxed_str());
+        let _ = slot.set(family);
+        tracing::info!(
+            family = %family,
+            source = ?source,
+            "resolved {label} font family"
+        );
+    }
+}
+
+/// The interface family for this launch.
+pub fn ui_font() -> &'static str {
+    UI_FAMILY.get().copied().unwrap_or(UI_FONT_FALLBACK)
+}
+
+/// The code family for this launch.
+pub fn mono_font() -> &'static str {
+    MONO_FAMILY.get().copied().unwrap_or(MONO_FONT_FALLBACK)
+}
 
 /// A named typographic role.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,9 +337,9 @@ pub trait TypeStyle: Styled + Sized {
             .line_height(role.line_height())
             .font_weight(role.weight());
         if role.is_mono() {
-            styled.font_family(MONO_FONT)
+            styled.font_family(mono_font())
         } else {
-            styled.font_family(UI_FONT)
+            styled.font_family(ui_font())
         }
     }
 }
@@ -439,6 +604,75 @@ mod tests {
         assert!(
             f32::from(type_role::CODE.line_height()) >= f32::from(type_role::CODE.size()) * 1.4
         );
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_preferred_family_wins_over_the_rest_of_the_host() {
+        let available = names(&["DejaVu Sans", "Segoe UI", "Consolas"]);
+        let choice = select_family(&available, &["Segoe UI"], &["Arial"]).expect("a choice");
+        assert_eq!(choice.family, "Segoe UI");
+        assert_eq!(choice.source, FamilySource::Preferred);
+    }
+
+    #[test]
+    fn preferred_families_match_without_regard_to_case() {
+        let available = names(&["segoe ui"]);
+        let choice = select_family(&available, &["Segoe UI"], &[]).expect("a choice");
+        assert_eq!(choice.family, "segoe ui");
+        assert_eq!(choice.source, FamilySource::Preferred);
+    }
+
+    #[test]
+    fn an_absent_preferred_family_falls_to_the_second_tier() {
+        let available = names(&["DejaVu Sans", "Arial"]);
+        let choice = select_family(&available, &["Segoe UI"], &["Arial"]).expect("a choice");
+        assert_eq!(choice.family, "Arial");
+        assert_eq!(choice.source, FamilySource::SecondTier);
+    }
+
+    #[test]
+    fn a_minimal_host_uses_the_family_it_has() {
+        let available = names(&["DejaVu Sans"]);
+        let choice = select_family(&available, &["Segoe UI"], &[]).expect("a choice");
+        assert_eq!(choice.family, "DejaVu Sans");
+        assert_eq!(choice.source, FamilySource::Other);
+    }
+
+    #[test]
+    fn a_host_without_text_families_yields_no_choice() {
+        assert_eq!(select_family(&[], &["Segoe UI"], &["Arial"]), None);
+
+        let icons_only = names(&["Segoe Fluent Icons", "Noto Color Emoji"]);
+        assert_eq!(
+            select_family(&icons_only, &["Segoe UI"], &["Arial"]),
+            None,
+            "an icon or emoji face is never accepted as a text family"
+        );
+    }
+
+    #[test]
+    fn the_arbitrary_family_is_deterministic() {
+        let available = names(&["Zeta Sans", "alpha sans", "Beta Sans"]);
+        let choice = select_family(&available, &[], &[]).expect("a choice");
+        assert_eq!(choice.family, "alpha sans");
+        assert_eq!(choice.source, FamilySource::Other);
+    }
+
+    #[test]
+    fn the_platform_preferences_lead_with_a_native_face() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(UI_FONT_PREFERENCES[0], "Segoe UI");
+        #[cfg(target_os = "macos")]
+        assert_eq!(UI_FONT_PREFERENCES[0], ".AppleSystemUIFont");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(UI_FONT_PREFERENCES[0], "Ubuntu");
+
+        assert!(!ui_font().is_empty());
+        assert!(!mono_font().is_empty());
     }
 
     #[test]

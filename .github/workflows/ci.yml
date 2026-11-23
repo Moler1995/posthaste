@@ -60,6 +60,8 @@ jobs:
 
       # gpui's Linux backend links against these; the list is verified by the
       # build itself, so a missing package fails here instead of going stale.
+      # xvfb, openbox, and mesa-vulkan-drivers (lavapipe) serve the runtime
+      # launch check.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -75,7 +77,10 @@ jobs:
             libxkbcommon-x11-dev \
             clang \
             lld \
-            cmake
+            cmake \
+            mesa-vulkan-drivers \
+            openbox \
+            xvfb
 
       - name: Install Rust
         run: |
@@ -103,6 +108,37 @@ jobs:
 
       - name: Tests
         run: cargo +${{ matrix.toolchain }} test --workspace
+
+      # The tests above build gpui's headless test window; only these steps
+      # start the real binary and prove the platform renderer paints a frame.
+      - name: Build for runtime check
+        if: runner.os != 'Windows'
+        run: cargo +${{ matrix.toolchain }} build -p posthaste-app
+
+      # gpui starts its frame refresh loop from the window's map and
+      # visibility events. With no window manager those can be handled
+      # before the loop is running, and then no frame ever arrives, so
+      # openbox maps the window the way a desktop would.
+      - name: Runtime smoke (virtual display)
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        # info makes the launch log name the font families it selected, which
+        # is the other thing this job should show.
+        env:
+          RUST_LOG: info
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -c '
+            openbox >/dev/null 2>&1 &
+            sleep 1
+            sh scripts/smoke-launch.sh target/debug/posthaste
+          '
+
+      - name: Runtime smoke
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        env:
+          RUST_LOG: info
+        run: sh scripts/smoke-launch.sh target/debug/posthaste
 
       - name: Shim tests
         if: runner.os == 'Windows'
