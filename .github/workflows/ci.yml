@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One platform failing must not cancel or skip the others: the Windows
+      # GNU job is the release platform and always has to report a result.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (GNU)
+            os: windows-latest
+            toolchain: 1.99.1-x86_64-pc-windows-gnu
+          - name: Linux
+            os: ubuntu-latest
+            toolchain: 1.99.1
+          - name: macOS
+            os: macos-latest
+            toolchain: 1.99.1
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The Windows runner image ships MSYS2 at C:\msys64, but does not put its
+      # MinGW-w64 toolchain on PATH. Downloading it with msys2/setup-msys2 was
+      # the step that failed with an HTTP 504, so use the preinstalled copy.
+      - name: Add MinGW to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify MinGW toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $missing = @(
+            @('x86_64-w64-mingw32-gcc', 'windres', 'ld') |
+              Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+          )
+          if ($missing.Count -gt 0) {
+            throw "C:\msys64\mingw64\bin does not provide $($missing -join ', '). The runner image changed; reinstate the msys2/setup-msys2 step described in CONTRIBUTING.md."
+          }
+
+      # gpui's Linux backend links against these; the list is verified by the
+      # build itself, so a missing package fails here instead of going stale.
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libva-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            clang \
+            lld \
+            cmake
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt --component clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/fxc-shim -> tools/fxc-shim/target
+
+      - name: Check formatting
+        run: cargo +${{ matrix.toolchain }} fmt --all -- --check
+
+      # tools/fxc-shim is outside the workspace, so it needs its own commands.
+      # It builds the Windows shader compiler and therefore runs on Windows only.
+      - name: Check shim formatting
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo +${{ matrix.toolchain }} fmt --manifest-path tools/fxc-shim/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo +${{ matrix.toolchain }} test --workspace
+
+      - name: Shim tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo +${{ matrix.toolchain }} test --manifest-path tools/fxc-shim/Cargo.toml

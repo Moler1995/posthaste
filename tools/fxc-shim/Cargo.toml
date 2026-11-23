@@ -1,0 +1,14 @@
+[package]
+name = "fxc-shim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+# This crate is intentionally outside the main workspace. It is built only by
+# scripts/build-dist.ps1 when a real fxc.exe is unavailable.
+[workspace]
+
+[dependencies]
+libloading = "0.8"
+windows = { version = "0.61", features = ["Win32_Graphics_Direct3D"] }

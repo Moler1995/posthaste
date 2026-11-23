@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="320" viewBox="0 0 1024 320">
+    <rect width="1024" height="320" fill="#0B1116"/>
+    <rect x="64" y="56" width="200" height="200" rx="44" fill="#182028"/>
+    <g transform="translate(64 56) scale(0.390625)"><g transform="translate(256 256) scale(1.02) translate(-256 -256)">
+    <defs><mask id="stm2">
+      <path d="M 141 113 H 371 V 399 H 203 L 141 337 Z" fill="#fff"/>
+      <g fill="#000"><circle cx="160" cy="113" r="13"/><circle cx="198" cy="113" r="13"/><circle cx="236" cy="113" r="13"/><circle cx="274" cy="113" r="13"/><circle cx="312" cy="113" r="13"/><circle cx="350" cy="113" r="13"/><circle cx="160" cy="399" r="13"/><circle cx="198" cy="399" r="13"/><circle cx="236" cy="399" r="13"/><circle cx="274" cy="399" r="13"/><circle cx="312" cy="399" r="13"/><circle cx="350" cy="399" r="13"/><circle cx="141" cy="132" r="13"/><circle cx="141" cy="170" r="13"/><circle cx="141" cy="208" r="13"/><circle cx="141" cy="246" r="13"/><circle cx="141" cy="284" r="13"/><circle cx="141" cy="322" r="13"/><circle cx="371" cy="132" r="13"/><circle cx="371" cy="170" r="13"/><circle cx="371" cy="208" r="13"/><circle cx="371" cy="246" r="13"/><circle cx="371" cy="284" r="13"/><circle cx="371" cy="322" r="13"/></g>
+    </mask></defs>
+    <g transform="rotate(-9 256 256)">
+      <path d="M 141 113 H 371 V 399 H 203 L 141 337 Z" fill="#F2EDE3" mask="url(#stm2)"/>
+      <path d="M 151 123 H 361 V 389 H 205 L 151 335 Z" fill="none" stroke="#0E1418"
+            stroke-opacity="0.22" stroke-width="2"/>
+      <g fill="none" stroke="#4D8DFF" stroke-width="20" stroke-linecap="round"
+         stroke-linejoin="round">
+        <path d="M 198 208 L 244 256 L 198 304"/>
+        <path d="M 248 208 L 294 256 L 248 304"/>
+      </g>
+      <circle cx="318" cy="300" r="12" fill="#E2604C"/>
+      <path d="M 145 340 L 205 400" stroke="#0E1418" stroke-opacity="0.14"
+            stroke-width="7"/>
+      <path d="M 141 337 L 203 399 "
+            f"L 203 337 Z" fill="#DCD3C2"/>
+      <path d="M 141 337 L 203 399"
+            stroke="#B4A98F" stroke-width="2"/>
+    </g>
+    </g></g>
+    <text x="300" y="188" font-family="Bahnschrift" font-weight="700" font-size="92"
+          letter-spacing="8" fill="#F2EDE3">POSTHASTE</text>
+    <text x="303" y="234" font-family="Consolas" font-size="20" letter-spacing="7"
+          fill="#98A4B0">BY RETURN OF POST</text>
+    <path d="M 300 258 H 900" stroke="#F2EDE3" stroke-opacity="0.25" stroke-width="2"/>
+    <circle cx="900" cy="258" r="6" fill="#4D8DFF"/>
+    </svg>

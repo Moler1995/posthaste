@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Posthaste · 场景预览</title>
+<style>
+  :root{
+    --page:#080B0F; --win:#0E1319; --bar:#12181F; --panel:#10161C;
+    --field:#1A222B; --line:#222B34; --tx:#C7D1DB; --muted:#72808D;
+    --dim:#4B5661; --paper:#F2EDE3; --ink:#0E1418; --blue:#4D8DFF; --wax:#E2604C;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--page);color:var(--tx);
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1360px;margin:0 auto;padding:56px 48px 88px}
+  h1{font-family:Bahnschrift,"Microsoft YaHei",sans-serif;font-weight:700;font-size:34px;
+     letter-spacing:.5px;color:var(--paper);margin:0 0 12px}
+  .lead{font-size:13.5px;line-height:1.75;color:var(--muted);max-width:760px;margin:0}
+  .mono{font-family:Consolas,"Cascadia Mono",monospace}
+  .section{margin-top:64px}
+  .label{display:flex;align-items:baseline;gap:14px;border-top:1px solid var(--line);
+         padding-top:14px;margin-bottom:22px}
+  .label b{font-family:Bahnschrift,"Microsoft YaHei",sans-serif;font-weight:700;
+           font-size:14px;letter-spacing:1.6px;color:var(--paper)}
+  .label span{font-family:Consolas,monospace;font-size:10.5px;color:var(--dim);letter-spacing:.4px}
+  .row{display:grid;gap:32px}
+  .row.two{grid-template-columns:1fr 1fr}
+  .row.side{grid-template-columns:1.55fr 1fr;align-items:start}
+  .note{font-size:12px;line-height:1.7;color:var(--dim);margin:12px 0 0}
+  .note code{font-family:Consolas,monospace;font-size:11.5px;color:var(--muted)}
+
+  /* ---------- window ---------- */
+  .win{background:var(--win);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .titlebar{display:flex;align-items:center;height:44px;padding:0 16px;background:var(--bar);
+            border-bottom:1px solid var(--line)}
+  .titlebar img{margin-right:10px}
+  .appname{font-family:Bahnschrift,sans-serif;font-weight:700;font-size:13px;
+           letter-spacing:.6px;color:#A9B7C4}
+  .vline{width:1px;height:14px;background:var(--line);margin:0 14px}
+  .doc{font-family:Consolas,monospace;font-size:11px;color:var(--muted)}
+  .dots{margin-left:auto;display:flex;gap:14px}
+  .dots i{width:8px;height:8px;border-radius:50%;background:#39434E;display:block}
+  .winbody{display:grid;grid-template-columns:190px 1fr;min-height:270px}
+  .side{background:var(--panel);border-right:1px solid var(--line);padding:16px 18px}
+  .side h4{font-family:Consolas,monospace;font-size:9px;letter-spacing:2px;color:var(--muted);
+           margin:0 0 12px;font-weight:400}
+  .side li{list-style:none;font-size:11.5px;color:var(--tx);margin:0 0 10px;
+           display:flex;align-items:center;gap:9px}
+  .side li i{width:6px;height:6px;border-radius:50%;background:var(--dim);display:block}
+  .side li.on i{background:var(--blue)}
+  .side ul{margin:0 0 22px;padding:0}
+  .hist{font-family:Consolas,monospace;font-size:10.5px;color:var(--dim);line-height:1.95}
+  .main{padding:16px 20px}
+  .tabs{display:flex;align-items:center;gap:18px;margin-bottom:14px}
+  .tab{font-family:Consolas,monospace;font-size:11px;color:var(--tx);
+       background:var(--field);border-radius:7px;padding:7px 12px;position:relative}
+  .tab::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--blue)}
+  .tab i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--blue);
+         margin-right:8px;vertical-align:1px}
+  .add{font-family:Consolas,monospace;font-size:13px;color:var(--dim)}
+  .urlbar{display:flex;align-items:center;gap:10px;background:var(--field);
+          border:1px solid var(--line);border-radius:8px;padding:11px 14px}
+  .method{font-family:Consolas,monospace;font-weight:700;font-size:11px;color:var(--blue)}
+  .url{font-family:Consolas,monospace;font-size:12px;color:var(--tx)}
+  .send{margin-left:auto;background:var(--blue);color:#08111E;border-radius:7px;
+        padding:7px 14px;font-family:Bahnschrift,sans-serif;font-weight:700;
+        font-size:11px;letter-spacing:1px}
+  .resp{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+        padding:12px 16px}
+  .resp .head{display:flex;gap:28px;font-family:Consolas,monospace;font-size:9.5px;
+              letter-spacing:1.8px;color:var(--muted);margin-bottom:10px}
+  .resp .head b{color:#7FB89A;font-weight:400;letter-spacing:1px}
+  .json{font-family:Consolas,monospace;font-size:11.5px;line-height:1.75;color:var(--tx)}
+  .json .k{color:#7FA6D8}.json .s{color:#9BC48F}.json .n{color:#D9A05B}.json .p{color:var(--dim)}
+
+  /* ---------- splash ---------- */
+  .splash{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;
+          background:radial-gradient(circle at 50% 40%,#1A222B 0%,#080D11 76%);
+          border:1px solid #1A222B;display:flex;flex-direction:column;
+          align-items:center;justify-content:center;gap:16px}
+  .splash img{width:190px;height:190px;display:block}
+  .splash .word{font-family:Bahnschrift,sans-serif;font-weight:700;font-size:34px;
+                letter-spacing:10px;color:var(--paper)}
+  .splash .sub{font-family:Consolas,monospace;font-size:10px;letter-spacing:4px;color:#5C6873}
+  .splash .bar{position:absolute;left:50%;bottom:34px;transform:translateX(-50%);
+               width:180px;height:2px;background:#1E2731;border-radius:2px;overflow:hidden}
+  .splash .bar i{display:block;width:38%;height:100%;background:var(--blue)}
+
+  /* ---------- about ---------- */
+  .about{background:#141B22;border:1px solid var(--line);border-radius:10px;padding:26px 26px 20px;
+         box-shadow:0 24px 60px rgba(0,0,0,.45);max-width:380px}
+  .about .top{display:flex;gap:18px;align-items:center}
+  .about h3{margin:0;font-family:Bahnschrift,sans-serif;font-weight:700;font-size:17px;
+            color:var(--paper);letter-spacing:.4px}
+  .about p{margin:4px 0 0;font-family:Consolas,monospace;font-size:11px;color:var(--muted)}
+  .about .rule{height:1px;background:var(--line);margin:20px 0 14px}
+  .about .meta{font-family:Consolas,monospace;font-size:10.5px;color:var(--dim);line-height:1.8}
+  .about .btns{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+  .btn{font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--line);
+       color:var(--tx);background:var(--field)}
+  .btn.primary{background:var(--blue);border-color:var(--blue);color:#08111E;font-weight:600}
+
+  /* ---------- taskbar / tray / tabs ---------- */
+  .taskbar{height:56px;background:#0B1015;border:1px solid #1A222B;border-radius:10px;
+           display:flex;align-items:center;gap:12px;padding:0 16px}
+  .taskbar .start{width:22px;height:22px;display:grid;grid-template-columns:1fr 1fr;gap:2px}
+  .taskbar .start i{background:#2C3945;display:block}
+  .pin{display:flex;align-items:center;justify-content:center;width:40px;height:40px;
+       border-radius:8px;position:relative}
+  .pin.active{background:#1B2530}
+  .pin.active::after{content:"";position:absolute;left:50%;bottom:-6px;transform:translateX(-50%);
+                     width:14px;height:2px;background:var(--blue);border-radius:2px}
+  .spacer{flex:1}
+  .tray{display:flex;align-items:center;gap:14px}
+  .tray .t{display:flex;align-items:center;justify-content:center;width:24px;height:24px}
+  .clock{font-family:Consolas,monospace;font-size:11px;color:#8B9AA7;line-height:1.2;text-align:right}
+
+  .tabsbar{background:#12181F;border:1px solid #1A222B;border-radius:10px;padding:8px 8px 0;
+           display:flex;align-items:flex-end;gap:4px}
+  .btab{display:flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:7px 7px 0 0;
+        font-size:11.5px;color:#8B9AA7;max-width:210px;overflow:hidden;white-space:nowrap}
+  .btab.on{background:#1B2530;color:var(--tx)}
+  .btab .fav{width:16px;height:16px;flex:0 0 16px}
+  .btab .x{margin-left:6px;color:#5D6A76}
+
+  /* ---------- installer ---------- */
+  .installer{background:#12181F;border:1px solid var(--line);border-radius:10px;padding:22px;
+             display:flex;gap:20px;align-items:flex-start;max-width:460px}
+  .installer h3{margin:2px 0 6px;font-family:Bahnschrift,sans-serif;font-weight:700;
+                font-size:18px;color:var(--paper)}
+  .installer .v{font-family:Consolas,monospace;font-size:11px;color:var(--muted)}
+  .installer .path{font-family:Consolas,monospace;font-size:10.5px;color:var(--dim);
+                   background:#0C1218;border:1px solid #1B242D;border-radius:5px;
+                   padding:7px 9px;margin-top:14px}
+  .installer .btns{display:flex;gap:10px;margin-top:16px}
+
+  /* ---------- light surfaces ---------- */
+  .paper{background:var(--paper);border-radius:12px;padding:34px 40px;color:var(--ink)}
+  .dochead{display:flex;align-items:center;gap:34px}
+  .dochead img{width:280px;height:87.5px;display:block}
+  .dochead nav{display:flex;gap:26px;margin-left:auto;font-size:12.5px;color:#5B564D}
+  .dochead nav b{color:var(--ink);font-weight:600}
+  .dochead .search{display:flex;align-items:center;gap:8px;border:1px solid #D6CEBF;
+                   border-radius:7px;padding:8px 12px;font-family:Consolas,monospace;
+                   font-size:11px;color:#8B8378;background:#F7F3EB}
+  .readme{background:var(--ink);border-radius:12px;padding:34px 40px}
+  .readme img{width:420px;height:131px;display:block}
+  .srcline{margin-top:26px;border-top:1px solid #1E2A33;padding-top:16px;
+           font-family:Consolas,monospace;font-size:11.5px;color:#6B7783}
+  .srcline b{color:#9BC48F;font-weight:400}
+
+  /* ---------- social card ---------- */
+  .cardbox{width:640px;height:315px;overflow:hidden;border-radius:10px;border:1px solid #1A222B}
+  .card{width:1280px;height:630px;transform:scale(.5);transform-origin:top left;
+        background:radial-gradient(circle at 22% 46%,#16202B 0%,#0A0F15 62%,#080C11 100%);
+        position:relative;display:flex;align-items:center;gap:64px;padding:0 88px}
+  .card img{width:340px;height:340px}
+  .card h2{margin:0;font-family:Bahnschrift,sans-serif;font-weight:700;font-size:96px;
+           letter-spacing:14px;color:var(--paper);line-height:1}
+  .card .tag{margin-top:18px;font-size:26px;color:#8B9AA7;letter-spacing:1px}
+  .card .rule{position:absolute;left:88px;right:88px;bottom:66px;height:2px;
+              background:linear-gradient(90deg,var(--blue) 0 180px,#2E3D4B 180px 100%)}
+  .card .foot{position:absolute;left:88px;bottom:34px;font-family:Consolas,monospace;
+              font-size:18px;letter-spacing:5px;color:#5C6873}
+
+  /* ---------- mono / print ---------- */
+  .letterhead{background:var(--paper);border-radius:12px;padding:32px 36px;color:var(--ink)}
+  .lh-head{display:flex;align-items:center;gap:16px}
+  .lh-head img{width:84px;height:84px;display:block}
+  .lh-name{font-family:Bahnschrift,sans-serif;font-weight:700;font-size:21px;letter-spacing:6px}
+  .lh-sub{font-family:Consolas,monospace;font-size:9px;letter-spacing:3px;color:#8B8378;margin-top:7px}
+  .lh-meta{margin-left:auto;font-family:Consolas,monospace;font-size:10px;color:#8B8378;
+           text-align:right;line-height:1.8}
+  .lh-rule{height:1px;background:#D9D1C3;margin:18px 0 16px}
+  .lh-lines i{display:block;height:6px;border-radius:2px;background:#E7E0D3;margin-bottom:9px}
+
+  .cards{display:flex;gap:18px}
+  .bcard{width:252px;height:152px;border-radius:10px;padding:18px;display:flex;
+         flex-direction:column;justify-content:space-between}
+  .bcard img{width:40px;height:40px;display:block}
+  .bcard.light{background:var(--paper);color:var(--ink);border:1px solid #DED6C7}
+  .bcard.dark{background:var(--ink);color:var(--paper);border:1px solid #1E2A33}
+  .bcard .who{font-family:Bahnschrift,sans-serif;font-weight:700;font-size:14px;letter-spacing:.6px}
+  .bcard .role{font-family:Consolas,monospace;font-size:9.5px;color:#8B8378;margin-top:4px}
+
+  .parcel{background:#C6A87B;border-radius:12px;padding:30px 40px;display:flex;justify-content:center}
+  .plabel{background:var(--paper);width:430px;padding:20px 22px;color:var(--ink);
+          transform:rotate(-1.2deg);box-shadow:0 12px 26px rgba(54,36,16,.34)}
+  .plabel .top{display:flex;align-items:center;gap:14px}
+  .plabel .top img{width:54px;height:54px;display:block}
+  .plabel .name{font-family:Bahnschrift,sans-serif;font-weight:700;font-size:15px;letter-spacing:4px}
+  .plabel .addr{font-family:Consolas,monospace;font-size:10px;color:#6E685D;line-height:1.75;
+                margin-top:12px}
+  .barcode{height:30px;margin-top:12px;opacity:.82;
+    background:repeating-linear-gradient(90deg,#0E1418 0 2px,transparent 2px 5px,
+      #0E1418 5px 6px,transparent 6px 9px,#0E1418 9px 12px,transparent 12px 14px)}
+
+  /* ---------- footer ---------- */
+  .rules{margin-top:72px;border-top:1px solid var(--line);padding-top:22px;
+         display:grid;grid-template-columns:1fr 1fr;gap:10px 40px;font-size:12.5px;
+         line-height:1.8;color:var(--muted)}
+  .rules b{color:var(--paper);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Posthaste · 放进产品里</h1>
+  <p class="lead">下面每一块都是仓库里真实文件按真实像素摆进去的，不是重画的示意图。
+     16 / 32 / 128 这些尺寸直接引用 <span class="mono">app-icon/</span> 和
+     <span class="mono">brand-mark/</span> 里的 PNG；文件路径写在每块下面。
+     用浏览器直接打开这个文件就行，不需要起服务。</p>
+
+  <!-- A. window -->
+  <section class="section">
+    <div class="label"><b>A · 主窗口</b><span>app-icon/icon-tiny-16.png</span></div>
+    <div class="win">
+      <div class="titlebar">
+        <img src="app-icon/icon-tiny-16.png" width="16" height="16" alt="">
+        <span class="appname">posthaste</span>
+        <span class="vline"></span>
+        <span class="doc">untitled — api.posthaste.dev</span>
+        <span class="dots"><i></i><i></i><i></i></span>
+      </div>
+      <div class="winbody">
+        <div class="side">
+          <h4>COLLECTIONS</h4>
+          <ul>
+            <li class="on"><i></i>本地</li>
+            <li><i></i>posthaste-api</li>
+            <li><i></i>草稿</li>
+          </ul>
+          <h4>HISTORY</h4>
+          <div class="hist">GET &nbsp;/v1/requests<br>POST /v1/send<br>WS &nbsp;&nbsp;/v1/stream</div>
+        </div>
+        <div class="main">
+          <div class="tabs">
+            <div class="tab"><i></i>GET untitled</div>
+            <div class="add">+</div>
+          </div>
+          <div class="urlbar">
+            <span class="method">GET</span>
+            <span class="url">https://api.posthaste.dev/v1/requests</span>
+            <span class="send">SEND</span>
+          </div>
+          <div class="resp">
+            <div class="head"><span>RESPONSE</span><b>200 OK</b><span>128 ms · 1.4 kB</span></div>
+            <div class="json">
+              <span class="p">{</span><br>
+              &nbsp;&nbsp;<span class="k">"delivered"</span><span class="p">:</span>
+              <span class="s">true</span><span class="p">,</span><br>
+              &nbsp;&nbsp;<span class="k">"service"</span><span class="p">:</span>
+              <span class="s">"posthaste"</span><span class="p">,</span><br>
+              &nbsp;&nbsp;<span class="k">"latency_ms"</span><span class="p">:</span>
+              <span class="n">128</span><br>
+              <span class="p">}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note">标题栏 16px 用 A2 的简化稿：没有齿孔、没有邮资红点。这一款是全应用唯一的图标来源。</p>
+  </section>
+
+  <!-- B. splash + about -->
+  <section class="section">
+    <div class="label"><b>B · 启动页与关于</b><span>brand-mark/badge-512.png · brand-mark/badge-128.png</span></div>
+    <div class="row side">
+      <div>
+        <div class="splash">
+          <img src="brand-mark/badge-512.png" alt="">
+          <div class="word">POSTHASTE</div>
+          <div class="sub">BY RETURN OF POST</div>
+          <div class="bar"><i></i></div>
+        </div>
+        <p class="note">启动页是 C3 的主场：一整块蜡、一枚压印。这里是它唯一需要 512 的场合。</p>
+      </div>
+      <div>
+        <div class="about">
+          <div class="top">
+            <img src="brand-mark/badge-128.png" width="72" height="72" alt="">
+            <div>
+              <h3>Posthaste</h3>
+              <p>0.5.3 (x86_64-pc-windows-msvc)</p>
+            </div>
+          </div>
+          <div class="rule"></div>
+          <div class="meta">本地优先的 HTTP 客户端<br>
+            工作区与历史都存在本机。</div>
+          <div class="btns"><span class="btn">检查更新</span><span class="btn primary">关闭</span></div>
+        </div>
+        <p class="note">关于页 128：标记还清楚，徽章上的名字已经糊成一条灰线。要读名字就用 256 起。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- C. taskbar / tray / browser tabs -->
+  <section class="section">
+    <div class="label"><b>C · 任务栏、托盘、标签页</b><span>app-icon/icon-tiny-32.png · app-icon/icon-tiny-16.png</span></div>
+    <div class="taskbar">
+      <div class="start"><i></i><i></i><i></i><i></i></div>
+      <div class="pin"><img src="app-icon/icon-tiny-32.png" width="32" height="32" alt=""></div>
+      <div class="pin active"><img src="app-icon/icon-tiny-32.png" width="32" height="32" alt=""></div>
+      <div class="spacer"></div>
+      <div class="tray">
+        <span class="t"><img src="app-icon/icon-tiny-16.png" width="16" height="16" alt=""></span>
+        <span class="t"><img src="app-icon/icon-tiny-16.png" width="16" height="16" alt=""></span>
+        <span class="clock">08:14<br>2026/11/20</span>
+      </div>
+    </div>
+    <div class="row two" style="margin-top:28px">
+      <div>
+        <div class="tabsbar">
+          <div class="btab on"><img class="fav" src="app-icon/icon-tiny-16.png" alt="">Posthaste — api.posthaste.dev<span class="x">×</span></div>
+          <div class="btab"><img class="fav" src="app-icon/icon-tiny-16.png" alt="">文档 · Posthaste</div>
+          <div class="btab"><img class="fav" src="app-icon/icon-tiny-16.png" alt="">新标签页</div>
+        </div>
+        <p class="note">16px 在浏览器标签、托盘、favicon 里是同一个文件：真彩、无红点。</p>
+      </div>
+      <div>
+        <div class="installer">
+          <img src="app-icon/icon-128.png" width="72" height="72" alt="">
+          <div>
+            <h3>Posthaste 0.5.3</h3>
+            <span class="v">Windows · 64 位 · 12.4 MB</span>
+            <div class="path">C:\Users\you\AppData\Local\Posthaste</div>
+            <div class="btns"><span class="btn">更改目录</span><span class="btn primary">安装</span></div>
+          </div>
+        </div>
+        <p class="note">安装包与商店卡片用 128；图标是方的，和系统里的其它应用排在一起不吃亏。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D. docs header -->
+  <section class="section">
+    <div class="label"><b>D · 文档站页眉（浅）</b><span>app-icon/lockup.png</span></div>
+    <div class="paper">
+      <div class="dochead">
+        <img src="app-icon/lockup.png" alt="">
+        <nav><b>指南</b><span>快捷键</span><span>更新日志</span><span>源码</span></nav>
+        <div class="search">搜索文档</div>
+      </div>
+    </div>
+    <p class="note">浅底字标直接铺在 #F2EDE3 上：字标自己带纸色底板，所以不会出现第二条白边。</p>
+  </section>
+
+  <!-- E. readme -->
+  <section class="section">
+    <div class="label"><b>E · README 头图（深）</b><span>app-icon/lockup-dark.png</span></div>
+    <div class="readme">
+      <img src="app-icon/lockup-dark.png" alt="">
+      <div class="srcline"><b>![Posthaste](</b>resources/brand/app-icon/lockup-dark.png<b>)</b></div>
+    </div>
+    <p class="note">深色版用 #0B1116 底，和 GitHub 的暗色主题接近；蓝点是整张图里唯一的高饱和。</p>
+  </section>
+
+  <!-- F. social card -->
+  <section class="section">
+    <div class="label"><b>F · 社交卡 1280×630</b><span>brand-mark/badge-512.png</span></div>
+    <div class="row side">
+      <div class="cardbox">
+        <div class="card">
+          <img src="brand-mark/badge-512.png" alt="">
+          <div>
+            <h2>POSTHASTE</h2>
+            <div class="tag">本地优先的 HTTP 客户端</div>
+          </div>
+          <div class="rule"></div>
+          <div class="foot">PRESSED, AND SENT · GITHUB.COM/…</div>
+        </div>
+      </div>
+      <div>
+        <p class="note" style="margin-top:0">这张卡是按 1280×630 画的，页面里缩到一半看比例；
+          截图时用 1:1 输出即可。蜡红放在整块深色上，是 C3 最占便宜的一格。</p>
+        <p class="note">同一套骨架换成 A2：把左边换成 icon-512 的方形 tile，蓝色 `»` 会代替蜡红成为主色。
+          两个版本不要混用——一张卡里只出现一个标记。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- G. mono / print -->
+  <section class="section">
+    <div class="label"><b>G · 单色：印刷与包裹</b><span>app-icon/mono.png · brand-mark/mono.png · mono-inverse.png</span></div>
+    <div class="row two">
+      <div>
+        <div class="letterhead">
+          <div class="lh-head">
+            <img src="app-icon/mono.png" alt="">
+            <div>
+              <div class="lh-name">POSTHASTE</div>
+              <div class="lh-sub">BY RETURN OF POST</div>
+            </div>
+            <div class="lh-meta">No. 0413<br>2026 / 11 / 20</div>
+          </div>
+          <div class="lh-rule"></div>
+          <div class="lh-lines" style="width:92%"><i></i><i style="width:78%"></i><i style="width:86%"></i><i style="width:40%"></i></div>
+        </div>
+        <p class="note">发件单 / 信纸：单色标记是页眉里的印章，不是彩色 logo。这一版对应丝印和单色激光打印。</p>
+      </div>
+      <div>
+        <div class="cards">
+          <div class="bcard light">
+            <img src="app-icon/mono.png" alt="">
+            <div>
+              <div class="who">POSTHASTE</div>
+              <div class="role">HTTP, locally.</div>
+            </div>
+          </div>
+          <div class="bcard dark">
+            <img src="brand-mark/mono-inverse.png" alt="">
+            <div>
+              <div class="who">POSTHASTE</div>
+              <div class="role">by return of post</div>
+            </div>
+          </div>
+        </div>
+        <p class="note">名片正反：浅面用 <code>mono</code>，深面用 <code>mono-inverse</code>。
+          两张都是满版单色，没有渐变和第二种红。</p>
+      </div>
+    </div>
+
+    <div class="parcel" style="margin-top:32px">
+      <div class="plabel">
+        <div class="top">
+          <img src="brand-mark/mono.png" alt="">
+          <div>
+            <div class="name">POSTHASTE</div>
+            <div class="addr">收件 / TO &nbsp;·&nbsp; 本地优先工作室<br>
+              100020 · 北京 &nbsp;·&nbsp; RMA 0413 &nbsp;·&nbsp; 1.4 kB</div>
+          </div>
+        </div>
+        <div class="barcode"></div>
+      </div>
+    </div>
+    <p class="note">包裹面单：圆形的 C3 在这里读作邮戳。纸面是 #F2EDE3，所以 <code>mono.png</code> 直接放上去不产生第二条白边；
+      换到牛皮纸底色上就需要透明版——那版还没做。</p>
+  </section>
+
+  <div class="rules">
+    <div><b>尺寸规则</b><br>A2 从 16 到 512；C3 从 128 起，再小归 A2。</div>
+    <div><b>颜色规则</b><br>蜡红只出现在没有 DELETE、没有蓝色按钮的表面。</div>
+    <div><b>文件规则</b><br>每一档用对应尺寸的 PNG，不要拿 512 缩到 16。</div>
+    <div><b>组合规则</b><br>同屏只出现一个标记；两个标记不并排做“双 logo”。</div>
+  </div>
+
+</div>
+</body>
+</html>

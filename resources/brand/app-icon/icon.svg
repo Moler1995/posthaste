@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+    <defs>
+      <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#131A21"/><stop offset="1" stop-color="#0B1015"/>
+      </linearGradient>
+    </defs>
+    <rect width="512" height="512" rx="112" fill="url(#tile)"/>
+    <rect x="0.5" y="0.5" width="511" height="511" rx="111.5" fill="none"
+          stroke="#FFFFFF" stroke-opacity="0.07"/>
+    <g transform="translate(256 256) scale(1.02) translate(-256 -256)">
+    <defs><mask id="stm2">
+      <path d="M 141 113 H 371 V 399 H 203 L 141 337 Z" fill="#fff"/>
+      <g fill="#000"><circle cx="160" cy="113" r="13"/><circle cx="198" cy="113" r="13"/><circle cx="236" cy="113" r="13"/><circle cx="274" cy="113" r="13"/><circle cx="312" cy="113" r="13"/><circle cx="350" cy="113" r="13"/><circle cx="160" cy="399" r="13"/><circle cx="198" cy="399" r="13"/><circle cx="236" cy="399" r="13"/><circle cx="274" cy="399" r="13"/><circle cx="312" cy="399" r="13"/><circle cx="350" cy="399" r="13"/><circle cx="141" cy="132" r="13"/><circle cx="141" cy="170" r="13"/><circle cx="141" cy="208" r="13"/><circle cx="141" cy="246" r="13"/><circle cx="141" cy="284" r="13"/><circle cx="141" cy="322" r="13"/><circle cx="371" cy="132" r="13"/><circle cx="371" cy="170" r="13"/><circle cx="371" cy="208" r="13"/><circle cx="371" cy="246" r="13"/><circle cx="371" cy="284" r="13"/><circle cx="371" cy="322" r="13"/></g>
+    </mask></defs>
+    <g transform="rotate(-9 256 256)">
+      <path d="M 141 113 H 371 V 399 H 203 L 141 337 Z" fill="#F2EDE3" mask="url(#stm2)"/>
+      <path d="M 151 123 H 361 V 389 H 205 L 151 335 Z" fill="none" stroke="#0E1418"
+            stroke-opacity="0.22" stroke-width="2"/>
+      <g fill="none" stroke="#4D8DFF" stroke-width="20" stroke-linecap="round"
+         stroke-linejoin="round">
+        <path d="M 198 208 L 244 256 L 198 304"/>
+        <path d="M 248 208 L 294 256 L 248 304"/>
+      </g>
+      <circle cx="318" cy="300" r="12" fill="#E2604C"/>
+      <path d="M 145 340 L 205 400" stroke="#0E1418" stroke-opacity="0.14"
+            stroke-width="7"/>
+      <path d="M 141 337 L 203 399 L 203 337 Z" fill="#DCD3C2"/>
+      <path d="M 141 337 L 203 399"
+            stroke="#B4A98F" stroke-width="2"/>
+    </g>
+    </g>
+    </svg>

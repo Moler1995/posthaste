@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" fill="#F2EDE3"/><g transform="translate(256 256) scale(1.3) translate(-256 -256)">
+    <g transform="rotate(-9 256 256)">
+      <path d="M 141 113 H 371 V 399 H 203 L 141 337 Z" fill="#0E1418"/>
+      <g fill="#F2EDE3"><circle cx="160" cy="113" r="13"/><circle cx="198" cy="113" r="13"/><circle cx="236" cy="113" r="13"/><circle cx="274" cy="113" r="13"/><circle cx="312" cy="113" r="13"/><circle cx="350" cy="113" r="13"/><circle cx="160" cy="399" r="13"/><circle cx="198" cy="399" r="13"/><circle cx="236" cy="399" r="13"/><circle cx="274" cy="399" r="13"/><circle cx="312" cy="399" r="13"/><circle cx="350" cy="399" r="13"/><circle cx="141" cy="132" r="13"/><circle cx="141" cy="170" r="13"/><circle cx="141" cy="208" r="13"/><circle cx="141" cy="246" r="13"/><circle cx="141" cy="284" r="13"/><circle cx="141" cy="322" r="13"/><circle cx="371" cy="132" r="13"/><circle cx="371" cy="170" r="13"/><circle cx="371" cy="208" r="13"/><circle cx="371" cy="246" r="13"/><circle cx="371" cy="284" r="13"/><circle cx="371" cy="322" r="13"/></g>
+      <g fill="none" stroke="#F2EDE3" stroke-width="20" stroke-linecap="round"
+         stroke-linejoin="round">
+        <path d="M 198 208 L 244 256 L 198 304"/>
+        <path d="M 248 208 L 294 256 L 248 304"/>
+      </g>
+    </g>
+    </g></svg>

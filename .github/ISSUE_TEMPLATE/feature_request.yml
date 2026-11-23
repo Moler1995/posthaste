@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a capability or an improvement.
+title: '[Feature]: '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the outcome you want. Posthaste is
+        local-first and ships as a single binary; proposals that fit that
+        scope are easiest to plan.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should Posthaste do instead, from the user's point of view?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you have tried.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: References, comparable tools, or examples.
+    validations:
+      required: false

@@ -1,0 +1,27 @@
+# Rust
+/target
+tools/fxc-shim/target/
+**/*.rs.bk
+*.pdb
+
+# Release archives
+/dist/
+
+# Logs
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.openidea/
+.vscode/
+*.swp
+
+# Local tool settings
+.claude/settings.local.json
+
+# Agent worktrees
+.claude/worktrees/
+
+# OpenSpec planning record (local only; not published)
+/openspec/

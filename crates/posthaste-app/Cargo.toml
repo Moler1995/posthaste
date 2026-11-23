@@ -1,0 +1,68 @@
+[package]
+name = "posthaste-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "posthaste"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+bytes.workspace = true
+# Formats history timestamps in the machine's local time zone; entries keep
+# storing Unix milliseconds, so the zone is applied only when displaying.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+posthaste-core = { path = "../posthaste-core" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-segmentation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The manifest is required: without it comctl32 v5 is loaded and
+# `TaskDialogIndirect` (imported by gpui) is missing, so the exe fails to start.
+# `windows-manifest` compiles the .rc through MinGW's `windres`, which must be on PATH.
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+# Reads the main window's HWND so the shell can own the non-client frame's hit
+# testing and resize cursor. Must match the version gpui implements.
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.build-dependencies]
+# Reuses the same `windres` that gpui's windows-manifest feature requires.
+embed-resource = "3.0"
+
+[target.'cfg(not(windows))'.dependencies]
+gpui = { version = "=0.2.2" }
+
+[dev-dependencies]
+# Tests run a real WebSocket server through tungstenite's blocking API.
+tokio-tungstenite.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+bytes.workspace = true
+gpui = {
+    version = "=0.2.2",
+    default-features = false,
+    features = ["windows-manifest", "test-support"],
+}
+
+[target.'cfg(not(windows))'.dev-dependencies]
+bytes.workspace = true
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
+[features]
+test-support = ["gpui/test-support"]
+# Keep the console subsystem (and stderr logs) on Windows for debugging.
+windows-console = []
+
+[lints.rust]
+# rustc's windows-gnu startup objects and gpui each embed a manifest; GNU ld
+# reports "multiple non-default manifests" but the resulting exe starts and
+# renders correctly. See design D3.
+linker_messages = "allow"
