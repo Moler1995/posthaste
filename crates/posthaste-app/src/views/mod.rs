@@ -1016,7 +1016,7 @@ mod tests {
     /// against their longest label instead of guessed.
     fn shaped_width(cx: &mut VisualTestContext, text: &str, role: crate::metrics::TypeRole) -> f32 {
         let text: gpui::SharedString = text.to_owned().into();
-        let mut face = gpui::font(crate::metrics::UI_FONT);
+        let mut face = gpui::font(crate::metrics::ui_font());
         face.weight = role.weight();
         let run = gpui::TextRun {
             len: text.len(),

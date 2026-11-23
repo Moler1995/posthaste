@@ -46,7 +46,7 @@ use super::ui::{EmptyStateScale, empty_state};
 use crate::history::format_timestamp_ms;
 use crate::i18n::{self, Key, MessageKey, counted};
 use crate::metrics::{
-    MONO_FONT, TypeRole, TypeStyle as _, editor_font_size, layout, radius, resolve_type_role,
+    TypeRole, TypeStyle as _, editor_font_size, layout, mono_font, radius, resolve_type_role,
     space, type_role,
 };
 use crate::theme;
@@ -176,7 +176,7 @@ fn hscroll_thumb(viewport: Pixels, max: Pixels) -> Option<(Pixels, Pixels)> {
 /// the line-number gutter, divided by the code font's advance, floored at one.
 fn wrap_columns(window: &mut Window, width: Pixels, line_count: usize) -> usize {
     let gutter = gutter_width(window, line_count);
-    let font = gpui::font(MONO_FONT);
+    let font = gpui::font(mono_font());
     let font_id = window.text_system().resolve_font(&font);
     let advance = window
         .text_system()

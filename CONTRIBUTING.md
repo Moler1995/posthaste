@@ -102,11 +102,30 @@ request and every push to `main`; a run is green only when all three pass. Lint
 warnings fail the run. The gpui smoke tests are gated behind gpui's
 `test-support` feature, which the Windows dev-dependency enables automatically.
 
+On Linux and macOS the run also builds the application and starts it once
+through `scripts/smoke-launch.sh`: Linux under Xvfb with Mesa's software Vulkan
+driver, macOS in the runner's own session. The step fails when the window is not
+created or the first frame is not reported, which is the part the headless tests
+cannot cover. Windows runtime behavior stays on the manual checklist because
+hosted Windows runners have no interactive desktop.
+
 To see gpui's stderr diagnostics on Windows, build with the console subsystem:
 
 ```bash
 cargo run -p posthaste-app --features windows-console
 ```
+
+To verify that a build starts and paints, set `POSTHASTE_SMOKE_EXIT_AFTER_FRAME`
+to any non-empty value. The application exits successfully directly after its
+first rendered frame and prints `posthaste smoke: first frame rendered` to
+stderr; if no frame arrives within 30 seconds it exits non-zero instead. It is
+a verification aid: it adds no command-line option and is off by default.
+
+`scripts/smoke-launch.sh <binary>` wraps that check: it creates a temporary
+workspace, redirects preferences, recents, and cookies, launches the binary
+with the variable set, waits at most 120 seconds, and fails unless the
+first-frame confirmation is present and the application exited successfully.
+It is the same launch the platform runtime checks run in CI.
 
 In an empty workspace nothing is selected, so the request pane edits an
 unsaved draft that stays in memory. To start the app with that draft prefilled:
