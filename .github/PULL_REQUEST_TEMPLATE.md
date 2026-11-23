@@ -1,7 +1,6 @@
 ## Summary
 
-<!-- What changed, why it is needed, and which OpenSpec change it implements
-     (if any). Link the change directory or the archived change. -->
+<!-- What changed and why it is needed. Link the issue it fixes, if any. -->
 
 ## Tests run
 

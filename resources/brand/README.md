@@ -68,8 +68,8 @@ environment and formal clearance was not performed.
 
 ## Provenance
 
-The generators and exploration sheets live outside the repo, in the logo study
-folder on the Desktop. The SVGs are plain and editable; the PNGs are Chrome
+The generators and exploration sheets are kept outside the repository. The
+SVGs are plain and editable; the PNGs are Chrome
 rasterisations at 1× with a LANCZOS ladder. `brand-mark/seal.png` is a
 transparent Chrome render of the seal group from `badge.svg` (viewBox
 `250 160 524 524`, 1024×1024, no background or wordmark); the icon packer

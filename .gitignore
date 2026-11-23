@@ -25,3 +25,4 @@ tools/fxc-shim/target/
 
 # OpenSpec planning record (local only; not published)
 /openspec/
+.claude/commands/opsx/

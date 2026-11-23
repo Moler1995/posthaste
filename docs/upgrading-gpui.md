@@ -39,7 +39,7 @@ patch when `zed-async-tar` moves to xattr 1.x.
 3. Build and run on Windows:
 
    ```powershell
-   $env:PATH = "D:\tools\mingw64\bin;$env:PATH"
+   $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
    cargo run -p posthaste-app
    ```
 
