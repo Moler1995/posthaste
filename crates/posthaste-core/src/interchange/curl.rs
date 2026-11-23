@@ -1451,21 +1451,21 @@ mod tests {
         assert!(error.to_string().contains("1048576"));
     }
 
-    /// The README is the panel's public documentation, so its example must be
-    /// text this parser actually accepts.
+    /// The user guide is the panel's public documentation, so its example must
+    /// be text this parser actually accepts.
     #[test]
-    fn the_readme_curl_examples_parse() {
-        let readme = include_str!("../../../../README.md");
-        let section = readme
+    fn the_guide_curl_examples_parse() {
+        let guide = include_str!("../../../../docs/guide.md");
+        let section = guide
             .split("### Pasting cURL")
             .nth(1)
-            .expect("the README documents pasting cURL");
+            .expect("the guide documents pasting cURL");
         let block = section
             .split("```sh")
             .nth(1)
             .expect("the section has a shell example");
         let document = block.split("```").next().expect("the example is closed");
-        let bundle = parse_curl_text(document, "README cURL").expect("the examples parse");
+        let bundle = parse_curl_text(document, "guide cURL").expect("the examples parse");
         let requests = &bundle.collections[0].requests;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].name, "GET /v1/users");

@@ -805,15 +805,15 @@ mod tests {
         assert_eq!(keys, vec!["page", "limit"]);
     }
 
-    /// The README's example is the format's public documentation, so it must be
+    /// The guide's example is the format's public documentation, so it must be
     /// a document this build actually accepts.
     #[test]
-    fn the_readme_bundle_example_parses() {
-        let readme = include_str!("../../../../README.md");
-        let section = readme
+    fn the_guide_bundle_example_parses() {
+        let guide = include_str!("../../../../docs/guide.md");
+        let section = guide
             .split("## Import and export")
             .nth(1)
-            .expect("the README documents the bundle format");
+            .expect("the guide documents the bundle format");
         let block = section
             .split("```json")
             .nth(1)
@@ -822,8 +822,7 @@ mod tests {
             .split("```")
             .next()
             .expect("the example fence is closed");
-        let format =
-            sniff("readme.json", document.as_bytes()).expect("the example is recognizable");
+        let format = sniff("guide.json", document.as_bytes()).expect("the example is recognizable");
         let bundle = parse(format, document.as_bytes()).expect("the example parses");
         assert_eq!(bundle.collections[0].name, "Petstore");
         assert_eq!(bundle.collections[0].requests[0].name, "List animals");

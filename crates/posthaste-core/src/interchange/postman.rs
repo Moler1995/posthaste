@@ -1720,15 +1720,15 @@ mod tests {
         assert_ne!(first["info"]["_postman_id"], second["info"]["_postman_id"]);
     }
 
-    /// The README's Postman example is the format's public documentation, so it
+    /// The guide's Postman example is the format's public documentation, so it
     /// must be a document this build actually accepts.
     #[test]
-    fn the_readme_postman_example_parses() {
-        let readme = include_str!("../../../../README.md");
-        let section = readme
+    fn the_guide_postman_example_parses() {
+        let guide = include_str!("../../../../docs/guide.md");
+        let section = guide
             .split("### Postman collections")
             .nth(1)
-            .expect("the README documents the Postman format");
+            .expect("the guide documents the Postman format");
         let block = section
             .split("```json")
             .nth(1)
@@ -1737,7 +1737,7 @@ mod tests {
             .split("```")
             .next()
             .expect("the example fence is closed");
-        let format = super::super::sniff("readme.postman_collection.json", document.as_bytes())
+        let format = super::super::sniff("guide.postman_collection.json", document.as_bytes())
             .expect("the example is recognizable");
         let bundle = super::super::parse(format, document.as_bytes()).expect("the example parses");
         assert_eq!(bundle.collections[0].name, "Petstore");
