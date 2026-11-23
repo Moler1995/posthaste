@@ -10,7 +10,7 @@ platform is described as supported.
 | Platform | Build and tests | Automated launch | Manual checklist | Release artifacts |
 | --- | --- | --- | --- | --- |
 | Windows (x86_64-pc-windows-gnu) | CI, every pull request | Scripted locally (hosted runners have no desktop) | Passed through ordinary use; formal run pending | Portable zip |
-| Linux (x86_64) | CI, every pull request | CI under Xvfb with Mesa's software Vulkan driver | Not run | None |
+| Linux (x86_64) | CI, every pull request | CI under Xvfb with Mesa's software Vulkan driver and openbox | Not run | None |
 | macOS | CI, every pull request | CI in the runner's session | Not run | None |
 
 The automated launch proves that the application creates its window and paints
@@ -34,8 +34,11 @@ the tests pass) and, where the automated launch applies, **runtime-checked**
    user data is read or written; the launch enables
    `POSTHASTE_SMOKE_EXIT_AFTER_FRAME`, which exits successfully directly after
    the first rendered frame and fails after 30 seconds if no frame arrives.
-   Linux runs under Xvfb with Mesa's software Vulkan driver (lavapipe), so it
-   needs no GPU or logged-in desktop. Windows runtime behavior stays manual
+   Linux runs under Xvfb with Mesa's software Vulkan driver (lavapipe) and the
+   openbox window manager, so it needs no GPU or logged-in desktop. The window
+   manager matters: gpui starts its frame loop from the window's map and
+   visibility events, and with no window manager those can be handled before
+   the loop is running, so the frame never arrives. Windows runtime behavior stays manual
    because hosted Windows runners have no interactive desktop.
 3. **Manual checklist.** The items below, performed by a person on real
    hardware. This is the only step that verifies behavior beyond window

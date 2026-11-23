@@ -65,7 +65,9 @@ sudo apt-get install -y --no-install-recommends \
 ```
 
 The CI job is the source of truth: if the build asks for a package that is not
-in this list, add it here and to the workflow in the same pull request.
+in this list, add it here and to the workflow in the same pull request. The
+runtime launch check additionally needs `xvfb`, `openbox`, and
+`mesa-vulkan-drivers` (lavapipe); they are installed for it, not for building.
 
 ### macOS
 
@@ -104,7 +106,8 @@ warnings fail the run. The gpui smoke tests are gated behind gpui's
 
 On Linux and macOS the run also builds the application and starts it once
 through `scripts/smoke-launch.sh`: Linux under Xvfb with Mesa's software Vulkan
-driver, macOS in the runner's own session. The step fails when the window is not
+driver and a minimal window manager (openbox), macOS in the runner's own
+session. The step fails when the window is not
 created or the first frame is not reported, which is the part the headless tests
 cannot cover. It is part of the same three required checks, not a separate
 optional job. Windows runtime behavior stays on the manual checklist because

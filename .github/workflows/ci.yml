@@ -60,7 +60,8 @@ jobs:
 
       # gpui's Linux backend links against these; the list is verified by the
       # build itself, so a missing package fails here instead of going stale.
-      # xvfb and mesa-vulkan-drivers (lavapipe) serve the runtime launch check.
+      # xvfb, openbox, and mesa-vulkan-drivers (lavapipe) serve the runtime
+      # launch check.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -78,6 +79,7 @@ jobs:
             lld \
             cmake \
             mesa-vulkan-drivers \
+            openbox \
             xvfb
 
       - name: Install Rust
@@ -113,25 +115,19 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo +${{ matrix.toolchain }} build -p posthaste-app
 
-      # TEMPORARY: diagnostics for the Linux smoke launch. Remove once the
-      # first frame is understood.
-      - name: Probe the virtual display
+      # gpui starts its frame refresh loop from the window's map and
+      # visibility events. With no window manager those can be handled
+      # before the loop is running, and then no frame ever arrives, so
+      # openbox maps the window the way a desktop would.
+      - name: Runtime smoke (virtual display)
         if: runner.os == 'Linux'
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
-          sudo apt-get install -y --no-install-recommends openbox x11-utils
           xvfb-run -a -s "-screen 0 1280x800x24" sh -c '
             openbox >/dev/null 2>&1 &
             sleep 1
             sh scripts/smoke-launch.sh target/debug/posthaste
           '
-
-      - name: Runtime smoke (virtual display)
-        if: runner.os == 'Linux'
-        timeout-minutes: 5
-        env:
-          RUST_LOG: debug
-        run: xvfb-run -a -s "-screen 0 1280x800x24" sh scripts/smoke-launch.sh target/debug/posthaste
 
       - name: Runtime smoke
         if: runner.os == 'macOS'
