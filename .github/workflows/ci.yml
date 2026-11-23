@@ -119,12 +119,11 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: |
-          sudo apt-get install -y --no-install-recommends vulkan-tools x11-utils
+          sudo apt-get install -y --no-install-recommends openbox x11-utils
           xvfb-run -a -s "-screen 0 1280x800x24" sh -c '
-            echo "--- X extensions"
-            xdpyinfo -queryExtensions 2>&1 | grep -iE "present|composite|dri" || echo "(no present/composite/dri)"
-            echo "--- Vulkan"
-            vulkaninfo --summary 2>&1 | head -40
+            openbox >/dev/null 2>&1 &
+            sleep 1
+            sh scripts/smoke-launch.sh target/debug/posthaste
           '
 
       - name: Runtime smoke (virtual display)
