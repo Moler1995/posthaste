@@ -113,9 +113,25 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo +${{ matrix.toolchain }} build -p posthaste-app
 
+      # TEMPORARY: diagnostics for the Linux smoke launch. Remove once the
+      # first frame is understood.
+      - name: Probe the virtual display
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get install -y --no-install-recommends vulkan-tools x11-utils
+          xvfb-run -a -s "-screen 0 1280x800x24" sh -c '
+            echo "--- X extensions"
+            xdpyinfo -queryExtensions 2>&1 | grep -iE "present|composite|dri" || echo "(no present/composite/dri)"
+            echo "--- Vulkan"
+            vulkaninfo --summary 2>&1 | head -40
+          '
+
       - name: Runtime smoke (virtual display)
         if: runner.os == 'Linux'
         timeout-minutes: 5
+        env:
+          RUST_LOG: debug
         run: xvfb-run -a -s "-screen 0 1280x800x24" sh scripts/smoke-launch.sh target/debug/posthaste
 
       - name: Runtime smoke

@@ -44,7 +44,7 @@ while kill -0 "$pid" 2>/dev/null; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
         echo "smoke launch: the application did not exit within 120 s" >&2
-        sed 's/^/  /' "$log" >&2
+        tail -n 200 "$log" | sed 's/^/  /' >&2
         exit 1
     fi
     sleep 1
@@ -56,13 +56,13 @@ wait "$pid" || status=$?
 
 if [ "$status" -ne 0 ]; then
     echo "smoke launch: the application exited with status $status" >&2
-    sed 's/^/  /' "$log" >&2
+    tail -n 200 "$log" | sed 's/^/  /' >&2
     exit 1
 fi
 
 if ! grep -q 'posthaste smoke: first frame rendered' "$log"; then
     echo "smoke launch: the first-frame confirmation is missing" >&2
-    sed 's/^/  /' "$log" >&2
+    tail -n 200 "$log" | sed 's/^/  /' >&2
     exit 1
 fi
 

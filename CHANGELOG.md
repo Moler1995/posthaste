@@ -61,5 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Send and other Enter-triggered actions no longer fire while a Windows IME
   composition is active.
+- Interface and code text use font families the host actually has installed,
+  chosen at startup. Before, Linux and macOS asked for families that do not
+  exist there, and a host with only a minimal font set could not start at all.
 
 [Unreleased]: https://github.com/Moler1995/posthaste/commits/main

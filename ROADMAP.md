@@ -53,6 +53,9 @@ Delivered so far:
   dark/light/system themes, and an English/简体中文 interface.
 - Cross-platform CI, a tag-driven release workflow, contributor and issue
   templates, a changelog, and an unsigned portable Windows build.
+- Runtime launch checks on Linux (Xvfb with a software Vulkan driver) and macOS
+  in CI, font families resolved from what the host has installed, and a
+  [platform status page](docs/platform-support.md) with a manual checklist.
 
 ## In progress — release readiness
 
@@ -65,6 +68,8 @@ Delivered so far:
 - [x] Portable Windows zip with icon and embedded manifest, built without the
       Windows SDK.
 - [x] Unsigned-binary and SmartScreen notes.
+- [x] Runtime launch verification on Linux and macOS in CI, and a recorded
+      platform status page with its manual checklist.
 - [ ] The first tagged release, and branch protection for `main`.
 - [ ] Crash/error reporting that stays local (no telemetry).
 - [ ] Non-Windows release artifacts (Linux/macOS); Windows remains the only

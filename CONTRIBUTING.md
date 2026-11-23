@@ -106,8 +106,11 @@ On Linux and macOS the run also builds the application and starts it once
 through `scripts/smoke-launch.sh`: Linux under Xvfb with Mesa's software Vulkan
 driver, macOS in the runner's own session. The step fails when the window is not
 created or the first frame is not reported, which is the part the headless tests
-cannot cover. Windows runtime behavior stays on the manual checklist because
-hosted Windows runners have no interactive desktop.
+cannot cover. It is part of the same three required checks, not a separate
+optional job. Windows runtime behavior stays on the manual checklist because
+hosted Windows runners have no interactive desktop. What each platform has been
+verified for, and the checklist a person runs, are on the
+[platform support](docs/platform-support.md) page.
 
 To see gpui's stderr diagnostics on Windows, build with the console subsystem:
 
@@ -161,7 +164,8 @@ Security problems go through [SECURITY.md](SECURITY.md), never a public issue.
   platform-specific behavior by hand, and the changelog decision.
 - The pull request is mergeable only when the **CI** workflow is green on
   every platform: `Check (Windows (GNU))`, `Check (Linux)`, and
-  `Check (macOS)`.
+  `Check (macOS)`. The Linux and macOS jobs include the runtime launch, so a
+  window that cannot be created or painted fails the check.
 - User-visible changes add a `CHANGELOG.md` entry under `Unreleased`.
 - Formatting and lint warnings fail the run; there is no separate style
   review.
