@@ -14,7 +14,6 @@
 //! and values must never reach a log or a panic message.
 
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -27,6 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::model::{RequestSpec, ResponseCookie};
+use crate::storage::persist_bytes_atomic;
 
 /// Version of the persisted jar envelope. A file written by another version is
 /// ignored instead of guessed at.
@@ -395,18 +395,13 @@ impl CookieJar {
 
 /// Writes the cookie list for `persistence` atomically.
 ///
-/// The temporary file is created in the destination directory so the final
-/// rename stays on one filesystem and an interrupted write leaves the previous
-/// file intact.
+/// The write goes through the workspace storage helper, so the temporary file
+/// is created in the destination directory and an interrupted write leaves the
+/// previous file intact.
 fn write_cookie_file(
     persistence: &CookiePersistence,
     cookies: &[Cookie<'static>],
 ) -> Result<(), String> {
-    let Some(parent) = persistence.path.parent() else {
-        return Err("the cookie file has no parent directory".to_owned());
-    };
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     let file = CookieFile {
         schema_version: COOKIE_FILE_SCHEMA,
         workspace: persistence.workspace.clone(),
@@ -414,14 +409,8 @@ fn write_cookie_file(
     };
     let contents = serde_json::to_string(&file)
         .map_err(|error| format!("could not encode the cookie file: {error}"))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("could not create the cookie file: {error}"))?;
-    temp.write_all(contents.as_bytes())
-        .and_then(|()| temp.flush())
-        .map_err(|error| format!("could not write the cookie file: {error}"))?;
-    temp.persist(&persistence.path)
-        .map(|_| ())
-        .map_err(|error| format!("could not replace the cookie file: {}", error.error))
+    persist_bytes_atomic(&persistence.path, contents.as_bytes())
+        .map_err(|error| format!("could not write the cookie file: {error}"))
 }
 
 /// Count-only debug output: names and values are as sensitive as the values

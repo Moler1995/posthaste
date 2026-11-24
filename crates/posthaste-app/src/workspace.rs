@@ -14,7 +14,7 @@ use posthaste_core::interchange::{
 use posthaste_core::model::{Collection, Folder, FolderId, RequestId, RequestSpec, Workspace};
 use posthaste_core::storage::{
     DEFAULT_WORKSPACE_NAME, LoadedCollection, LoadedEnvironment, LoadedWorkspace, RequestEntry,
-    SaveIssues, StorageError, StorageIssue, WorkspaceStore,
+    SaveReport, StorageError, StorageIssue, WorkspaceStore,
 };
 use posthaste_core::variables::{VariableCatalog, Variables};
 
@@ -162,6 +162,9 @@ pub struct WorkspaceState {
     pub row_menu: Option<RowMenuTarget>,
     /// The item whose move destination is being chosen, if any.
     pub move_picker: Option<MoveTarget>,
+    /// Paths of issues that describe failed writes rather than failed loads.
+    /// A later successful save clears exactly these.
+    save_issue_paths: Vec<PathBuf>,
 }
 
 impl WorkspaceState {
@@ -211,6 +214,7 @@ impl WorkspaceState {
             delete_target: None,
             row_menu: None,
             move_picker: None,
+            save_issue_paths: Vec::new(),
         }
     }
 
@@ -236,6 +240,7 @@ impl WorkspaceState {
             delete_target: None,
             row_menu: None,
             move_picker: None,
+            save_issue_paths: Vec::new(),
         }
     }
 
@@ -581,9 +586,9 @@ impl WorkspaceState {
         if self.needs_resync {
             self.upsert_request(slug, request.clone());
             match self.resave(&store) {
-                Ok(issues) => {
+                Ok(report) => {
                     self.sync_index(&store, slug);
-                    self.record_save(Ok(issues));
+                    self.record_save(Ok(report));
                     true
                 }
                 Err(error) => {
@@ -594,8 +599,8 @@ impl WorkspaceState {
             }
         } else {
             match store.save_request(slug, &request) {
-                Ok(issues) => {
-                    self.issues.extend(issues);
+                Ok(report) => {
+                    self.issues.extend(report.into_issues());
                     self.upsert_request(slug, request);
                     self.sync_index(&store, slug);
                     self.finish_mutation(&store);
@@ -705,7 +710,7 @@ impl WorkspaceState {
         mut write_request: F,
     ) -> Option<Folder>
     where
-        F: FnMut(&WorkspaceStore, &str, &RequestSpec) -> Result<SaveIssues, StorageError>,
+        F: FnMut(&WorkspaceStore, &str, &RequestSpec) -> Result<SaveReport, StorageError>,
     {
         let Some(store) = self.store.clone() else {
             self.fail_unavailable();
@@ -815,7 +820,7 @@ impl WorkspaceState {
         // The collection document is the commit point: no request file is
         // written until the copied folder entries are on disk.
         match store.save_collection(&updated) {
-            Ok(issues) => self.issues.extend(issues),
+            Ok(report) => self.issues.extend(report.into_issues()),
             Err(error) => {
                 self.record_save(Err(error));
                 return None;
@@ -836,8 +841,8 @@ impl WorkspaceState {
         let mut failed = false;
         for request in copied_requests {
             match write_request(&store, slug, &request) {
-                Ok(issues) => {
-                    self.issues.extend(issues);
+                Ok(report) => {
+                    self.issues.extend(report.into_issues());
                     written.push(request);
                 }
                 Err(error) => {
@@ -1008,7 +1013,7 @@ impl WorkspaceState {
 
         if target != slug {
             match store.move_collection(slug, &target) {
-                Ok(issues) => self.issues.extend(issues),
+                Ok(()) => {}
                 Err(error) => {
                     self.push_storage_issue(
                         &store,
@@ -1034,8 +1039,7 @@ impl WorkspaceState {
         let mut resulting = target.clone();
         if result.is_err() && target != slug {
             match store.move_collection(&target, slug) {
-                Ok(issues) => {
-                    self.issues.extend(issues);
+                Ok(()) => {
                     if let Some(entry) = self
                         .collections
                         .iter_mut()
@@ -1270,7 +1274,7 @@ impl WorkspaceState {
         request.folder_id = parent_id;
         if !self.needs_resync {
             match store.save_request(to_slug, &request) {
-                Ok(issues) => self.issues.extend(issues),
+                Ok(report) => self.issues.extend(report.into_issues()),
                 Err(error) => {
                     self.record_save(Err(error));
                     return false;
@@ -1291,7 +1295,7 @@ impl WorkspaceState {
         if self.needs_resync {
             self.finish_mutation(store);
         } else {
-            self.record_save(Ok(Vec::new()));
+            self.record_save(Ok(SaveReport::default()));
         }
         true
     }
@@ -1473,7 +1477,7 @@ impl WorkspaceState {
         };
 
         match store.save_collection(&updated_target.collection) {
-            Ok(issues) => self.issues.extend(issues),
+            Ok(report) => self.issues.extend(report.into_issues()),
             Err(error) => {
                 self.record_save(Err(error));
                 return false;
@@ -1481,7 +1485,7 @@ impl WorkspaceState {
         }
         for spec in &moved {
             match store.save_request(to_slug, spec) {
-                Ok(issues) => self.issues.extend(issues),
+                Ok(report) => self.issues.extend(report.into_issues()),
                 Err(error) => {
                     roll_back(0);
                     self.record_save(Err(error));
@@ -1606,7 +1610,7 @@ impl WorkspaceState {
 
         if target != slug {
             match store.move_environment(slug, &target) {
-                Ok(issues) => self.issues.extend(issues),
+                Ok(()) => {}
                 Err(error) => {
                     self.push_storage_issue(&store, &error, "environment file could not be moved");
                     let result = self.save_environment_document(&store, slug);
@@ -1627,15 +1631,10 @@ impl WorkspaceState {
             }
         }
 
-        match self.save_environment_document(&store, &target) {
-            Ok(issues) => {
-                self.issues.extend(issues);
-                // The active selection is session state now; the rename does
-                // not rewrite `workspace.json`.
-                self.record_save(Ok(Vec::new()));
-            }
-            Err(error) => self.record_save(Err(error)),
-        }
+        // The active selection is session state now; the rename does not
+        // rewrite `workspace.json`.
+        let result = self.save_environment_document(&store, &target);
+        self.record_save(result);
         Some(target)
     }
 
@@ -1674,7 +1673,7 @@ impl WorkspaceState {
                 if self.workspace.active_environment.as_deref() == Some(slug) {
                     self.workspace.active_environment = None;
                 }
-                self.record_save(Ok(Vec::new()));
+                self.record_save(Ok(SaveReport::default()));
                 true
             }
             Err(error) => {
@@ -1701,7 +1700,7 @@ impl WorkspaceState {
 
     /// Writes `workspace.json`, or performs the full re-save when a previous
     /// write failed or the file could not be loaded safely.
-    fn persist_workspace(&self, store: &WorkspaceStore) -> Result<SaveIssues, StorageError> {
+    fn persist_workspace(&self, store: &WorkspaceStore) -> Result<SaveReport, StorageError> {
         if self.workspace_file_ok && !self.needs_resync {
             store.save_workspace(&self.workspace)
         } else {
@@ -1841,8 +1840,8 @@ impl WorkspaceState {
 
             for request in import.requests {
                 match store.save_request(&slug, &request) {
-                    Ok(issues) => {
-                        self.issues.extend(issues);
+                    Ok(report) => {
+                        self.issues.extend(report.into_issues());
                         outcome.requests += 1;
                         if let Some(entry) = self
                             .collections
@@ -1938,8 +1937,8 @@ impl WorkspaceState {
 
         for request in requests {
             match store.save_request(slug, &request) {
-                Ok(issues) => {
-                    self.issues.extend(issues);
+                Ok(report) => {
+                    self.issues.extend(report.into_issues());
                     outcome.requests += 1;
                     if let Some(entry) = self
                         .collections
@@ -2029,7 +2028,7 @@ impl WorkspaceState {
             let result = self.resave(store);
             self.record_save(result);
         } else {
-            self.record_save(Ok(Vec::new()));
+            self.record_save(Ok(SaveReport::default()));
         }
     }
 
@@ -2038,13 +2037,13 @@ impl WorkspaceState {
         self.needs_resync = true;
     }
 
-    fn resave(&self, store: &WorkspaceStore) -> Result<SaveIssues, StorageError> {
+    fn resave(&self, store: &WorkspaceStore) -> Result<SaveReport, StorageError> {
         if self.workspace_file_ok {
             store.save_all(&self.workspace, &self.collections, &self.environments)
         } else {
-            let mut issues = store.save_collections(&self.collections)?;
-            issues.extend(store.save_environments(&self.environments)?);
-            Ok(issues)
+            let mut report = store.save_collections(&self.collections);
+            report.append(store.save_environments(&self.environments));
+            Ok(report)
         }
     }
 
@@ -2054,7 +2053,7 @@ impl WorkspaceState {
         &self,
         store: &WorkspaceStore,
         slug: &str,
-    ) -> Result<SaveIssues, StorageError> {
+    ) -> Result<SaveReport, StorageError> {
         if self.needs_resync {
             return self.resave(store);
         }
@@ -2073,7 +2072,7 @@ impl WorkspaceState {
         &self,
         store: &WorkspaceStore,
         slug: &str,
-    ) -> Result<SaveIssues, StorageError> {
+    ) -> Result<SaveReport, StorageError> {
         if self.needs_resync {
             return self.resave(store);
         }
@@ -2095,12 +2094,28 @@ impl WorkspaceState {
         });
     }
 
-    fn record_save(&mut self, result: Result<SaveIssues, StorageError>) {
+    /// Records the outcome of one save.
+    ///
+    /// A partial failure keeps the in-memory change and names every document
+    /// that was not written, one issue per path. Those issues belong to the
+    /// save, so the next save that succeeds clears them; issues from loading
+    /// are never touched.
+    fn record_save(&mut self, result: Result<SaveReport, StorageError>) {
+        self.clear_save_issues();
         match result {
-            Ok(issues) => {
-                self.issues.extend(issues);
-                self.save_status = SaveStatus::Saved;
-                self.needs_resync = false;
+            Ok(report) => {
+                if report.is_success() {
+                    self.save_status = SaveStatus::Saved;
+                    self.needs_resync = false;
+                } else {
+                    let failed = report.failures.len();
+                    self.save_status =
+                        SaveStatus::Failed(format!("{failed} document(s) could not be written"));
+                    self.needs_resync = true;
+                    for issue in report.into_issues() {
+                        self.push_save_issue(issue);
+                    }
+                }
             }
             Err(error) => {
                 self.save_status = SaveStatus::Failed(error.to_string());
@@ -2111,6 +2126,22 @@ impl WorkspaceState {
         if let Some(store) = &self.store {
             store.flush_indexes();
         }
+    }
+
+    /// Adds a visible issue that belongs to the most recent save.
+    fn push_save_issue(&mut self, issue: StorageIssue) {
+        self.save_issue_paths.push(issue.path.clone());
+        self.issues.push(issue);
+    }
+
+    /// Removes the issues a previous save produced, keeping load issues.
+    fn clear_save_issues(&mut self) {
+        if self.save_issue_paths.is_empty() {
+            return;
+        }
+        self.issues
+            .retain(|issue| !self.save_issue_paths.contains(&issue.path));
+        self.save_issue_paths.clear();
     }
 
     /// Refreshes the derived metadata for one collection from memory.
@@ -2506,6 +2537,44 @@ mod tests {
         assert_eq!(state.collection("demo").unwrap().collection.name, "Billing");
         assert!(matches!(state.save_status, SaveStatus::Failed(_)));
         assert!(state.needs_resync);
+    }
+
+    #[test]
+    fn a_failed_request_write_is_visible_and_the_next_save_clears_it() {
+        let (_dir, mut state) = workspace();
+        let collection = state.create_collection("Demo").expect("collection");
+        let request = state
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        let store = state.store.clone().expect("store");
+        let request_path = store.request_file(&collection.id, request.id).unwrap();
+
+        // A directory in place of the request file makes that one write fail.
+        std::fs::remove_file(&request_path).unwrap();
+        std::fs::create_dir(&request_path).unwrap();
+
+        let result = state.resave(&store);
+        state.record_save(result);
+
+        assert!(matches!(state.save_status, SaveStatus::Failed(_)));
+        assert!(state.needs_resync);
+        assert!(
+            state.issues.iter().any(|issue| issue.path == request_path),
+            "the failed document is named: {:?}",
+            state.issues
+        );
+        assert!(
+            state.collection(&collection.id).is_some(),
+            "the change stays in memory"
+        );
+
+        std::fs::remove_dir(&request_path).unwrap();
+        let result = state.resave(&store);
+        state.record_save(result);
+
+        assert_eq!(state.save_status, SaveStatus::Saved);
+        assert!(!state.needs_resync);
+        assert!(!state.issues.iter().any(|issue| issue.path == request_path));
     }
 
     #[test]

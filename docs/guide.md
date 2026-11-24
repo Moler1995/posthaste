@@ -149,12 +149,24 @@ keeps the selection valid. If the recorded environment has no file, the
 workspace opens with no environment active and keeps the other environments and
 defaults.
 
-Writes are atomic: content is staged in a temporary file beside the destination
-(`.posthaste-*.posthaste-tmp`) and renamed into place, and loading removes
-leftovers from the directories Posthaste owns. Documents are UTF-8 with
-indentation and LF line endings, so saving an unchanged document produces
-byte-identical content and a clean checkout stays clean. A file that cannot be
-parsed is reported in the sidebar and left untouched.
+Writes are atomic against process interruption: content is staged in a
+temporary file beside the destination (`.posthaste-*.posthaste-tmp`), flushed
+to the operating system, and renamed into place, so a crash leaves either the
+previous complete document or the new one. This is not a power-loss guarantee:
+nothing is forced to the device, so a power failure can still lose the newest
+write. Loading removes temporary leftovers from the directories Posthaste owns.
+Documents are UTF-8 with indentation and LF line endings, so saving an unchanged
+document produces byte-identical content and a clean checkout stays clean.
+
+A document that cannot be parsed is reported in the sidebar under its path and
+left untouched. The root `workspace.json` is handled more carefully because the
+workspace cannot open without it: a damaged root document (unparsable content or
+an unsupported `schema_version`) is renamed to
+`workspace.json.corrupt-<unix-millis>` before a default workspace is written in
+its place, and the sidebar names the preserved file. If the damaged file cannot
+be moved aside, it stays where it is, nothing is written over it, and the error
+names the path. A save reports every document it could not write by path; the
+change stays in memory and the next save retries it.
 
 ### File assets
 

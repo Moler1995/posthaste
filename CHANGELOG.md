@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A damaged root `workspace.json` is preserved as
+  `workspace.json.corrupt-<timestamp>` instead of being overwritten, and a
+  default workspace opens in its place; if the file cannot be moved aside, it is
+  left untouched and the error names it.
+- Saving now reports every document that could not be written, by path, instead
+  of reporting success with an always-empty failure list; the change stays in
+  memory and the next save retries it.
 - Send and other Enter-triggered actions no longer fire while a Windows IME
   composition is active.
 - Interface and code text use font families the host actually has installed,

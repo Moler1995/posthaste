@@ -34,10 +34,22 @@
 //!
 //! Reads are tolerant: a file that cannot be parsed, or that declares a newer
 //! `schema_version`, is reported through [`StorageIssue`] and skipped without
-//! being modified. Writes are atomic: the document is serialized first, written
-//! to a temporary file in the destination directory, then renamed over the
-//! destination. An interrupted write therefore leaves either the previous file
-//! or the new file, never partial content.
+//! being modified. The root `workspace.json` is the exception: it is renamed to
+//! `workspace.json.corrupt-<unix-millis>` before a default workspace replaces
+//! it, so the damaged bytes are never overwritten.
+//!
+//! Writes are atomic against process interruption: the document is serialized
+//! first, written to a temporary file in the destination directory, then renamed
+//! over the destination. An interrupted write therefore leaves either the
+//! previous file or the new file, never partial content.
+//!
+//! Atomicity here is rename-based only. Nothing is flushed to the device and no
+//! directory is synced, so a power loss or an operating-system crash can still
+//! lose or truncate the newest write. Adding that barrier would cost a
+//! `sync_all` per autosave, and this storage model does not need it: a missing
+//! or truncated document loads tolerantly and is re-written by the next save.
+//! Power-loss durability is therefore not claimed, and no documentation or API
+//! here should promise it.
 //!
 //! Request metadata used by the sidebar is cached outside the workspace, at
 //! `<platform cache>/Posthaste/index/<workspace-key>/<collection-id>.json`, where
@@ -53,6 +65,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -182,8 +195,71 @@ pub struct StorageIssue {
     pub message: String,
 }
 
-/// Non-fatal problems produced by a save that otherwise succeeded.
-pub type SaveIssues = Vec<StorageIssue>;
+/// The outcome of writing one or more documents.
+///
+/// A save names every document it wrote and every document it could not write.
+/// A non-empty [`Self::failures`] list is a partial failure; callers decide how
+/// visible it should be. There is no separate channel that is always empty.
+#[derive(Debug, Default)]
+pub struct SaveReport {
+    /// Documents replaced on disk, in the order they were written.
+    pub written: Vec<PathBuf>,
+    /// Documents that were not written, with the reason.
+    pub failures: Vec<SaveFailure>,
+}
+
+/// One document a save could not write.
+#[derive(Debug)]
+pub struct SaveFailure {
+    /// Path of the document that was not written.
+    pub path: PathBuf,
+    /// Why the write failed.
+    pub error: StorageError,
+}
+
+impl SaveReport {
+    /// A report for one document that was written.
+    fn written(path: PathBuf) -> Self {
+        Self {
+            written: vec![path],
+            failures: Vec::new(),
+        }
+    }
+
+    /// Records the outcome of another save in this report.
+    pub fn append(&mut self, other: Self) {
+        self.written.extend(other.written);
+        self.failures.extend(other.failures);
+    }
+
+    /// Records one document's outcome, naming `fallback` when the error does
+    /// not carry a path of its own.
+    fn absorb(&mut self, result: Result<Self, StorageError>, fallback: PathBuf) {
+        match result {
+            Ok(report) => self.append(report),
+            Err(error) => {
+                let path = error.path().unwrap_or(&fallback).to_path_buf();
+                self.failures.push(SaveFailure { path, error });
+            }
+        }
+    }
+
+    /// Whether every requested document was written.
+    pub fn is_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// The failed documents as load-style issues, for display.
+    pub fn into_issues(self) -> Vec<StorageIssue> {
+        self.failures
+            .into_iter()
+            .map(|failure| StorageIssue {
+                path: failure.path,
+                message: failure.error.detail(),
+            })
+            .collect()
+    }
+}
 
 impl StorageIssue {
     pub(crate) fn from_error(error: &StorageError) -> Option<Self> {
@@ -795,7 +871,6 @@ impl WorkspaceStore {
         }
 
         let files = self.files_dir();
-        ensure_dir(&files)?;
         let name = match source
             .extension()
             .and_then(|extension| extension.to_str())
@@ -806,17 +881,8 @@ impl WorkspaceStore {
         };
         let destination = files.join(&name);
 
-        let mut temp = tempfile::Builder::new()
-            .prefix(".posthaste-")
-            .suffix(TEMP_SUFFIX)
-            .tempfile_in(&files)
-            .map_err(|error| io_error(&destination, error))?;
-        let mut input = fs::File::open(source).map_err(|error| io_error(source, error))?;
-        std::io::copy(&mut input, &mut temp).map_err(|error| io_error(source, error))?;
-        temp.flush()
-            .map_err(|error| io_error(&destination, error))?;
-        temp.persist(&destination)
-            .map_err(|error| io_error(&destination, error.error))?;
+        let bytes = fs::read(source).map_err(|error| io_error(source, error))?;
+        persist_bytes_atomic(&destination, &bytes)?;
 
         Ok(format!("{FILES_DIR}/{name}"))
     }
@@ -892,10 +958,7 @@ impl WorkspaceStore {
             match read_versioned::<Workspace>(&canonical_path) {
                 Ok(workspace) => workspace,
                 Err(error) => {
-                    if let Some(issue) = StorageIssue::from_error(&error) {
-                        issues.push(issue);
-                    }
-                    Workspace::new(DEFAULT_WORKSPACE_NAME)
+                    self.substitute_damaged_workspace(&canonical_path, &error, &mut issues)
                 }
             }
         } else {
@@ -908,7 +971,7 @@ impl WorkspaceStore {
                 });
             }
             let workspace = Workspace::new(DEFAULT_WORKSPACE_NAME);
-            issues.extend(write_document_atomic(&canonical_path, &workspace)?);
+            write_document_atomic(&canonical_path, &workspace)?;
             issues.extend(self.write_dotfiles());
             workspace
         };
@@ -922,7 +985,9 @@ impl WorkspaceStore {
     /// directory, and a directory without `workspace.json` are all errors
     /// rather than a first-run bootstrap. Startup reports the failure and offers
     /// to create the workspace, instead of writing to a path the user may have
-    /// mistyped.
+    /// mistyped. A `workspace.json` that exists but cannot be used is still
+    /// quarantined and replaced with a default, because leaving it in place
+    /// would lose it to the next save.
     pub fn load_existing(&self) -> Result<LoadedWorkspace, StorageError> {
         let metadata = match fs::metadata(&self.root) {
             Ok(metadata) => metadata,
@@ -954,14 +1019,51 @@ impl WorkspaceStore {
         let mut issues = Vec::new();
         let workspace = match read_versioned::<Workspace>(&canonical_path) {
             Ok(workspace) => workspace,
-            Err(error) => {
-                if let Some(issue) = StorageIssue::from_error(&error) {
-                    issues.push(issue);
-                }
-                Workspace::new(DEFAULT_WORKSPACE_NAME)
-            }
+            Err(error) => self.substitute_damaged_workspace(&canonical_path, &error, &mut issues),
         };
         self.load_contents(workspace, issues)
+    }
+
+    /// Preserves a damaged `workspace.json` and substitutes a default workspace.
+    ///
+    /// The damaged file is renamed to `workspace.json.corrupt-<unix-millis>` in
+    /// the same directory before anything can overwrite it, and a fresh default
+    /// document is written to the canonical path so later saves start from a
+    /// valid file. If the rename fails, the file stays where it is, no write is
+    /// attempted, and the issue names the path that could not be preserved. The
+    /// issue path is the canonical document only in that case, which keeps the
+    /// app's re-save from ever targeting the damaged bytes.
+    fn substitute_damaged_workspace(
+        &self,
+        canonical_path: &Path,
+        error: &StorageError,
+        issues: &mut Vec<StorageIssue>,
+    ) -> Workspace {
+        let workspace = Workspace::new(DEFAULT_WORKSPACE_NAME);
+        match quarantine_document(canonical_path) {
+            Ok(preserved) => {
+                issues.push(issue_for(
+                    &preserved,
+                    format!(
+                        "damaged workspace document preserved ({}); a new workspace.json was written",
+                        error.detail()
+                    ),
+                ));
+                if let Err(write_error) = write_document_atomic(canonical_path, &workspace) {
+                    push_error_issue(issues, &write_error);
+                }
+            }
+            Err(quarantine_error) => {
+                issues.push(issue_for(
+                    canonical_path,
+                    format!(
+                        "damaged workspace document could not be preserved ({}); it will not be overwritten",
+                        quarantine_error.detail()
+                    ),
+                ));
+            }
+        }
+        workspace
     }
 
     /// Reads the documents that hang off a workspace root, creating the two
@@ -1643,22 +1745,21 @@ impl WorkspaceStore {
     /// The caller computes `to` with [`Self::collection_slug_for`]. A
     /// filesystem failure leaves the old directory in place and is returned as
     /// an error; an existing destination is never overwritten.
-    pub fn move_collection(&self, from: &str, to: &str) -> Result<SaveIssues, StorageError> {
+    pub fn move_collection(&self, from: &str, to: &str) -> Result<(), StorageError> {
         let from_dir = self.collection_dir(from)?;
         let to_dir = self.collection_dir(to)?;
-        fs::rename(&from_dir, &to_dir).map_err(|error| io_error(&from_dir, error))?;
-        Ok(Vec::new())
+        fs::rename(&from_dir, &to_dir).map_err(|error| io_error(&from_dir, error))
     }
 
     /// Moves an environment document from one slug to another.
     ///
     /// A missing source document is an error, and a filesystem failure leaves
     /// the old file in place.
-    pub fn move_environment(&self, from: &str, to: &str) -> Result<SaveIssues, StorageError> {
+    pub fn move_environment(&self, from: &str, to: &str) -> Result<(), StorageError> {
         let from_json = self.environment_file(from)?;
         let to_json = self.environment_file(to)?;
         match fs::rename(&from_json, &to_json) {
-            Ok(()) => Ok(Vec::new()),
+            Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err(StorageError::InvalidEntry {
                     path: from_json,
@@ -1672,11 +1773,12 @@ impl WorkspaceStore {
     /// Saves collection metadata as JSON under the directory derived from
     /// [`Collection::id`]. A rename that changes the id moves the directory
     /// first with [`Self::move_collection`].
-    pub fn save_collection(&self, collection: &Collection) -> Result<SaveIssues, StorageError> {
+    pub fn save_collection(&self, collection: &Collection) -> Result<SaveReport, StorageError> {
         let path = self.collection_file(&collection.id)?;
         let requests_dir = self.requests_dir(&collection.id)?;
         fs::create_dir_all(&requests_dir).map_err(|error| io_error(&requests_dir, error))?;
-        write_document_atomic(&path, collection)
+        write_document_atomic(&path, collection)?;
+        Ok(SaveReport::written(path))
     }
 
     /// Saves a request under its collection and id as JSON.
@@ -1684,11 +1786,12 @@ impl WorkspaceStore {
         &self,
         slug: &str,
         request: &RequestSpec,
-    ) -> Result<SaveIssues, StorageError> {
+    ) -> Result<SaveReport, StorageError> {
         let path = self.request_file(slug, request.id)?;
         let requests_dir = self.requests_dir(slug)?;
         fs::create_dir_all(&requests_dir).map_err(|error| io_error(&requests_dir, error))?;
-        write_document_atomic(&path, request)
+        write_document_atomic(&path, request)?;
+        Ok(SaveReport::written(path))
     }
 
     /// Saves an environment to `environments/<slug>.json`. A rename that
@@ -1697,50 +1800,63 @@ impl WorkspaceStore {
         &self,
         slug: &str,
         environment: &Environment,
-    ) -> Result<SaveIssues, StorageError> {
+    ) -> Result<SaveReport, StorageError> {
         let path = self.environment_file(slug)?;
-        write_document_atomic(&path, environment)
+        write_document_atomic(&path, environment)?;
+        Ok(SaveReport::written(path))
     }
 
     /// Saves `workspace.json`.
-    pub fn save_workspace(&self, workspace: &Workspace) -> Result<SaveIssues, StorageError> {
-        write_document_atomic(&self.workspace_file(), workspace)
+    pub fn save_workspace(&self, workspace: &Workspace) -> Result<SaveReport, StorageError> {
+        let path = self.workspace_file();
+        write_document_atomic(&path, workspace)?;
+        Ok(SaveReport::written(path))
     }
 
     /// Saves the workspace and every loaded collection, request, and
     /// environment. Entries that failed to load are absent from the lists and
     /// are left untouched.
+    ///
+    /// Every requested document is attempted; each failure is named in the
+    /// report so one unwritable file does not hide the writes that succeeded.
+    /// The returned error is reserved for the root directory itself being
+    /// unavailable, which makes every further write meaningless.
     pub fn save_all(
         &self,
         workspace: &Workspace,
         collections: &[LoadedCollection],
         environments: &[LoadedEnvironment],
-    ) -> Result<SaveIssues, StorageError> {
-        let mut issues = self.save_workspace(workspace)?;
-        issues.extend(self.save_collections(collections)?);
-        issues.extend(self.save_environments(environments)?);
-        Ok(issues)
+    ) -> Result<SaveReport, StorageError> {
+        ensure_dir(&self.root)?;
+        let mut report = SaveReport::default();
+        report.absorb(self.save_workspace(workspace), self.workspace_file());
+        report.append(self.save_collections(collections));
+        report.append(self.save_environments(environments));
+        Ok(report)
     }
 
     /// Saves every loaded collection and request without touching
     /// `workspace.json`. This is used for a re-save after a failure when the
     /// workspace metadata file itself could not be loaded.
-    pub fn save_collections(
-        &self,
-        collections: &[LoadedCollection],
-    ) -> Result<SaveIssues, StorageError> {
-        let mut issues = Vec::new();
+    pub fn save_collections(&self, collections: &[LoadedCollection]) -> SaveReport {
+        let mut report = SaveReport::default();
         for loaded in collections {
-            issues.extend(self.save_collection(&loaded.collection)?);
+            let collection_path = self
+                .collection_file(&loaded.collection.id)
+                .unwrap_or_else(|_| self.collections_dir());
+            report.absorb(self.save_collection(&loaded.collection), collection_path);
             for request in &loaded.requests {
                 // Only a loaded entry has full contents. Skipping an unloaded
                 // one keeps its file byte-for-byte untouched.
                 if let Some(request) = request.spec() {
-                    issues.extend(self.save_request(&loaded.collection.id, request)?);
+                    report.absorb(
+                        self.save_request(&loaded.collection.id, request),
+                        self.collections_dir(),
+                    );
                 }
             }
         }
-        Ok(issues)
+        report
     }
 
     /// Deletes a collection directory and everything under it.
@@ -1772,7 +1888,7 @@ impl WorkspaceStore {
         updated
             .folders
             .retain(|folder| !removed.contains(&folder.id));
-        let mut issues = self.save_collection(&updated)?;
+        let mut issues = self.save_collection(&updated)?.into_issues();
         loaded.collection = updated;
 
         let doomed: Vec<RequestId> = loaded
@@ -1816,15 +1932,18 @@ impl WorkspaceStore {
     }
 
     /// Saves every loaded environment without touching `workspace.json`.
-    pub fn save_environments(
-        &self,
-        environments: &[LoadedEnvironment],
-    ) -> Result<SaveIssues, StorageError> {
-        let mut issues = Vec::new();
+    pub fn save_environments(&self, environments: &[LoadedEnvironment]) -> SaveReport {
+        let mut report = SaveReport::default();
         for loaded in environments {
-            issues.extend(self.save_environment(&loaded.slug, &loaded.environment)?);
+            let path = self
+                .environment_file(&loaded.slug)
+                .unwrap_or_else(|_| self.environments_dir());
+            report.absorb(
+                self.save_environment(&loaded.slug, &loaded.environment),
+                path,
+            );
         }
-        Ok(issues)
+        report
     }
 
     /// Deletes one environment file, whichever container extension it uses.
@@ -2201,37 +2320,86 @@ pub(crate) const TEMP_SUFFIX: &str = ".posthaste-tmp";
 
 /// Writes one document as pretty-printed JSON with a trailing newline.
 ///
-/// The content is serialized before the file is touched and the file is
-/// replaced by renaming a temporary sibling into place, so an interrupted
-/// write leaves the previous document intact. The temporary file carries
-/// [`TEMP_SUFFIX`] so residue is recognizable.
+/// The content is serialized before the file is touched and written through
+/// [`persist_bytes_atomic`], so an interrupted write leaves the previous
+/// document intact.
 pub(crate) fn write_document_atomic<T: Serialize>(
     path: &Path,
     value: &T,
-) -> Result<SaveIssues, StorageError> {
+) -> Result<(), StorageError> {
     let mut contents =
         serde_json::to_string_pretty(value).map_err(|error| StorageError::Serialize {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
     contents.push('\n');
+    persist_bytes_atomic(path, contents.as_bytes())
+}
+
+/// Replaces `path` with `bytes` by writing a temporary sibling and renaming it.
+///
+/// This is the only place that builds a temporary file for a document write.
+/// The temporary file carries [`TEMP_SUFFIX`] so an interrupted write is
+/// recognizable and removable by [`cleanup_temporary_files`], and it is created
+/// in the destination directory so the final rename stays on one filesystem.
+///
+/// The rename makes the replacement atomic against process interruption: a
+/// crash leaves either the previous complete file or the new one. Nothing is
+/// flushed to the device, so a power loss can still lose the newest write; see
+/// the module documentation for the durability contract.
+pub(crate) fn persist_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().ok_or_else(|| StorageError::InvalidEntry {
         path: path.to_path_buf(),
         reason: "destination has no parent directory".into(),
     })?;
-    fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+    ensure_dir(parent)?;
 
     let mut temp = tempfile::Builder::new()
         .prefix(".posthaste-")
         .suffix(TEMP_SUFFIX)
         .tempfile_in(parent)
         .map_err(|error| io_error(path, error))?;
-    temp.write_all(contents.as_bytes())
+    temp.write_all(bytes)
         .map_err(|error| io_error(path, error))?;
     temp.flush().map_err(|error| io_error(path, error))?;
     temp.persist(path)
         .map_err(|error| io_error(path, error.error))?;
-    Ok(Vec::new())
+    Ok(())
+}
+
+/// Renames a damaged document out of the way and returns its preserved path.
+///
+/// The new name is `<name>.corrupt-<unix-millis>`. A name that already exists
+/// gets `-2`, `-3`, ... appended, so an earlier quarantine is never replaced,
+/// even within the same millisecond. A rename keeps the original bytes on disk
+/// and removes the damaged path, so a later save cannot target it.
+fn quarantine_document(path: &Path) -> Result<PathBuf, StorageError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StorageError::InvalidEntry {
+            path: path.to_path_buf(),
+            reason: "document name is not valid UTF-8".into(),
+        })?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    for attempt in 1.. {
+        let suffix = if attempt == 1 {
+            format!(".corrupt-{millis}")
+        } else {
+            format!(".corrupt-{millis}-{attempt}")
+        };
+        let candidate = path.with_file_name(format!("{name}{suffix}"));
+        if candidate.exists() {
+            continue;
+        }
+        return fs::rename(path, &candidate)
+            .map(|()| candidate)
+            .map_err(|error| io_error(path, error));
+    }
+    unreachable!("suffix space is unbounded")
 }
 
 /// Removes atomic-write residue from a directory the app owns.
@@ -3495,8 +3663,7 @@ mod tests {
         let collection = store.create_collection("Demo", 0).unwrap();
         let request = store.create_request(&collection.id, "Ping").unwrap();
 
-        let issues = store.move_collection("demo", "payments").unwrap();
-        assert!(issues.is_empty());
+        store.move_collection("demo", "payments").unwrap();
         assert!(!store.collection_dir("demo").unwrap().exists());
         assert!(store.collection_file("payments").unwrap().is_file());
 
@@ -3517,8 +3684,7 @@ mod tests {
             .insert("host".into(), "dev.example.com".into());
         store.save_environment(&slug, &environment).unwrap();
 
-        let issues = store.move_environment("dev", "development").unwrap();
-        assert!(issues.is_empty());
+        store.move_environment("dev", "development").unwrap();
         assert!(!store.environment_file("dev").unwrap().exists());
         assert!(store.environment_file("development").unwrap().is_file());
 
@@ -4193,9 +4359,11 @@ mod tests {
             requests: Vec::new(),
         };
 
-        store
-            .save_collections(std::slice::from_ref(&loaded))
-            .unwrap();
+        assert!(
+            store
+                .save_collections(std::slice::from_ref(&loaded))
+                .is_success()
+        );
         let mut stored = read_collection(&store, &collection.id);
         assert_eq!(stored.folders.len(), 2);
         assert_eq!(stored.folder(tokens).unwrap().parent_id, Some(auth));
@@ -4526,9 +4694,8 @@ mod tests {
         let path = dir.path().join("document.json");
         fs::write(&path, "{\"value\": 1}\n").unwrap();
 
-        let issues = write_document_atomic(&path, &Sample { value: 2 }).unwrap();
+        write_document_atomic(&path, &Sample { value: 2 }).unwrap();
 
-        assert!(issues.is_empty());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{\n  \"value\": 2\n}\n");
         let json_files: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
@@ -4589,9 +4756,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&before).unwrap();
         assert_eq!(value["schema_version"], 1);
 
-        let issues = store.save_workspace(&loaded.workspace).unwrap();
+        let report = store.save_workspace(&loaded.workspace).unwrap();
 
-        assert!(issues.is_empty());
+        assert!(report.is_success());
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
@@ -4618,7 +4785,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_document_corruption_is_a_non_fatal_issue() {
+    fn workspace_document_corruption_is_quarantined_and_replaced() {
         let (_dir, store) = store();
         store.load().unwrap();
         fs::write(store.workspace_file(), "not: [valid").unwrap();
@@ -4628,7 +4795,190 @@ mod tests {
 
         assert_eq!(loaded.workspace.name, DEFAULT_WORKSPACE_NAME);
         assert_eq!(loaded.issues.len(), 1);
-        assert_eq!(fs::read(store.workspace_file()).unwrap(), before);
+        let quarantined = fs::read_dir(store.root())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("workspace.json.corrupt-"))
+            })
+            .expect("the damaged document is preserved");
+        assert!(loaded.issues[0].path == quarantined);
+        assert_eq!(fs::read(&quarantined).unwrap(), before);
+        assert!(store.workspace_file().is_file());
+        assert_ne!(fs::read(store.workspace_file()).unwrap(), before);
+
+        // Creating a collection and saving again writes a valid document and
+        // never touches the preserved copy.
+        store.create_collection("Fresh", 0).unwrap();
+        let report = store.save_workspace(&loaded.workspace).unwrap();
+        assert!(report.is_success());
+        assert_eq!(fs::read(&quarantined).unwrap(), before);
+        assert_eq!(
+            read_versioned::<Workspace>(&store.workspace_file())
+                .unwrap()
+                .name,
+            DEFAULT_WORKSPACE_NAME
+        );
+    }
+
+    fn quarantine_files(store: &WorkspaceStore) -> Vec<PathBuf> {
+        fs::read_dir(store.root())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".corrupt-"))
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_undetachable_quarantine_is_reported_and_never_overwritten() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let path = store.workspace_file();
+        fs::write(&path, "not: [valid").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // An exclusive handle makes both reading the document and renaming it
+        // fail, the way a locked file would in practice.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let loaded = store.load().unwrap();
+        drop(locked);
+
+        assert_eq!(loaded.workspace.name, DEFAULT_WORKSPACE_NAME);
+        assert!(
+            loaded
+                .issues
+                .iter()
+                .any(|issue| issue.path == path && issue.message.contains("could not be preserved")),
+            "{:?}",
+            loaded.issues
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(quarantine_files(&store).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undetachable_quarantine_is_reported_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let path = store.workspace_file();
+        fs::write(&path, "not: [valid").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // A directory that cannot be written cannot accept the rename.
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o555)).unwrap();
+        let loaded = store.load().unwrap();
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(loaded.workspace.name, DEFAULT_WORKSPACE_NAME);
+        assert!(
+            loaded
+                .issues
+                .iter()
+                .any(|issue| issue.path == path && issue.message.contains("could not be preserved")),
+            "{:?}",
+            loaded.issues
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(quarantine_files(&store).is_empty());
+    }
+
+    #[test]
+    fn quarantine_files_are_never_enumerated_as_documents() {
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let collection = store.create_collection("Demo", 0).unwrap();
+        let request = store.create_request(&collection.id, "Ping").unwrap();
+        let (environment_slug, _environment) = store.create_environment("Dev").unwrap();
+        let preserved = store.root().join("workspace.json.corrupt-123");
+        fs::write(&preserved, "not: [valid").unwrap();
+
+        let loaded = store.load().unwrap();
+
+        assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+        assert_eq!(loaded.collections.len(), 1);
+        assert_eq!(loaded.collections[0].requests.len(), 1);
+        assert_eq!(loaded.collections[0].requests[0].id(), request.id);
+        assert_eq!(loaded.environments.len(), 1);
+        assert_eq!(loaded.environments[0].slug, environment_slug);
+        assert_eq!(fs::read(&preserved).unwrap(), b"not: [valid");
+    }
+
+    #[test]
+    fn save_all_reports_one_failed_document_and_writes_the_rest() {
+        let (_dir, store) = store();
+        let collection = store.create_collection("Demo", 0).unwrap();
+        let request = store.create_request(&collection.id, "Ping").unwrap();
+        let (environment_slug, _environment) = store.create_environment("Dev").unwrap();
+        let loaded = store.load().unwrap();
+
+        // A directory in place of the request file makes that one write fail.
+        let request_path = store.request_file(&collection.id, request.id).unwrap();
+        fs::remove_file(&request_path).unwrap();
+        fs::create_dir(&request_path).unwrap();
+
+        let report = store
+            .save_all(&loaded.workspace, &loaded.collections, &loaded.environments)
+            .unwrap();
+
+        assert!(!report.is_success());
+        assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+        assert_eq!(report.failures[0].path, request_path);
+        assert!(!report.written.contains(&request_path));
+        for expected in [
+            store.workspace_file(),
+            store.collection_file(&collection.id).unwrap(),
+            store.environment_file(&environment_slug).unwrap(),
+        ] {
+            assert!(
+                report.written.contains(&expected),
+                "{} was not written",
+                expected.display()
+            );
+        }
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(store.workspace_file()).unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn interrupted_write_residue_is_cleaned_up_without_touching_documents() {
+        let (dir, _store) = store();
+        let path = dir.path().join("document.json");
+        fs::write(&path, "{\"value\": 1}\n").unwrap();
+        let residue = dir
+            .path()
+            .join(format!(".posthaste-interrupted{TEMP_SUFFIX}"));
+        fs::write(&residue, "{\"value\": 2").unwrap();
+
+        cleanup_temporary_files(dir.path());
+
+        assert!(!residue.exists(), "the interrupted write's residue is gone");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"value\": 1}\n",
+            "the previous document is untouched"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -5269,9 +5619,11 @@ mod tests {
         );
 
         loaded.requests[0].spec_mut().unwrap().name = "Again".into();
-        store
-            .save_collections(std::slice::from_ref(&loaded))
-            .unwrap();
+        assert!(
+            store
+                .save_collections(std::slice::from_ref(&loaded))
+                .is_success()
+        );
         assert_eq!(fs::read(&unloaded_path).unwrap(), unloaded_before);
         assert_eq!(
             read_request(&store, &collection.id, loaded_request.id).name,
