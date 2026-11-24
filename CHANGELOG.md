@@ -58,9 +58,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resize cursors on every edge and corner.
 - A WebSocket frame's age in the frame log reads as `m:ss` after the first
   minute instead of seconds with decimals, and no longer wraps.
+- Storage reports for damaged documents and failed writes float over the
+  bottom-right corner like an import result instead of taking a band in the
+  sidebar. They stay until dismissed, keep the Delete file action for preserved
+  damaged documents, and stack with an import or export notice.
+- History load, write, prune, delete, and clear failures float over the
+  bottom-right corner like storage reports, name each unreadable file, follow
+  the interface language, and clear with one Dismiss for the session. The
+  History section keeps only its entries and its empty or no-match state, so a
+  report no longer disappears with the collapsed section.
+- A failed workspace action is reported as a floating warning card in the
+  bottom-right column instead of a band between the History section and the
+  environment control, so it no longer takes space from the sidebar. A notice
+  raised while the application runs still expires on its own; a startup notice
+  about an unavailable remembered workspace stays until dismissed.
+- The shared notice's Dismiss control now follows the interface language.
 
 ### Fixed
 
+- A save from the **Save request** dialog that could not be written now reports
+  the reason inside the dialog, instead of leaving it open with only the
+  status bar explaining what happened behind the modal dimmer. The dialog
+  keeps the draft, the entered name, and the destination so the save can be
+  retried.
 - On a fresh workspace with no Recent section, the welcome block is vertically
   centered in the panel instead of sitting near its top; when Recent is present
   the cover-sheet layout is unchanged.
@@ -71,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saving now reports every document that could not be written, by path, instead
   of reporting success with an always-empty failure list; the change stays in
   memory and the next save retries it.
+- Error surfaces that stayed English after the language switch now follow it:
+  duplicate, empty, and workspace-name validation messages, save-status and
+  storage-report sentences, and import and move outcomes. A storage or system
+  detail keeps its own text inside the translated sentence.
 - Send and other Enter-triggered actions no longer fire while a Windows IME
   composition is active.
 - Interface and code text use font families the host actually has installed,

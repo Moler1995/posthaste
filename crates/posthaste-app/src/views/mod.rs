@@ -44,8 +44,10 @@ use posthaste_core::preferences::WindowFrame;
 
 use crate::Quit;
 use crate::app::{AppState, ContentView, TabId};
+use crate::i18n::{self, Key, MessageKey};
 use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
+use crate::workspace::WorkspaceState;
 
 actions!(
     posthaste_shell,
@@ -647,9 +649,10 @@ impl Render for AppShell {
         // state on the left, the live request state and the cookie entry on
         // the right.
         .child(status_bar::render(app))
-        // An import or export result floats above the status bar. It is
-        // positioned out of the layout, so it never shrinks the panes.
-        .children(transfer_notice(self.state.clone(), app))
+        // Storage reports and import/export results float above the status
+        // bar in one column. They are positioned out of the layout, so they
+        // never shrink the panes or cover each other.
+        .children(floating_notices(self.state.clone(), app, window))
         .children(cookies_open.then(|| request_editor::cookies_modal(active_editor.clone(), cx)))
         // Overlays paint after the panes, so they sit above everything the
         // content row draws: the completion card follows the focused field,
@@ -695,11 +698,404 @@ impl Render for AppShell {
     }
 }
 
+/// The bottom-right notice column.
+///
+/// Storage reports stay until the user acts on them; the import/export result
+/// clears itself. Both sit outside the layout, so they never shrink the panes,
+/// and sharing one column keeps them from covering each other.
+fn floating_notices(
+    state: Entity<AppState>,
+    app: &AppState,
+    window: &Window,
+) -> Option<gpui::AnyElement> {
+    let storage = storage_alert(state.clone(), app, window);
+    let history = history_alert(state.clone(), app, window);
+    let workspace = workspace_notice(state.clone(), app);
+    let transfer = transfer_notice(state, app);
+    if storage.is_none() && history.is_none() && workspace.is_none() && transfer.is_none() {
+        return None;
+    }
+    Some(
+        div()
+            .debug_selector(|| "floating-notices".to_owned())
+            .id("floating-notices")
+            .absolute()
+            .right(space::S12)
+            .bottom(layout::PANEL_FOOTER + space::S8)
+            .w(px(400.))
+            .max_w(relative(0.9))
+            .max_h(floating_column_height(window))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(space::S8)
+            .children(storage)
+            .children(history)
+            .children(workspace)
+            .children(transfer)
+            .into_any_element(),
+    )
+}
+
+/// A workspace action that could not complete as a floating warning card.
+///
+/// A runtime notice expires on its own; the startup notice for an unavailable
+/// remembered workspace stays until dismissed. Either way Dismiss clears it at
+/// once, and the card takes no sidebar space.
+fn workspace_notice(state: Entity<AppState>, app: &AppState) -> Option<gpui::AnyElement> {
+    let message = app.workspace_notice()?;
+    let dismiss_state = state;
+    Some(
+        div()
+            .debug_selector(|| "workspace-notice".to_owned())
+            .id("workspace-notice")
+            .w_full()
+            .p(space::S8)
+            .rounded(radius::ROW)
+            .bg(theme::status::warning_subtle())
+            .border_1()
+            .border_color(theme::status::warning())
+            .flex()
+            .items_start()
+            .gap(space::S8)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_role(type_role::META)
+                    .text_color(theme::status::warning())
+                    .child(message.to_owned()),
+            )
+            .child(
+                ui::ghost_button(
+                    SharedString::from("workspace-notice-dismiss"),
+                    i18n::t(Key::SidebarDismiss),
+                )
+                .debug_selector(|| "workspace-notice-dismiss".to_owned())
+                .h(px(20.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    dismiss_state.update(cx, |state, cx| {
+                        state.dismiss_workspace_notice(cx);
+                    });
+                }),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The height a floating list may use without covering the panes.
+fn floating_list_height(window: &Window) -> gpui::Pixels {
+    let available = window.viewport_size().height - px(140.);
+    if available < px(120.) {
+        px(120.)
+    } else if available > px(360.) {
+        px(360.)
+    } else {
+        available
+    }
+}
+
+/// The height the whole notice column may use: the window above the status
+/// bar, less a margin at the top. With every report present the column scrolls
+/// instead of growing past the window.
+fn floating_column_height(window: &Window) -> gpui::Pixels {
+    let used = layout::PANEL_FOOTER + space::S8 + space::S8;
+    (window.viewport_size().height - used).max(px(120.))
+}
+
+/// History storage reports as a floating card.
+///
+/// Load issues name each unreadable file and a live error reports the failed
+/// write, prune, delete, or clear. One Dismiss clears the report for the
+/// session; no entry or file is touched. The card is outside the sidebar, so
+/// it stays visible while History is collapsed.
+fn history_alert(
+    state: Entity<AppState>,
+    app: &AppState,
+    window: &Window,
+) -> Option<gpui::AnyElement> {
+    let history = app.history();
+    if history.error.is_none() && history.issues.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<gpui::AnyElement> = Vec::new();
+    if let Some(error) = &history.error {
+        rows.push(
+            div()
+                .debug_selector(|| "history-alert-error".to_owned())
+                .min_w(px(0.))
+                .text_role(type_role::META)
+                .text_color(theme::status::danger())
+                .child(error.clone())
+                .into_any_element(),
+        );
+    }
+    for (index, issue) in history.issues.iter().enumerate() {
+        let selector = format!("history-alert-issue-{index}");
+        let line = i18n::msg(
+            MessageKey::StorageIssueLine,
+            &[&issue.path.display(), &issue.message],
+        );
+        rows.push(
+            div()
+                .debug_selector(move || selector.clone())
+                .min_w(px(0.))
+                .text_role(type_role::MICRO)
+                .text_color(theme::status::danger())
+                .child(line)
+                .into_any_element(),
+        );
+    }
+
+    let dismiss_state = state;
+    let dismiss = ui::ghost_button(
+        SharedString::from("history-alert-dismiss"),
+        i18n::t(Key::SidebarDismiss),
+    )
+    .debug_selector(|| "history-alert-dismiss".to_owned())
+    .h(px(20.))
+    .px(space::S6)
+    .text_role(type_role::MICRO)
+    .on_click(move |_, _, cx| {
+        cx.stop_propagation();
+        dismiss_state.update(cx, |state, cx| state.dismiss_history_report(cx));
+    });
+
+    Some(
+        div()
+            .debug_selector(|| "history-alert".to_owned())
+            .id("history-alert")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px(space::S12)
+            .py(space::S8)
+            .rounded(radius::CONTROL)
+            .border_1()
+            .border_color(theme::status::danger())
+            .bg(theme::surface::overlay())
+            .shadow(vec![gpui::BoxShadow {
+                color: theme::surface::floating_shadow().into(),
+                offset: gpui::point(px(0.), px(6.)),
+                blur_radius: px(16.),
+                spread_radius: px(0.),
+            }])
+            .child(
+                div()
+                    .id("history-alert-scroll")
+                    .debug_selector(|| "history-alert-scroll".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(space::S8)
+                    .max_h(floating_list_height(window))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(div().flex().justify_end().child(dismiss))
+            .into_any_element(),
+    )
+}
+
+/// Workspace storage issues as a floating alert.
+///
+/// Unlike the import/export notice, this one has no timer: it reports a
+/// condition that may need a file deleted, so it stays until every issue is
+/// dismissed or deleted. A long list scrolls inside a window-bounded height
+/// rather than covering the panes.
+fn storage_alert(
+    state: Entity<AppState>,
+    app: &AppState,
+    window: &Window,
+) -> Option<gpui::AnyElement> {
+    let workspace = app.workspace();
+    if workspace.issues.is_empty() {
+        return None;
+    }
+    // One line per issue, built once: the row and the text assertions in tests
+    // both use the same string.
+    let lines = storage_issue_lines(workspace);
+    let rows: Vec<gpui::AnyElement> = workspace
+        .issues
+        .iter()
+        .zip(lines)
+        .enumerate()
+        .map(|(index, (issue, line))| {
+            let pending_delete = workspace
+                .pending_issue_delete()
+                .is_some_and(|pending| pending == issue);
+            let deletable = workspace
+                .store
+                .as_ref()
+                .is_some_and(|store| store.is_quarantined_document(&issue.path));
+
+            let dismiss_selector = format!("storage-issue-{index}-dismiss");
+            let dismiss_state = state.clone();
+            let dismissed = issue.clone();
+            let dismiss = ui::ghost_button(
+                SharedString::from(dismiss_selector.clone()),
+                i18n::t(Key::SidebarDismiss),
+            )
+            .debug_selector(move || dismiss_selector.clone())
+            .h(px(20.))
+            .px(space::S6)
+            .text_role(type_role::MICRO)
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                dismiss_state.update(cx, |state, cx| {
+                    state.dismiss_storage_issue(&dismissed, cx);
+                });
+            });
+
+            let mut actions = div()
+                .flex()
+                .items_center()
+                .flex_none()
+                .gap_1()
+                .child(dismiss);
+
+            if pending_delete {
+                let confirm_selector = format!("storage-issue-{index}-confirm");
+                let confirm_state = state.clone();
+                let confirm = ui::ghost_button(
+                    SharedString::from(confirm_selector.clone()),
+                    i18n::t(Key::CommonDelete),
+                )
+                .debug_selector(move || confirm_selector.clone())
+                .h(px(20.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .text_color(theme::status::danger())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    confirm_state.update(cx, |state, cx| {
+                        state.confirm_storage_issue_delete(cx);
+                    });
+                });
+
+                let cancel_selector = format!("storage-issue-{index}-cancel");
+                let cancel_state = state.clone();
+                let cancel = ui::ghost_button(
+                    SharedString::from(cancel_selector.clone()),
+                    i18n::t(Key::CommonCancel),
+                )
+                .debug_selector(move || cancel_selector.clone())
+                .h(px(20.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cancel_state.update(cx, |state, cx| {
+                        state.cancel_storage_issue_delete(cx);
+                    });
+                });
+
+                actions = actions.child(confirm).child(cancel);
+            } else if deletable {
+                let delete_selector = format!("storage-issue-{index}-delete");
+                let delete_state = state.clone();
+                let targeted = issue.clone();
+                let delete = ui::ghost_button(
+                    SharedString::from(delete_selector.clone()),
+                    i18n::t(Key::SidebarDeleteFile),
+                )
+                .debug_selector(move || delete_selector.clone())
+                .h(px(20.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .text_color(theme::status::danger())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    delete_state.update(cx, |state, cx| {
+                        state.request_storage_issue_delete(&targeted, cx);
+                    });
+                });
+                actions = actions.child(delete);
+            }
+
+            // The message gets the full width and the actions sit under it.
+            // A path is long and unbreakable, so putting the buttons on the
+            // same line would squeeze the text into a column a few characters
+            // wide.
+            let row_selector = format!("storage-issue-{index}");
+            let text_selector = format!("storage-issue-{index}-text");
+            div()
+                .debug_selector(move || row_selector.clone())
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .debug_selector(move || text_selector.clone())
+                        .min_w(px(0.))
+                        .text_role(type_role::META)
+                        .text_color(theme::status::danger())
+                        .child(line),
+                )
+                .child(actions.justify_end())
+                .into_any_element()
+        })
+        .collect();
+
+    // Leave room for the request/response panes even when the window is short.
+    let list_height = floating_list_height(window);
+
+    Some(
+        div()
+            .debug_selector(|| "storage-issues".to_owned())
+            .id("storage-issues")
+            .w_full()
+            .flex()
+            .flex_col()
+            .px(space::S12)
+            .py(space::S8)
+            .rounded(radius::CONTROL)
+            .border_1()
+            .border_color(theme::status::danger())
+            .bg(theme::surface::overlay())
+            .shadow(vec![gpui::BoxShadow {
+                color: theme::surface::floating_shadow().into(),
+                offset: gpui::point(px(0.), px(6.)),
+                blur_radius: px(16.),
+                spread_radius: px(0.),
+            }])
+            .child(
+                div()
+                    .id("storage-issues-scroll")
+                    .debug_selector(|| "storage-issues-scroll".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(space::S8)
+                    .max_h(list_height)
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The exact lines rendered for storage issues, so tests can assert their text.
+fn storage_issue_lines(workspace: &WorkspaceState) -> Vec<String> {
+    workspace
+        .issues
+        .iter()
+        .map(|issue| {
+            i18n::msg(
+                MessageKey::StorageIssueLine,
+                &[&issue.path.display(), &issue.message],
+            )
+        })
+        .collect()
+}
+
 /// The import/export result as a small floating notice.
 ///
-/// It is anchored over the bottom-right corner, above the status bar, and sits
-/// outside the layout, so it never shrinks the panes or covers them for long:
-/// it clears itself after [`crate::app::TRANSFER_NOTICE_DURATION`] or when
+/// It clears itself after [`crate::app::TRANSFER_NOTICE_DURATION`] or when
 /// dismissed. Every other interaction stays available while it is shown.
 fn transfer_notice(state: Entity<AppState>, app: &AppState) -> Option<gpui::AnyElement> {
     let notice = app.transfer_notice()?;
@@ -724,11 +1120,7 @@ fn transfer_notice(state: Entity<AppState>, app: &AppState) -> Option<gpui::AnyE
         div()
             .debug_selector(|| "transfer-notice".to_owned())
             .id("transfer-notice")
-            .absolute()
-            .right(space::S12)
-            .bottom(layout::PANEL_FOOTER + space::S8)
-            .w(px(400.))
-            .max_w(gpui::relative(0.9))
+            .w_full()
             .flex()
             .items_start()
             .justify_between()
@@ -759,15 +1151,18 @@ fn transfer_notice(state: Entity<AppState>, app: &AppState) -> Option<gpui::AnyE
                     .children(lines),
             )
             .child(
-                ui::ghost_button(SharedString::from("transfer-notice-dismiss"), "Dismiss")
-                    .debug_selector(|| "transfer-notice-dismiss".to_owned())
-                    .h(px(22.))
-                    .px(space::S6)
-                    .text_role(type_role::MICRO)
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        dismiss_state.update(cx, |state, cx| state.dismiss_transfer_notice(cx));
-                    }),
+                ui::ghost_button(
+                    SharedString::from("transfer-notice-dismiss"),
+                    i18n::t(Key::SidebarDismiss),
+                )
+                .debug_selector(|| "transfer-notice-dismiss".to_owned())
+                .h(px(22.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    dismiss_state.update(cx, |state, cx| state.dismiss_transfer_notice(cx));
+                }),
             )
             .into_any_element(),
     )
@@ -819,6 +1214,7 @@ mod tests {
     use crate::app::{
         AppState, ContentView, ExportFormat, NumberSetting, RequestSaveState, ShellState,
     };
+    use crate::i18n::{Key, Lang};
     use crate::test_support::LocalServer;
     use gpui::{
         Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
@@ -2458,6 +2854,66 @@ mod tests {
         );
     }
 
+    /// A rejected destination keeps the dialog and shows why inside it, since
+    /// the modal backdrop covers the status bar that carries the same sentence.
+    #[gpui::test]
+    async fn a_failed_save_reports_its_reason_inside_the_dialog(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        store.create_collection("Demo", 0).expect("collection");
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        set_url(&state, cx, "https://example.test/probe".to_owned());
+
+        cx.update(|_, app| state.update(app, |state, cx| state.save_now(cx)));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("save-picker-error").is_none(),
+            "a fresh dialog reports nothing"
+        );
+
+        let saved = cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.save_draft_to(cx, "gone", None, "Probe")
+            })
+        });
+        assert!(!saved, "a stale collection is rejected");
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("save-picker-error").is_some(),
+            "the dialog shows the failed save"
+        );
+        let reason = cx
+            .update(|_, app| {
+                let state = state.read(app);
+                assert!(state.save_picker_open(), "the dialog stays open");
+                state.save_picker_error().map(str::to_owned)
+            })
+            .expect("the dialog holds the reason");
+        let expected = i18n::msg(
+            MessageKey::StatusSaveFailed,
+            &[&i18n::msg(MessageKey::CollectionNotLoaded, &[&"gone"])],
+        );
+        assert_eq!(
+            reason, expected,
+            "the dialog repeats the status bar's sentence"
+        );
+
+        // Correcting the destination saves and closes the dialog; a fresh
+        // attempt starts without a stale reason.
+        click(cx, "save-picker-submit");
+        redraw(cx);
+        cx.update(|_, app| {
+            let state = state.read(app);
+            assert!(!state.save_picker_open(), "a successful save closes it");
+            assert!(state.save_picker_error().is_none());
+            assert_eq!(state.save_state(), &RequestSaveState::Clean);
+        });
+    }
+
     #[gpui::test]
     async fn a_click_outside_the_save_picker_closes_it(cx: &mut TestAppContext) {
         let (_dir, view, cx) = shell_window(cx);
@@ -2699,13 +3155,420 @@ mod tests {
             cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
         assert!(cx.debug_bounds("storage-issues").is_some());
         let state = shell_state(&view, cx);
-        let lines = cx.update(|_, app| sidebar::storage_issue_lines(state.read(app).workspace()));
+        let lines = cx.update(|_, app| storage_issue_lines(state.read(app).workspace()));
         assert!(
             lines.iter().any(
                 |line| line.contains("00000000-0000-0000-0000-000000000000.json")
                     && line.contains("invalid JSON")
             ),
             "issue text should be rendered: {lines:?}"
+        );
+    }
+
+    /// Builds a workspace with one saved collection and, when `damaged`,
+    /// replaces its collection document with invalid JSON before the shell
+    /// opens.
+    fn collection_shell(
+        cx: &mut TestAppContext,
+        damaged: bool,
+    ) -> (tempfile::TempDir, Entity<AppShell>, &mut VisualTestContext) {
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        store
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        if damaged {
+            std::fs::write(
+                store
+                    .collection_file(&collection.id)
+                    .expect("collection path"),
+                b"not: [valid",
+            )
+            .expect("damage the collection document");
+        }
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        (dir, view, cx)
+    }
+
+    #[gpui::test]
+    async fn a_damaged_collection_file_floats_above_the_panes(cx: &mut TestAppContext) {
+        bind_editor_keys(cx);
+        let (_clean_dir, _clean_view, clean_cx) = collection_shell(cx, false);
+        clean_cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        redraw(clean_cx);
+        let clean_chip = clean_cx
+            .debug_bounds("environment-chip")
+            .expect("the environment chip is laid out");
+
+        let (_damaged_dir, view, cx) = collection_shell(cx, true);
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        let reported = cx.update(|_, app| {
+            state
+                .read(app)
+                .workspace()
+                .issues
+                .iter()
+                .any(|issue| issue.path.ends_with("collection.json"))
+        });
+        assert!(reported, "the damaged collection document is reported");
+
+        let alert = cx.debug_bounds("storage-issues").expect("floating alert");
+        let chip = cx
+            .debug_bounds("environment-chip")
+            .expect("the environment chip is still laid out");
+        assert_eq!(
+            f32::from(chip.origin.x),
+            f32::from(clean_chip.origin.x),
+            "the report does not move the sidebar"
+        );
+        assert_eq!(
+            f32::from(chip.size.width),
+            f32::from(clean_chip.size.width),
+            "the report does not resize the sidebar"
+        );
+        assert!(
+            alert.origin.x > chip.origin.x + chip.size.width,
+            "the alert floats over the content, not inside the sidebar: {alert:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_storage_alert_does_not_expire(cx: &mut TestAppContext) {
+        let (_dir, _view, cx, store, collection, _request) = seeded_shell(cx, "Demo", "Ping");
+        let requests_dir = store.requests_dir(&collection.id).expect("path");
+        std::fs::write(
+            requests_dir.join("00000000-0000-0000-0000-000000000000.json"),
+            b"not: [valid",
+        )
+        .expect("corrupt request");
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        redraw(cx);
+        assert!(cx.debug_bounds("storage-issues").is_some());
+
+        cx.executor()
+            .advance_clock(crate::app::TRANSFER_NOTICE_DURATION);
+        cx.executor()
+            .advance_clock(crate::app::WORKSPACE_NOTICE_DURATION);
+        cx.run_until_parked();
+        redraw(cx);
+
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| {
+            assert!(
+                !state.read(app).workspace().issues.is_empty(),
+                "expiry does not dismiss a storage issue"
+            );
+        });
+        assert!(
+            cx.debug_bounds("storage-issues").is_some(),
+            "the storage alert has no timer"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_storage_alert_and_the_transfer_notice_stack(cx: &mut TestAppContext) {
+        let (_dir, _view, cx, store, collection, _request) = seeded_shell(cx, "Demo", "Ping");
+        let requests_dir = store.requests_dir(&collection.id).expect("path");
+        std::fs::write(
+            requests_dir.join("00000000-0000-0000-0000-000000000000.json"),
+            b"not: [valid",
+        )
+        .expect("corrupt request");
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.import_bytes("mixed.posthaste.json", PARTIAL_BUNDLE.as_bytes(), cx)
+            })
+        });
+        redraw(cx);
+
+        let storage = cx.debug_bounds("storage-issues").expect("storage alert");
+        let transfer = cx.debug_bounds("transfer-notice").expect("transfer notice");
+        assert!(
+            storage.origin.y + storage.size.height <= transfer.origin.y,
+            "the storage alert sits above the import result without overlap: \
+             storage {storage:?}, transfer {transfer:?}"
+        );
+    }
+
+    /// History reports float over the panes, stack an unreadable file with a
+    /// live failure, follow the interface language, and clear on Dismiss.
+    #[gpui::test]
+    async fn a_history_report_floats_and_can_be_dismissed(cx: &mut TestAppContext) {
+        use posthaste_core::history::{HistoryEntry, HistoryStore};
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        let _guard = crate::test_globals::InterfaceGuard::take();
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let history = HistoryStore::at(dir.path().join("history"));
+        std::fs::create_dir_all(history.root()).expect("history root");
+        let corrupt = history.root().join("corrupt.json");
+        std::fs::write(&corrupt, b"not json").expect("corrupt entry");
+        let shell_store = store.clone();
+        let shell_history = history.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            AppShell::new_with_store_and_history(window, cx, shell_store, shell_history)
+        });
+        let state = shell_state(&view, cx);
+        redraw(cx);
+
+        // The card floats even though History starts collapsed, and the
+        // section itself keeps only its own state.
+        assert!(
+            cx.debug_bounds("history-list").is_none(),
+            "History starts collapsed"
+        );
+        assert!(
+            cx.debug_bounds("history-alert").is_some(),
+            "the report floats over the panes"
+        );
+        assert!(
+            cx.debug_bounds("history-alert-issue-0").is_some(),
+            "the unreadable file is named"
+        );
+        assert!(cx.debug_bounds("history-alert-error").is_none());
+
+        // A failed delete joins the load issue on the same card.
+        let response = ResponseRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::from_static(b"{}"),
+            duration: Duration::from_millis(5),
+            truncated: false,
+            cookies: Vec::new(),
+        };
+        let mut spec = RequestSpec::new("Ping");
+        spec.method = HttpMethod::Get;
+        spec.url = "http://example.test/first".to_owned();
+        let doomed = HistoryEntry::completed(1, &spec, &response);
+        let doomed_id = doomed.id;
+        cx.update(|_, app| {
+            state.update(app, |state, _| state.record_test_history(doomed));
+        });
+        let path = history.entry_file(doomed_id);
+        std::fs::remove_file(&path).expect("remove entry file");
+        std::fs::create_dir(&path).expect("replace with a directory");
+        cx.update(|_, app| {
+            state.update(app, |state, cx| state.delete_history(doomed_id, cx));
+        });
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("history-alert-error").is_some(),
+            "the failed delete is reported"
+        );
+        let error = cx
+            .update(|_, app| state.read(app).history().error.clone())
+            .expect("a live error stands");
+        let prefix = i18n::msg(MessageKey::HistoryDeleteFailed, &[&""]);
+        assert!(
+            error.starts_with(&prefix),
+            "the sentence wraps the storage detail: {error}"
+        );
+
+        // Expanding History shows its empty state, never a second error row.
+        click(cx, "history-toggle");
+        redraw(cx);
+        assert!(cx.debug_bounds("history-list").is_some());
+        assert!(cx.debug_bounds("history-empty").is_some());
+        assert!(
+            cx.debug_bounds("history-error").is_none(),
+            "the section holds no error row"
+        );
+        assert!(cx.debug_bounds("history-alert").is_some());
+
+        // In Chinese a new failure is reported in Chinese.
+        i18n::set_language(Lang::Chinese);
+        spec.url = "http://example.test/second".to_owned();
+        let second = HistoryEntry::completed(2, &spec, &response);
+        let second_id = second.id;
+        cx.update(|_, app| {
+            state.update(app, |state, _| state.record_test_history(second));
+        });
+        let path = history.entry_file(second_id);
+        std::fs::remove_file(&path).expect("remove entry file");
+        std::fs::create_dir(&path).expect("replace with a directory");
+        cx.update(|_, app| {
+            state.update(app, |state, cx| state.delete_history(second_id, cx));
+        });
+        redraw(cx);
+        let error = cx
+            .update(|_, app| state.read(app).history().error.clone())
+            .expect("the second failure stands");
+        assert!(
+            error.starts_with("无法删除历史记录："),
+            "the sentence follows the interface language: {error}"
+        );
+
+        // Dismiss clears the report; the stored files stay as they are.
+        click(cx, "history-alert-dismiss");
+        redraw(cx);
+        cx.update(|_, app| {
+            let history = state.read(app).history();
+            assert!(history.error.is_none());
+            assert!(history.issues.is_empty());
+        });
+        assert!(corrupt.is_file(), "Dismiss deletes nothing");
+    }
+
+    #[gpui::test]
+    async fn a_long_history_report_scrolls_inside_the_alert(cx: &mut TestAppContext) {
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let history = HistoryStore::at(dir.path().join("history"));
+        std::fs::create_dir_all(history.root()).expect("history root");
+        for index in 0..8 {
+            std::fs::write(
+                history.root().join(format!("corrupt-{index}.json")),
+                b"not json",
+            )
+            .expect("corrupt entry");
+        }
+        let shell_store = store.clone();
+        let shell_history = history.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            AppShell::new_with_store_and_history(window, cx, shell_store, shell_history)
+        });
+        let state = shell_state(&view, cx);
+        redraw(cx);
+
+        let count = cx.update(|_, app| state.read(app).history().issues.len());
+        assert_eq!(count, 8, "every unreadable file is reported");
+        assert!(
+            cx.debug_bounds("history-alert-issue-7").is_some(),
+            "every row is present"
+        );
+        let scroll = cx
+            .debug_bounds("history-alert-scroll")
+            .expect("the card has a scroll area");
+        assert!(
+            scroll.size.height <= px(360.),
+            "the card keeps a window-bounded height: {scroll:?}"
+        );
+    }
+
+    /// Every report shares one bottom-right column: none covers another and
+    /// the column stays inside the window.
+    #[gpui::test]
+    async fn the_floating_column_stacks_every_report(cx: &mut TestAppContext) {
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let requests_dir = store.requests_dir(&collection.id).expect("path");
+        std::fs::write(
+            requests_dir.join("00000000-0000-0000-0000-000000000000.json"),
+            b"not: [valid",
+        )
+        .expect("corrupt request");
+        let history = HistoryStore::at(dir.path().join("history"));
+        std::fs::create_dir_all(history.root()).expect("history root");
+        std::fs::write(history.root().join("corrupt.json"), b"not json").expect("corrupt entry");
+
+        let shell_store = store.clone();
+        let shell_history = history.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            AppShell::new_with_store_and_history(window, cx, shell_store, shell_history)
+        });
+        let state = shell_state(&view, cx);
+
+        let holder = tempfile::tempdir().expect("temp holder");
+        let missing = holder.path().join("gone");
+        cx.update(|window, app| {
+            state.update(app, |state, cx| {
+                state.choose_workspace_path(missing, window, cx)
+            });
+        });
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.import_bytes("mixed.posthaste.json", PARTIAL_BUNDLE.as_bytes(), cx)
+            })
+        });
+        redraw(cx);
+
+        for selector in [
+            "storage-issues",
+            "history-alert",
+            "workspace-notice",
+            "transfer-notice",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "the column should show {selector}"
+            );
+        }
+
+        let shell = cx.debug_bounds("app-shell").expect("the shell renders");
+        let column = cx
+            .debug_bounds("floating-notices")
+            .expect("the column renders");
+        assert!(
+            column.origin.y >= shell.origin.y
+                && column.origin.y + column.size.height <= shell.origin.y + shell.size.height,
+            "the column stays inside the window: {column:?} in {shell:?}"
+        );
+
+        let storage = cx.debug_bounds("storage-issues").expect("storage alert");
+        let history = cx.debug_bounds("history-alert").expect("history report");
+        let workspace = cx
+            .debug_bounds("workspace-notice")
+            .expect("workspace notice");
+        let transfer = cx.debug_bounds("transfer-notice").expect("transfer notice");
+        assert!(
+            storage.origin.y + storage.size.height <= history.origin.y,
+            "storage sits above history: {storage:?}, {history:?}"
+        );
+        assert!(
+            history.origin.y + history.size.height <= workspace.origin.y,
+            "history sits above the workspace notice: {history:?}, {workspace:?}"
+        );
+        assert!(
+            workspace.origin.y + workspace.size.height <= transfer.origin.y,
+            "the workspace notice sits above the transfer notice: \
+             {workspace:?}, {transfer:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_long_storage_report_scrolls_inside_the_alert(cx: &mut TestAppContext) {
+        let (_dir, _view, cx, store, collection, _request) = seeded_shell(cx, "Demo", "Ping");
+        let requests_dir = store.requests_dir(&collection.id).expect("path");
+        for index in 0..8u128 {
+            std::fs::write(
+                requests_dir.join(format!("00000000-0000-0000-0000-{index:012}.json")),
+                b"not: [valid",
+            )
+            .expect("corrupt request");
+        }
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        redraw(cx);
+
+        let state = shell_state(&view, cx);
+        let count = cx.update(|_, app| state.read(app).workspace().issues.len());
+        assert!(count >= 8, "every damaged file is reported: {count}");
+        assert!(cx.debug_bounds("storage-issue-7").is_some());
+        let scroll = cx
+            .debug_bounds("storage-issues-scroll")
+            .expect("the alert has a scroll area");
+        assert!(
+            scroll.size.height <= px(360.),
+            "the alert keeps a window-bounded height: {scroll:?}"
         );
     }
 
@@ -2740,7 +3603,7 @@ mod tests {
             );
             (
                 workspace.issues[0].path.clone(),
-                sidebar::storage_issue_lines(workspace)[0].clone(),
+                storage_issue_lines(workspace)[0].clone(),
             )
         });
         assert!(path.exists(), "the damaged file is preserved, not deleted");
@@ -3049,7 +3912,7 @@ mod tests {
         let state = shell_state(&view, cx);
         assert_eq!(
             cx.update(|_, app| state.read(app).workspace().rename_error.clone()),
-            Some("Name is required.".to_owned())
+            Some(Key::RenameNameRequired.text(Lang::English).to_owned())
         );
         let loaded = store.load().expect("reload");
         assert_eq!(loaded.collections[0].requests[0].name(), "Renamed");
@@ -3083,7 +3946,7 @@ mod tests {
         assert!(cx.debug_bounds("rename-error").is_some());
         assert_eq!(
             cx.update(|_, app| state.read(app).workspace().rename_error.clone()),
-            Some("A collection with this name already exists.".to_owned())
+            Some(Key::RenameCollectionTaken.text(Lang::English).to_owned())
         );
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
@@ -3098,7 +3961,7 @@ mod tests {
         assert!(cx.debug_bounds("rename-error").is_some());
         assert_eq!(
             cx.update(|_, app| state.read(app).workspace().rename_error.clone()),
-            Some("An environment with this name already exists.".to_owned())
+            Some(Key::RenameEnvironmentTaken.text(Lang::English).to_owned())
         );
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
@@ -3112,7 +3975,7 @@ mod tests {
         assert!(cx.debug_bounds("rename-error").is_some());
         assert_eq!(
             cx.update(|_, app| state.read(app).workspace().rename_error.clone()),
-            Some("A folder with this name already exists.".to_owned())
+            Some(Key::RenameFolderTaken.text(Lang::English).to_owned())
         );
 
         let loaded = store.load().expect("reload");
@@ -4723,6 +5586,12 @@ mod tests {
     async fn the_workspace_notice_shows_and_clears(cx: &mut TestAppContext) {
         let (_dirs, _view, state, cx) = workspace_shell(cx);
         assert!(cx.debug_bounds("workspace-notice").is_none());
+        let clean_chip = cx
+            .debug_bounds("environment-chip")
+            .expect("the environment chip renders");
+        let clean_history = cx
+            .debug_bounds("history-section")
+            .expect("the history section renders");
 
         let holder = tempfile::tempdir().expect("temp holder");
         let missing = holder.path().join("gone");
@@ -4732,9 +5601,51 @@ mod tests {
             });
         });
         redraw(cx);
+        let card = cx
+            .debug_bounds("workspace-notice")
+            .expect("the notice floats over the panes");
+        let column = cx
+            .debug_bounds("floating-notices")
+            .expect("the notice joins the floating column");
         assert!(
-            cx.debug_bounds("workspace-notice").is_some(),
-            "the notice renders above the sidebar's storage errors"
+            card.origin.x >= column.origin.x && card.origin.y >= column.origin.y,
+            "the notice sits inside the bottom-right column: {card:?} in {column:?}"
+        );
+        let chip = cx
+            .debug_bounds("environment-chip")
+            .expect("the environment chip renders");
+        assert_eq!(
+            (
+                f32::from(chip.origin.x),
+                f32::from(chip.origin.y),
+                f32::from(chip.size.width),
+                f32::from(chip.size.height),
+            ),
+            (
+                f32::from(clean_chip.origin.x),
+                f32::from(clean_chip.origin.y),
+                f32::from(clean_chip.size.width),
+                f32::from(clean_chip.size.height),
+            ),
+            "a notice no longer moves the environment control"
+        );
+        let history = cx
+            .debug_bounds("history-section")
+            .expect("the history section renders");
+        assert_eq!(
+            (
+                f32::from(history.origin.x),
+                f32::from(history.origin.y),
+                f32::from(history.size.width),
+                f32::from(history.size.height),
+            ),
+            (
+                f32::from(clean_history.origin.x),
+                f32::from(clean_history.origin.y),
+                f32::from(clean_history.size.width),
+                f32::from(clean_history.size.height),
+            ),
+            "the notice takes no sidebar space between the sections"
         );
         let notice = cx
             .update(|_, app| state.read(app).workspace_notice().map(str::to_owned))

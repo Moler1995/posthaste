@@ -76,6 +76,7 @@ text_table! {
     PlaceholderName => "Name" / "名称",
     PlaceholderCurlRequestName => "Named after the command" / "以命令命名",
     PlaceholderCurlCommands => "Paste one or more cURL commands" / "粘贴一个或多个 cURL 命令",
+    PlaceholderValue => "Value" / "值",
 
     // Platform file dialogs.
     PromptOpenWorkspace => "Open a workspace folder" / "打开工作区文件夹",
@@ -86,9 +87,23 @@ text_table! {
     // Plain notices and validation.
     SavePickerChooseDestination => "Choose where to save this request." / "请选择此请求的保存位置。",
     SavePickerEnterName => "Enter a request name." / "请输入请求名称。",
+    RenameNameRequired => "Name is required." / "请输入名称。",
+    RenameCollectionTaken => "A collection with this name already exists." / "已存在同名集合。",
+    RenameFolderTaken => "A folder with this name already exists." / "已存在同名文件夹。",
+    RenameEnvironmentTaken => "An environment with this name already exists." / "已存在同名环境。",
+    WorkspaceNameRequired => "Enter a workspace name." / "请输入工作区名称。",
+    WorkspaceNameInvalidCharacter => "The name contains a character that cannot be used in a folder name." / "名称中包含不能用于文件夹名的字符。",
+    WorkspaceNameReserved => "That name is reserved on this platform." / "该名称在此平台上为保留名称。",
+
+    // Save-status causes. The status bar and the tab tooltip wrap these in a
+    // sentence, so each reads as its own clause.
+    WorkspaceUnavailable => "the workspace is unavailable" / "工作区不可用",
+    SaveFolderMissing => "the destination folder no longer exists" / "目标文件夹已不存在",
+    SaveRequestsCopyFailed => "some requests could not be copied" / "部分请求无法复制",
+    SaveRequestsDeleteFailed => "some requests could not be deleted" / "部分请求无法删除",
     CurlImportRequestNameItem => "request name" / "请求名称",
     CurlImportRequestNameReason => "applies to a single command; these requests kept their inferred names" / "仅适用于单条命令；这些请求保留了推断的名称",
-    CurlImportDestinationGone => "the destination collection is no longer available" / "目标集合已不可用",
+    DestinationCollectionGone => "the destination collection is no longer available" / "目标集合已不再可用",
     ImportNotRecognized => "the file is not a recognizable collection document; expected a .posthaste.json bundle or a Postman collection" / "无法识别该集合文档；应为 .posthaste.json 打包文件或 Postman 集合",
 
     // Export warnings.
@@ -397,6 +412,10 @@ text_table! {
 
 message_table! {
     StatusSaveFailed => "Save failed: {}" / "保存失败：{}",
+    // A save that was refused without a workspace status to quote. The dialog
+    // normally shows the status bar's own sentence; this keeps it from closing
+    // silently if that status is ever missing.
+    SavePickerWriteFailed => "The request could not be saved." / "无法保存此请求。",
     SettingsWriteFailed => "Preferences write failed: {}" / "偏好设置写入失败：{}",
 
     // Workspace notices.
@@ -434,11 +453,16 @@ message_table! {
     // The response pane's banners.
     ResponseHistoryBanner => "HISTORY · {}" / "历史 · {}",
     WsFrameTotals => "{} sent · {} received · {}" / "已发送 {} · 已接收 {} · {}",
+    WsTrafficSummary => "{} frames and {} bytes sent; {} frames and {} bytes received" / "已发送 {} 帧、{} 字节；已接收 {} 帧、{} 字节",
 
     // The response viewer's counts and notices.
     ScriptCookiesButton => "Cookies ({})" / "Cookie（{}）",
     TabTooltipSaveFailed => "Save failed: {} — Ctrl+S retries" / "保存失败：{} — 按 Ctrl+S 重试",
     HistoryUnavailable => "History unavailable: {}" / "历史记录不可用：{}",
+    HistoryWriteFailed => "The history entry could not be written: {}" / "无法写入历史记录：{}",
+    HistoryPruneFailed => "An old history entry could not be deleted: {}" / "无法删除旧的历史记录：{}",
+    HistoryDeleteFailed => "The history entry could not be deleted: {}" / "无法删除历史记录：{}",
+    HistoryClearFailed => "The history could not be cleared: {}" / "无法清空历史记录：{}",
     CloseTabsHeading => "Close {} tabs?" / "关闭 {} 个标签页？",
     CloseTabsMessage => "Unsaved drafts in {} of {} tabs will be discarded." / "{} / {} 个标签页中有未保存的草稿，将被丢弃。",
     CloseTabMessage => "Discard the unsaved draft in \"{}\"?" / "丢弃「{}」中未保存的草稿？",
@@ -473,6 +497,25 @@ message_table! {
     DeleteWithOne => "Delete \"{}\" and its {}?" / "删除“{}”及其 {}？",
     DeleteWithTwo => "Delete \"{}\" and its {} and {}?" / "删除“{}”及其 {}和{}？",
     StorageIssueLine => "{}: {}" / "{}：{}",
+
+    // Save failures. A failed save is one sentence, and the count of documents
+    // that could not be written uses the counted form.
+    CollectionNotLoaded => "collection {} is not loaded" / "集合 {} 未加载",
+    SaveDocumentsFailed => "{} could not be written" / "{}未能写入",
+
+    // Storage reports. Each is one sentence with the storage detail as its
+    // argument; the detail itself stays in the layer that produced it.
+    StorageCollectionNameFailed => "The collection directory name could not be computed: {}" / "无法计算集合目录名：{}",
+    StorageCollectionMoveFailed => "The collection directory could not be moved: {}" / "集合目录无法移动：{}",
+    StorageCollectionMoveBackFailed => "The collection directory could not be moved back after a failed save: {}" / "保存失败后，集合目录无法移回：{}",
+    StorageEnvironmentNameFailed => "The environment file name could not be computed: {}" / "无法计算环境文件名：{}",
+    StorageEnvironmentMoveFailed => "The environment file could not be moved: {}" / "环境文件无法移动：{}",
+    StorageRequestCopyFailed => "The request copy could not be written: {}" / "请求副本无法写入：{}",
+    StoragePreservedDeleteFailed => "The preserved document could not be deleted: {}" / "无法删除保留的文档：{}",
+
+    // Workspace creation and export.
+    WorkspaceTargetNotEmpty => "{}: the folder is not empty" / "{}：文件夹不为空",
+    RequestReadFailed => "{} could not be read: {}" / "无法读取 {}：{}",
 }
 
 /// Keys whose two texts are identical on purpose, in declaration order.
@@ -510,6 +553,9 @@ pub mod counted {
         Folder,
         Request,
         Environment,
+        /// A stored document written by the save path. Only used by the
+        /// failed-write sentence, so it is not an object the UI lists.
+        Document,
     }
 
     impl Item {
@@ -523,6 +569,8 @@ pub mod counted {
                 (Self::Request, true) => "requests",
                 (Self::Environment, false) => "environment",
                 (Self::Environment, true) => "environments",
+                (Self::Document, false) => "document",
+                (Self::Document, true) => "documents",
             }
         }
 
@@ -532,6 +580,7 @@ pub mod counted {
                 Self::Folder => "文件夹",
                 Self::Request => "请求",
                 Self::Environment => "环境",
+                Self::Document => "文档",
             }
         }
     }

@@ -18,6 +18,8 @@ use posthaste_core::storage::{
 };
 use posthaste_core::variables::{VariableCatalog, Variables};
 
+use crate::i18n::{self, Key, MessageKey, counted};
+
 /// Outcome of the most recent autosave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveStatus {
@@ -572,12 +574,12 @@ impl WorkspaceState {
             return false;
         };
         if self.collection(slug).is_none() {
-            self.save_status = SaveStatus::Failed(format!("collection {slug} is not loaded"));
+            self.save_status =
+                SaveStatus::Failed(i18n::msg(MessageKey::CollectionNotLoaded, &[&slug]));
             return false;
         }
         if folder_id.is_some_and(|id| self.folder(slug, id).is_none()) {
-            self.save_status =
-                SaveStatus::Failed("the destination folder no longer exists".to_owned());
+            self.save_status = SaveStatus::Failed(i18n::t(Key::SaveFolderMissing).to_owned());
             return false;
         }
 
@@ -853,7 +855,10 @@ impl WorkspaceState {
                     failed = true;
                     self.issues.push(StorageIssue {
                         path: error.path().unwrap_or_else(|| store.root()).to_path_buf(),
-                        message: format!("request copy could not be written: {}", error.detail()),
+                        message: i18n::msg(
+                            MessageKey::StorageRequestCopyFailed,
+                            &[&error.detail()],
+                        ),
                     });
                 }
             }
@@ -874,7 +879,7 @@ impl WorkspaceState {
         self.sync_index(&store, slug);
         if failed {
             store.flush_indexes();
-            self.save_status = SaveStatus::Failed("some requests could not be copied".to_owned());
+            self.save_status = SaveStatus::Failed(i18n::t(Key::SaveRequestsCopyFailed).to_owned());
             self.needs_resync = true;
         } else {
             self.finish_mutation(&store);
@@ -991,18 +996,14 @@ impl WorkspaceState {
         // Confirming the current name is always accepted, even when the
         // workspace already contains another collection with that name.
         if !same_display_name(&current_name, name) && self.collection_name_taken(name, Some(slug)) {
-            self.rename_error = Some("A collection with this name already exists.".to_owned());
+            self.rename_error = Some(i18n::t(Key::RenameCollectionTaken).to_owned());
             return None;
         }
 
         let target = match store.collection_slug_for(name, slug) {
             Ok(target) => target,
             Err(error) => {
-                self.push_storage_issue(
-                    &store,
-                    &error,
-                    "collection directory name could not be computed",
-                );
+                self.push_storage_issue(&store, &error, MessageKey::StorageCollectionNameFailed);
                 slug.to_owned()
             }
         };
@@ -1022,7 +1023,7 @@ impl WorkspaceState {
                     self.push_storage_issue(
                         &store,
                         &error,
-                        "collection directory could not be moved",
+                        MessageKey::StorageCollectionMoveFailed,
                     );
                     let result = self.save_collection_document(&store, slug);
                     self.record_save(result);
@@ -1060,7 +1061,7 @@ impl WorkspaceState {
                     self.push_storage_issue(
                         &store,
                         &error,
-                        "collection directory could not be moved back after a failed save",
+                        MessageKey::StorageCollectionMoveBackFailed,
                     );
                 }
             }
@@ -1100,7 +1101,7 @@ impl WorkspaceState {
                 && folder_name_taken(&entry.collection, folder.parent_id, name, Some(id))
         };
         if duplicate {
-            self.rename_error = Some("A folder with this name already exists.".to_owned());
+            self.rename_error = Some(i18n::t(Key::RenameFolderTaken).to_owned());
             return false;
         }
         {
@@ -1151,7 +1152,7 @@ impl WorkspaceState {
                 if partial {
                     store.flush_indexes();
                     self.save_status =
-                        SaveStatus::Failed("some requests could not be deleted".to_owned());
+                        SaveStatus::Failed(i18n::t(Key::SaveRequestsDeleteFailed).to_owned());
                     self.needs_resync = true;
                 } else {
                     self.finish_mutation(&store);
@@ -1588,18 +1589,14 @@ impl WorkspaceState {
         // workspace already contains another environment with that name.
         if !same_display_name(&current_name, name) && self.environment_name_taken(name, Some(slug))
         {
-            self.rename_error = Some("An environment with this name already exists.".to_owned());
+            self.rename_error = Some(i18n::t(Key::RenameEnvironmentTaken).to_owned());
             return None;
         }
 
         let target = match store.environment_slug_for(name, slug) {
             Ok(target) => target,
             Err(error) => {
-                self.push_storage_issue(
-                    &store,
-                    &error,
-                    "environment file name could not be computed",
-                );
+                self.push_storage_issue(&store, &error, MessageKey::StorageEnvironmentNameFailed);
                 slug.to_owned()
             }
         };
@@ -1616,7 +1613,11 @@ impl WorkspaceState {
             match store.move_environment(slug, &target) {
                 Ok(()) => {}
                 Err(error) => {
-                    self.push_storage_issue(&store, &error, "environment file could not be moved");
+                    self.push_storage_issue(
+                        &store,
+                        &error,
+                        MessageKey::StorageEnvironmentMoveFailed,
+                    );
                     let result = self.save_environment_document(&store, slug);
                     self.record_save(result);
                     return Some(slug.to_owned());
@@ -1799,7 +1800,7 @@ impl WorkspaceState {
         };
         let Some(store) = self.store.clone() else {
             self.fail_unavailable();
-            outcome.error = Some("the workspace is unavailable".to_owned());
+            outcome.error = Some(i18n::t(Key::WorkspaceUnavailable).to_owned());
             return outcome;
         };
 
@@ -1930,11 +1931,11 @@ impl WorkspaceState {
         let mut outcome = ImportOutcome::default();
         let Some(store) = self.store.clone() else {
             self.fail_unavailable();
-            outcome.error = Some("the workspace is unavailable".to_owned());
+            outcome.error = Some(i18n::t(Key::WorkspaceUnavailable).to_owned());
             return outcome;
         };
         let Some(collection) = self.collection(slug) else {
-            outcome.error = Some("the destination collection is no longer available".to_owned());
+            outcome.error = Some(i18n::t(Key::DestinationCollectionGone).to_owned());
             return outcome;
         };
         let collection_name = collection.collection.name.clone();
@@ -1996,14 +1997,14 @@ impl WorkspaceState {
     fn load_bundle_collection(&self, slug: &str) -> Result<BundleCollection, InterchangeError> {
         let Some(entry) = self.collection(slug) else {
             return Err(InterchangeError::Unavailable {
-                message: format!("collection {slug} is not loaded"),
+                message: i18n::msg(MessageKey::CollectionNotLoaded, &[&slug]),
             });
         };
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| InterchangeError::Unavailable {
-                message: "the workspace is unavailable".to_owned(),
+                message: i18n::t(Key::WorkspaceUnavailable).to_owned(),
             })?;
 
         let mut requests = Vec::with_capacity(entry.requests.len());
@@ -2013,7 +2014,7 @@ impl WorkspaceState {
                 RequestEntry::Unloaded { summary, .. } => store
                     .load_request(slug, summary.id)
                     .map_err(|error| InterchangeError::Unavailable {
-                        message: format!("{} could not be read: {error}", summary.name),
+                        message: i18n::msg(MessageKey::RequestReadFailed, &[&summary.name, &error]),
                     })?,
             };
             requests.push(spec);
@@ -2037,7 +2038,7 @@ impl WorkspaceState {
     }
 
     fn fail_unavailable(&mut self) {
-        self.save_status = SaveStatus::Failed("workspace is unavailable".to_owned());
+        self.save_status = SaveStatus::Failed(i18n::t(Key::WorkspaceUnavailable).to_owned());
         self.needs_resync = true;
     }
 
@@ -2091,10 +2092,15 @@ impl WorkspaceState {
 
     /// Adds a non-fatal issue for a rename step that failed without preventing
     /// the rest of the save.
-    fn push_storage_issue(&mut self, store: &WorkspaceStore, error: &StorageError, context: &str) {
+    fn push_storage_issue(
+        &mut self,
+        store: &WorkspaceStore,
+        error: &StorageError,
+        sentence: MessageKey,
+    ) {
         self.issues.push(StorageIssue {
             path: error.path().unwrap_or_else(|| store.root()).to_path_buf(),
-            message: format!("{context}: {}", error.detail()),
+            message: i18n::msg(sentence, &[&error.detail()]),
         });
     }
 
@@ -2113,8 +2119,10 @@ impl WorkspaceState {
                     self.needs_resync = false;
                 } else {
                     let failed = report.failures.len();
-                    self.save_status =
-                        SaveStatus::Failed(format!("{failed} document(s) could not be written"));
+                    self.save_status = SaveStatus::Failed(i18n::msg(
+                        MessageKey::SaveDocumentsFailed,
+                        &[&counted::item(counted::Item::Document, failed)],
+                    ));
                     self.needs_resync = true;
                     for issue in report.into_issues() {
                         self.push_save_issue(issue);
@@ -2192,7 +2200,8 @@ impl WorkspaceState {
         match store.delete_quarantined_document(&issue.path) {
             Ok(()) => self.dismiss_issue(&issue),
             Err(error) => {
-                let message = format!("could not delete preserved document: {}", error.detail());
+                let message =
+                    i18n::msg(MessageKey::StoragePreservedDeleteFailed, &[&error.detail()]);
                 match self
                     .issues
                     .iter_mut()
@@ -2251,7 +2260,7 @@ impl WorkspaceState {
 fn validated_name<'a>(name: &'a str, error: &mut Option<String>) -> Option<&'a str> {
     let name = name.trim();
     if name.is_empty() {
-        *error = Some("Name is required.".to_owned());
+        *error = Some(i18n::t(Key::RenameNameRequired).to_owned());
         None
     } else {
         *error = None;
@@ -2459,7 +2468,10 @@ mod tests {
             .expect("folder");
 
         assert!(!state.rename_folder(&collection.id, folder.id, "   "));
-        assert_eq!(state.rename_error.as_deref(), Some("Name is required."));
+        assert_eq!(
+            state.rename_error.as_deref(),
+            Some(Key::RenameNameRequired.text(i18n::Lang::English))
+        );
         assert!(!state.rename_folder(&collection.id, FolderId::new(), "Nope"));
 
         assert!(state.rename_folder(&collection.id, folder.id, "  Authentication  "));
@@ -2559,6 +2571,9 @@ mod tests {
 
     #[test]
     fn a_failed_collection_move_keeps_the_old_slug_and_reports_an_issue() {
+        // The reported sentence is English prose, so keep a language test from
+        // switching the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let (_dir, mut state) = workspace();
         state.create_collection("Demo").expect("collection");
         let store = state.store.clone().expect("store");
@@ -2765,6 +2780,9 @@ mod tests {
 
     #[test]
     fn a_failed_issue_delete_keeps_one_row_naming_the_failure() {
+        // The reported sentence is English prose, so keep a language test from
+        // switching the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let (_dir, mut state) = workspace();
         let store = state.store.clone().expect("store");
         // A directory in place of the preserved file makes removal fail on
@@ -2790,7 +2808,7 @@ mod tests {
         assert!(
             rows[0]
                 .message
-                .contains("could not delete preserved document"),
+                .contains("preserved document could not be deleted"),
             "{}",
             rows[0].message
         );
@@ -2862,6 +2880,9 @@ mod tests {
 
     #[test]
     fn a_failed_environment_move_keeps_the_old_slug_and_reports_an_issue() {
+        // The reported sentence is English prose, so keep a language test from
+        // switching the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let (_dir, mut state) = workspace();
         state.create_environment("Dev").expect("environment");
         let store = state.store.clone().expect("store");
@@ -3477,7 +3498,7 @@ mod tests {
         assert!(state.rename_collection(&payments.id, " Billing ").is_none());
         assert_eq!(
             state.rename_error.as_deref(),
-            Some("A collection with this name already exists.")
+            Some(Key::RenameCollectionTaken.text(i18n::Lang::English))
         );
         assert_eq!(
             state.collection(&payments.id).unwrap().collection.name,
@@ -3578,7 +3599,7 @@ mod tests {
         assert!(state.rename_environment(&prod.slug, " DEV ").is_none());
         assert_eq!(
             state.rename_error.as_deref(),
-            Some("An environment with this name already exists.")
+            Some(Key::RenameEnvironmentTaken.text(i18n::Lang::English))
         );
         assert_eq!(state.environment("prod").unwrap().environment.name, "Prod");
         assert_eq!(state.environment("dev").unwrap().environment.name, "Dev");
@@ -3670,7 +3691,7 @@ mod tests {
         assert!(!state.rename_folder(&collection.id, tokens.id, "AUTH"));
         assert_eq!(
             state.rename_error.as_deref(),
-            Some("A folder with this name already exists.")
+            Some(Key::RenameFolderTaken.text(i18n::Lang::English))
         );
         assert_eq!(
             state.folder(&collection.id, tokens.id).unwrap().name,
@@ -4100,6 +4121,9 @@ mod tests {
 
     #[test]
     fn a_failed_request_write_reports_a_partial_folder_copy() {
+        // The reported sentence is English prose, so keep a language test from
+        // switching the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let (_dir, mut state) = workspace();
         let collection = state.create_collection("Demo").expect("collection");
         let auth = state

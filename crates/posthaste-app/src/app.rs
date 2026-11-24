@@ -34,8 +34,8 @@ use posthaste_core::session::{
     SessionDocument, SessionExecution, SessionLoad, SessionStore, SessionTab,
 };
 use posthaste_core::storage::{
-    StorageError, StorageIssue, WorkspaceStore, create_workspace, has_workspace_document,
-    normalize_directory_path, same_directory,
+    StorageError, StorageIssue, WorkspaceCreateError, WorkspaceNameError, WorkspaceStore,
+    create_workspace, has_workspace_document, normalize_directory_path, same_directory,
 };
 use posthaste_core::variables::{resolve_request, resolve_request_lossy};
 use posthaste_core::ws::{
@@ -602,6 +602,29 @@ fn is_default_draft(draft: &RequestSpec) -> bool {
         && draft.timeout_ms == default.timeout_ms
         && draft.auth == default.auth
         && draft.folder_id == default.folder_id
+}
+
+/// Presents a workspace-creation failure in the interface language.
+///
+/// The name errors and the "not empty" refusal are sentences the application
+/// composes, so they come from the catalogue. A storage or OS detail keeps its
+/// own text inside the sentence that presents it.
+fn workspace_create_error_text(error: &WorkspaceCreateError) -> String {
+    match error {
+        WorkspaceCreateError::Name(WorkspaceNameError::Empty) => {
+            i18n::t(Key::WorkspaceNameRequired).to_owned()
+        }
+        WorkspaceCreateError::Name(WorkspaceNameError::InvalidCharacter) => {
+            i18n::t(Key::WorkspaceNameInvalidCharacter).to_owned()
+        }
+        WorkspaceCreateError::Name(WorkspaceNameError::Reserved) => {
+            i18n::t(Key::WorkspaceNameReserved).to_owned()
+        }
+        WorkspaceCreateError::TargetNotEmpty { path } => {
+            i18n::msg(MessageKey::WorkspaceTargetNotEmpty, &[&path.display()])
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Builds the notice that reports an import.
@@ -2159,9 +2182,10 @@ impl AppState {
             state.ensure_blank_number_unique(index);
         }
         state.refresh_variable_catalog(cx);
-        // A skipped remembered workspace is reported at boot; that report
-        // expires like any other.
-        state.start_workspace_notice_timer(cx);
+        // A skipped remembered workspace is reported at boot and describes the
+        // fallback workspace the user is now in, so it waits for the reader
+        // instead of counting down. A notice raised by a later workspace action
+        // starts its own timer in `set_workspace_notice`.
         state
     }
 
@@ -2961,7 +2985,7 @@ impl AppState {
                 self.open_workspace(&root, mode, window, cx);
             }
             Err(error) => {
-                self.new_workspace_error = Some(error.to_string());
+                self.new_workspace_error = Some(workspace_create_error_text(&error));
                 cx.notify();
             }
         }
@@ -3933,7 +3957,7 @@ impl AppState {
                 if self.workspace.collection(&slug).is_none() {
                     return self.finish_import(
                         ImportOutcome {
-                            error: Some(i18n::t(Key::CurlImportDestinationGone).to_owned()),
+                            error: Some(i18n::t(Key::DestinationCollectionGone).to_owned()),
                             ..ImportOutcome::default()
                         },
                         cx,
@@ -5723,6 +5747,12 @@ impl AppState {
         draft.name = name.to_owned();
         self.save_picker_error = None;
         if !self.workspace.save_new_request(slug, folder_id, &draft) {
+            // The dialog is the only surface the modal backdrop does not cover,
+            // so the reason the status bar would show is repeated here.
+            self.save_picker_error = Some(match &self.workspace.save_status {
+                SaveStatus::Failed(message) => i18n::msg(MessageKey::StatusSaveFailed, &[message]),
+                _ => i18n::msg(MessageKey::SavePickerWriteFailed, &[]),
+            });
             self.tabs[index].save_state = save_state_for(&self.workspace.save_status, false);
             self.schedule_session_write(cx);
             cx.notify();
@@ -6053,6 +6083,13 @@ impl AppState {
     /// Dismisses one reported storage issue without touching any file.
     pub fn dismiss_storage_issue(&mut self, issue: &StorageIssue, cx: &mut Context<Self>) {
         self.workspace.dismiss_issue(issue);
+        cx.notify();
+    }
+
+    /// Dismisses the reported history error and load issues without touching
+    /// any entry or file.
+    pub fn dismiss_history_report(&mut self, cx: &mut Context<Self>) {
+        self.history.dismiss_report();
         cx.notify();
     }
 
@@ -7931,8 +7968,21 @@ mod tests {
 
         assert_eq!(
             cx.update(|app| state.read(app).workspace_notice().map(str::to_owned)),
+            Some(notice.clone())
+        );
+
+        // The startup report describes the workspace the user is now in, so it
+        // waits for the reader rather than counting down.
+        cx.executor().advance_clock(WORKSPACE_NOTICE_DURATION);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|app| state.read(app).workspace_notice().map(str::to_owned)),
             Some(notice)
         );
+        cx.update(|app| {
+            state.update(app, |state, cx| state.dismiss_workspace_notice(cx));
+            assert!(state.read(app).workspace_notice().is_none());
+        });
     }
 
     #[gpui::test]
@@ -8246,10 +8296,13 @@ mod tests {
             (empty, separated)
         });
 
-        assert_eq!(empty.as_deref(), Some("Enter a workspace name."));
+        assert_eq!(
+            empty.as_deref(),
+            Some(Key::WorkspaceNameRequired.text(i18n::Lang::English))
+        );
         assert_eq!(
             separated.as_deref(),
-            Some("The name contains a character that cannot be used in a folder name.")
+            Some(Key::WorkspaceNameInvalidCharacter.text(i18n::Lang::English))
         );
         assert_eq!(
             std::fs::read_dir(location.path())
@@ -8262,6 +8315,9 @@ mod tests {
 
     #[gpui::test]
     async fn a_non_empty_target_is_refused(cx: &mut gpui::TestAppContext) {
+        // The refusal is English prose, so keep a language test from switching
+        // the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let (_workspace, store) = named_workspace("Payments");
         let location = tempfile::tempdir().expect("temp location");
         let target = location.path().join("Payments");
@@ -13239,7 +13295,7 @@ mod tests {
                 assert!(!state.commit_rename("   ", cx));
                 assert_eq!(
                     state.workspace().rename_error.as_deref(),
-                    Some("Name is required.")
+                    Some(Key::RenameNameRequired.text(i18n::Lang::English))
                 );
                 assert_eq!(
                     state.workspace().rename_target,
@@ -13309,7 +13365,7 @@ mod tests {
                 assert!(!state.commit_rename(" payments ", cx));
                 assert_eq!(
                     state.workspace().rename_error.as_deref(),
-                    Some("A collection with this name already exists.")
+                    Some(Key::RenameCollectionTaken.text(i18n::Lang::English))
                 );
                 assert_eq!(
                     state.workspace().rename_target,
@@ -13328,7 +13384,7 @@ mod tests {
                 assert!(!state.commit_rename("prod", cx));
                 assert_eq!(
                     state.workspace().rename_error.as_deref(),
-                    Some("An environment with this name already exists.")
+                    Some(Key::RenameEnvironmentTaken.text(i18n::Lang::English))
                 );
                 assert_eq!(
                     state.workspace().rename_target,
@@ -13348,7 +13404,7 @@ mod tests {
                 assert!(!state.commit_rename("auth", cx));
                 assert_eq!(
                     state.workspace().rename_error.as_deref(),
-                    Some("A folder with this name already exists.")
+                    Some(Key::RenameFolderTaken.text(i18n::Lang::English))
                 );
                 assert_eq!(
                     state.workspace().rename_target,
@@ -14562,10 +14618,19 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             assert!(state.save_picker_open(), "the picker stays open");
-            assert!(
-                matches!(state.save_state(), RequestSaveState::Failed(_)),
-                "the save-state line shows the failure"
+            let reason = i18n::msg(
+                MessageKey::StatusSaveFailed,
+                &[&i18n::t(Key::SaveFolderMissing)],
             );
+            assert_eq!(
+                state.save_picker_error(),
+                Some(reason.as_str()),
+                "the dialog reports the failure the status bar reports"
+            );
+            let RequestSaveState::Failed(status_sentence) = state.save_state() else {
+                panic!("the save-state line shows the failure");
+            };
+            assert_eq!(status_sentence, &reason);
             assert_eq!(state.shell().draft().url, "https://example.test/probe");
             assert_eq!(state.shell().selected_request(), None);
         });
@@ -14581,7 +14646,15 @@ mod tests {
             })
         });
         assert!(!saved);
-        assert!(cx.update(|app| state.read(app).save_picker_open()));
+        cx.update(|app| {
+            let state = state.read(app);
+            assert!(state.save_picker_open());
+            let reason = i18n::msg(
+                MessageKey::StatusSaveFailed,
+                &[&i18n::msg(MessageKey::CollectionNotLoaded, &[&"missing"])],
+            );
+            assert_eq!(state.save_picker_error(), Some(reason.as_str()));
+        });
         assert_eq!(
             cx.update(|app| state.read(app).shell().draft().url.clone()),
             "https://example.test/probe"

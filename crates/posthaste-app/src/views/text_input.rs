@@ -19,6 +19,7 @@ use gpui::{
 use posthaste_core::variables::VariableCatalog;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::i18n::{self, Key};
 use crate::metrics::{TypeStyle as _, layout, type_role};
 use crate::theme;
 use crate::views::text_history::{self, EditEntry, EditKind, Selection, TextHistory};
@@ -835,7 +836,7 @@ impl TextInput {
             .to_owned();
         let accent = self.accent;
         let value = cx.new(move |cx| {
-            TextInput::new(current, "Value", cx)
+            TextInput::new(current, i18n::t(Key::PlaceholderValue), cx)
                 .with_accent(accent)
                 .on_submit(move |text, window, cx| {
                     if let Some(owner) = submit_owner.upgrade() {

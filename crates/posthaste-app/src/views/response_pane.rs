@@ -421,9 +421,9 @@ fn response_header(view: &ResponseView) -> AnyElement {
                     meta.child(readout(
                         "response-frames",
                         format!("↑{frames_sent} ↓{frames_received}"),
-                        format!(
-                            "{frames_sent} frames and {bytes_sent} bytes sent; \
-                             {frames_received} frames and {bytes_received} bytes received"
+                        i18n::msg(
+                            MessageKey::WsTrafficSummary,
+                            &[&frames_sent, &bytes_sent, &frames_received, &bytes_received],
                         ),
                     ))
                 }

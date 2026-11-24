@@ -167,6 +167,15 @@ impl HistoryState {
         self.entries.is_empty()
     }
 
+    /// Clears the reported error and load issues for this session.
+    ///
+    /// No entry and no file is touched. A dismissed load issue is reported
+    /// again by the next load if its file is still unreadable.
+    pub fn dismiss_report(&mut self) {
+        self.error = None;
+        self.issues.clear();
+    }
+
     /// Records one entry, writing it first and then enforcing the cap.
     ///
     /// Returns the identifier the entry is stored under, so a caller can link
@@ -181,7 +190,10 @@ impl HistoryState {
         if let Some(store) = &self.store
             && let Err(error) = store.append(&entry)
         {
-            self.error = Some(format!("History write failed: {error}"));
+            self.error = Some(crate::i18n::msg(
+                crate::i18n::MessageKey::HistoryWriteFailed,
+                &[&error],
+            ));
         }
         self.entries.push(entry);
         self.entries.sort_by(|a, b| {
@@ -209,7 +221,10 @@ impl HistoryState {
                     self.entries.pop();
                 }
                 Err(error) => {
-                    self.error = Some(format!("History prune failed: {error}"));
+                    self.error = Some(crate::i18n::msg(
+                        crate::i18n::MessageKey::HistoryPruneFailed,
+                        &[&error],
+                    ));
                     break;
                 }
             }
@@ -231,7 +246,10 @@ impl HistoryState {
                 self.entries.remove(index);
             }
             Err(error) => {
-                self.error = Some(format!("History delete failed: {error}"));
+                self.error = Some(crate::i18n::msg(
+                    crate::i18n::MessageKey::HistoryDeleteFailed,
+                    &[&error],
+                ));
                 self.reload();
             }
         }
@@ -260,7 +278,10 @@ impl HistoryState {
                 self.error = None;
             }
             Err(error) => {
-                self.error = Some(format!("History clear failed: {error}"));
+                self.error = Some(crate::i18n::msg(
+                    crate::i18n::MessageKey::HistoryClearFailed,
+                    &[&error],
+                ));
                 self.reload();
             }
         }
@@ -276,7 +297,10 @@ impl HistoryState {
                 self.issues = loaded.issues;
             }
             Err(error) => {
-                self.error = Some(format!("History unavailable: {error}"));
+                self.error = Some(crate::i18n::msg(
+                    crate::i18n::MessageKey::HistoryUnavailable,
+                    &[&error],
+                ));
             }
         }
     }
@@ -509,6 +533,30 @@ mod tests {
 
         assert!(!state.confirming_clear);
         assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn dismiss_report_clears_the_error_and_issues_without_touching_entries() {
+        let (_dir, mut state) = state();
+        let kept = entry(10);
+        let kept_id = kept.id;
+        state.record(kept);
+        state.error = Some("failure".to_owned());
+        state.issues.push(StorageIssue {
+            path: std::path::PathBuf::from("corrupt.json"),
+            message: "invalid entry".to_owned(),
+        });
+
+        state.dismiss_report();
+
+        assert!(state.error.is_none());
+        assert!(state.issues.is_empty());
+        assert!(state.entries.iter().any(|entry| entry.id == kept_id));
+        let store = state.store.as_ref().expect("store");
+        assert!(
+            store.entry_file(kept_id).is_file(),
+            "dismissing a report touches no file"
+        );
     }
 
     #[test]

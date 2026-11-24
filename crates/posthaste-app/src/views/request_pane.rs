@@ -446,6 +446,8 @@ pub(crate) fn save_picker_modal(state: Entity<AppState>, app: &AppState) -> AnyE
     };
     let error_line = app.save_picker_error().map(|message| {
         div()
+            .id("save-picker-error")
+            .debug_selector(|| "save-picker-error".to_owned())
             .text_role(type_role::MICRO)
             .text_color(theme::status::danger())
             .child(message.to_owned())

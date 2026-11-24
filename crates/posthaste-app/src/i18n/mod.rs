@@ -131,6 +131,9 @@ macro_rules! message_table {
 mod catalogue;
 
 #[cfg(test)]
+mod literal_guard;
+
+#[cfg(test)]
 pub use catalogue::INVARIANT_KEYS;
 pub use catalogue::{Key, MessageKey, counted};
 
