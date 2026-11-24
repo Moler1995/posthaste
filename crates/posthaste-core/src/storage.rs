@@ -3206,8 +3206,8 @@ mod tests {
         store.bootstrap().expect("bootstrap");
         let source = dir.path().join("locked.bin");
         fs::write(&source, b"payload").expect("write source");
-        // Denying every other opener makes the copy fail after the temporary
-        // file exists.
+        // Denying every other opener makes the read fail before anything is
+        // staged.
         let _locked = fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -3217,10 +3217,16 @@ mod tests {
         let error = store.import_file(&source).expect_err("the copy must fail");
 
         assert!(matches!(error, StorageError::Io { .. }), "{error}");
-        let leftovers: Vec<_> = fs::read_dir(store.files_dir())
-            .expect("files dir")
-            .collect();
-        assert!(leftovers.is_empty(), "no partial or temporary file remains");
+        match fs::read_dir(store.files_dir()) {
+            Ok(entries) => {
+                assert_eq!(entries.count(), 0, "no partial or temporary file remains");
+            }
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "an unreadable files directory that is not missing"
+            ),
+        }
     }
 
     #[test]
@@ -4924,6 +4930,7 @@ mod tests {
     #[test]
     fn save_all_reports_one_failed_document_and_writes_the_rest() {
         let (_dir, store) = store();
+        store.load().unwrap();
         let collection = store.create_collection("Demo", 0).unwrap();
         let request = store.create_request(&collection.id, "Ping").unwrap();
         let (environment_slug, _environment) = store.create_environment("Dev").unwrap();
