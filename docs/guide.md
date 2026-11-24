@@ -159,14 +159,22 @@ Documents are UTF-8 with indentation and LF line endings, so saving an unchanged
 document produces byte-identical content and a clean checkout stays clean.
 
 A document that cannot be parsed is reported in the sidebar under its path and
-left untouched. The root `workspace.json` is handled more carefully because the
-workspace cannot open without it: a damaged root document (unparsable content or
-an unsupported `schema_version`) is renamed to
+left untouched. Every report has **Dismiss**, which clears that report for the
+session; the condition is reported again after the next launch, or by the next
+failed save when it came from one. The root `workspace.json` is handled more
+carefully because
+the workspace cannot open without it: a damaged root document (unparsable
+content or an unsupported `schema_version`) is renamed to
 `workspace.json.corrupt-<unix-millis>` before a default workspace is written in
-its place, and the sidebar names the preserved file. If the damaged file cannot
-be moved aside, it stays where it is, nothing is written over it, and the error
-names the path. A save reports every document it could not write by path; the
-change stays in memory and the next save retries it.
+its place, and the sidebar names the preserved file. Because that file is no
+longer used, its report also offers **Delete file**, which asks for confirmation
+inline and then deletes exactly that preserved document; a failed deletion keeps
+the report and names the failure, and deleting a file that is already gone
+counts as done. No other report offers deletion, so a live document is never
+deleted this way. If the damaged file cannot be moved aside, it stays where it
+is, nothing is written over it, and the error names the path. A save reports
+every document it could not write by path; the change stays in memory and the
+next save retries it.
 
 ### File assets
 

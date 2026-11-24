@@ -6050,6 +6050,30 @@ impl AppState {
         Some(collection)
     }
 
+    /// Dismisses one reported storage issue without touching any file.
+    pub fn dismiss_storage_issue(&mut self, issue: &StorageIssue, cx: &mut Context<Self>) {
+        self.workspace.dismiss_issue(issue);
+        cx.notify();
+    }
+
+    /// Asks for confirmation before deleting a preserved damaged document.
+    pub fn request_storage_issue_delete(&mut self, issue: &StorageIssue, cx: &mut Context<Self>) {
+        self.workspace.request_issue_delete(issue);
+        cx.notify();
+    }
+
+    /// Cancels the pending preserved-document deletion.
+    pub fn cancel_storage_issue_delete(&mut self, cx: &mut Context<Self>) {
+        self.workspace.cancel_issue_delete();
+        cx.notify();
+    }
+
+    /// Confirms the pending preserved-document deletion.
+    pub fn confirm_storage_issue_delete(&mut self, cx: &mut Context<Self>) {
+        self.workspace.confirm_issue_delete();
+        cx.notify();
+    }
+
     /// Creates a default request in `slug` and persists it synchronously.
     #[cfg(test)]
     pub fn create_request(

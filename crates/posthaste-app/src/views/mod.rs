@@ -2709,6 +2709,116 @@ mod tests {
         );
     }
 
+    /// Boots a shell over a workspace whose `workspace.json` is damaged, so
+    /// loading preserves it and reports one deletable issue.
+    fn preserved_workspace_shell(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<AppShell>, &mut VisualTestContext) {
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(dir.path().join("workspace.json"), b"not: [valid")
+            .expect("damage the workspace document");
+        let store = WorkspaceStore::at(dir.path());
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        (dir, view, cx)
+    }
+
+    #[gpui::test]
+    async fn a_preserved_workspace_document_is_deleted_only_after_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, view, cx) = preserved_workspace_shell(cx);
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        let (path, line) = cx.update(|_, app| {
+            let workspace = state.read(app).workspace();
+            assert_eq!(
+                workspace.issues.len(),
+                1,
+                "the damaged document is reported"
+            );
+            (
+                workspace.issues[0].path.clone(),
+                sidebar::storage_issue_lines(workspace)[0].clone(),
+            )
+        });
+        assert!(path.exists(), "the damaged file is preserved, not deleted");
+        assert!(line.contains("workspace.json.corrupt-"));
+        let row = cx
+            .debug_bounds("storage-issue-0")
+            .expect("the issue row is laid out");
+        let text = cx
+            .debug_bounds("storage-issue-0-text")
+            .expect("the issue message is laid out");
+        assert!(
+            text.size.width + gpui::px(1.) >= row.size.width,
+            "the message spans the row instead of a button-width column"
+        );
+        assert!(
+            cx.debug_bounds("storage-issue-0-dismiss").is_some()
+                && cx.debug_bounds("storage-issue-0-delete").is_some(),
+            "a preserved document offers Dismiss and Delete file"
+        );
+
+        click(cx, "storage-issue-0-delete");
+        redraw(cx);
+        assert!(
+            cx.update(|_, app| { state.read(app).workspace().pending_issue_delete().is_some() })
+        );
+        assert!(
+            cx.debug_bounds("storage-issue-0-confirm").is_some()
+                && cx.debug_bounds("storage-issue-0-cancel").is_some(),
+            "Delete file asks for confirmation first"
+        );
+
+        click(cx, "storage-issue-0-cancel");
+        redraw(cx);
+        assert!(path.exists(), "cancelling keeps the preserved file");
+        cx.update(|_, app| {
+            let workspace = state.read(app).workspace();
+            assert_eq!(workspace.issues.len(), 1);
+            assert!(workspace.pending_issue_delete().is_none());
+        });
+
+        click(cx, "storage-issue-0-delete");
+        redraw(cx);
+        click(cx, "storage-issue-0-confirm");
+        redraw(cx);
+        assert!(
+            !path.exists(),
+            "confirmation deletes the preserved document"
+        );
+        cx.update(|_, app| {
+            let workspace = state.read(app).workspace();
+            assert!(workspace.issues.is_empty(), "the handled report is gone");
+            assert!(workspace.pending_issue_delete().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn an_issue_for_a_live_document_offers_no_delete(cx: &mut TestAppContext) {
+        let (_dir, _view, cx, store, collection, _request) = seeded_shell(cx, "Demo", "Ping");
+        let requests_dir = store.requests_dir(&collection.id).expect("path");
+        let damaged = requests_dir.join("00000000-0000-0000-0000-000000000000.json");
+        std::fs::write(&damaged, b"not: [valid").expect("corrupt request");
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, store));
+        redraw(cx);
+
+        assert!(cx.debug_bounds("storage-issue-0-dismiss").is_some());
+        assert!(
+            cx.debug_bounds("storage-issue-0-delete").is_none(),
+            "a live document is not offered for deletion"
+        );
+
+        let state = shell_state(&view, cx);
+        click(cx, "storage-issue-0-dismiss");
+        redraw(cx);
+        cx.update(|_, app| assert!(state.read(app).workspace().issues.is_empty()));
+        assert!(damaged.exists(), "dismissing a report changes no file");
+    }
+
     #[gpui::test]
     async fn selected_request_loads_its_saved_values_into_the_editor(cx: &mut TestAppContext) {
         use posthaste_core::model::{HttpMethod, KeyValue, RequestBody};
@@ -10646,6 +10756,72 @@ mod tests {
                 "the {name} action must not be clipped"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn the_empty_welcome_block_is_vertically_centered(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = welcome_window(cx);
+        redraw(cx);
+
+        let panel = cx.debug_bounds("welcome-panel").expect("welcome panel");
+        let hero = cx.debug_bounds("welcome-hero").expect("welcome hero");
+        assert!(
+            (f32::from(hero.center().y) - f32::from(panel.center().y)).abs() <= 2.0,
+            "with no Recent section the hero is centered in the panel"
+        );
+        assert!(
+            cx.debug_bounds("welcome-new-request").is_some()
+                && cx.debug_bounds("welcome-new-collection").is_some(),
+            "the empty welcome keeps both actions"
+        );
+        assert!(
+            cx.debug_bounds("welcome-recent").is_none(),
+            "an empty workspace shows no Recent section"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_recent_section_keeps_the_welcome_block_at_the_top(cx: &mut TestAppContext) {
+        use bytes::Bytes;
+        use posthaste_core::history::HistoryEntry;
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        let (_dir, view, cx) = welcome_window(cx);
+        let state = shell_state(&view, cx);
+        let mut spec = RequestSpec::new("Ping");
+        spec.method = HttpMethod::Get;
+        spec.url = "http://example.test/".to_owned();
+        let entry = HistoryEntry::completed(
+            1_700_000_000_000,
+            &spec,
+            &ResponseRecord {
+                status: 200,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"{}"),
+                duration: Duration::from_millis(5),
+                truncated: false,
+                cookies: Vec::new(),
+            },
+        );
+        cx.update(|_, app| {
+            state.update(app, |state, _| state.record_test_history(entry));
+        });
+        redraw(cx);
+
+        let panel = cx.debug_bounds("welcome-panel").expect("welcome panel");
+        let hero = cx.debug_bounds("welcome-hero").expect("welcome hero");
+        assert!(
+            cx.debug_bounds("welcome-recent").is_some(),
+            "history gives the panel its Recent section"
+        );
+        assert!(
+            f32::from(hero.center().y) < f32::from(panel.center().y),
+            "the cover sheet keeps the hero above the panel's center"
+        );
+        assert!(
+            f32::from(hero.origin.y) - f32::from(panel.origin.y) <= 80.0,
+            "the cover sheet keeps its fixed top offset"
+        );
     }
 
     #[gpui::test]

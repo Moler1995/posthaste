@@ -165,6 +165,8 @@ pub struct WorkspaceState {
     /// Paths of issues that describe failed writes rather than failed loads.
     /// A later successful save clears exactly these.
     save_issue_paths: Vec<PathBuf>,
+    /// The preserved damaged document whose deletion is awaiting confirmation.
+    pending_issue_delete: Option<StorageIssue>,
 }
 
 impl WorkspaceState {
@@ -215,6 +217,7 @@ impl WorkspaceState {
             row_menu: None,
             move_picker: None,
             save_issue_paths: Vec::new(),
+            pending_issue_delete: None,
         }
     }
 
@@ -241,6 +244,7 @@ impl WorkspaceState {
             row_menu: None,
             move_picker: None,
             save_issue_paths: Vec::new(),
+            pending_issue_delete: None,
         }
     }
 
@@ -2144,6 +2148,66 @@ impl WorkspaceState {
         self.save_issue_paths.clear();
     }
 
+    /// Removes one reported issue for the rest of the session.
+    ///
+    /// Dismissing writes nothing. An issue produced by a load describes a
+    /// condition that still exists on disk, so it is reported again at the next
+    /// start; an issue produced by a failed save is still cleared by the next
+    /// save, as before. Issues are matched by value, so two reports on one path
+    /// dismiss independently.
+    pub fn dismiss_issue(&mut self, issue: &StorageIssue) {
+        if let Some(index) = self.issues.iter().position(|candidate| candidate == issue) {
+            self.issues.remove(index);
+        }
+    }
+
+    /// The preserved damaged document whose deletion is awaiting confirmation.
+    pub fn pending_issue_delete(&self) -> Option<&StorageIssue> {
+        self.pending_issue_delete.as_ref()
+    }
+
+    /// Asks for confirmation before deleting a preserved damaged document.
+    pub fn request_issue_delete(&mut self, issue: &StorageIssue) {
+        self.pending_issue_delete = Some(issue.clone());
+    }
+
+    /// Cancels the pending deletion without touching any file.
+    pub fn cancel_issue_delete(&mut self) {
+        self.pending_issue_delete = None;
+    }
+
+    /// Deletes the preserved damaged document named by the pending issue.
+    ///
+    /// The store decides whether the path is one, so a view cannot delete a live
+    /// document by mistake. A failed deletion keeps the issue visible with the
+    /// failure as its message; replacing the message instead of appending keeps
+    /// repeated attempts from stacking rows.
+    pub fn confirm_issue_delete(&mut self) {
+        let Some(issue) = self.pending_issue_delete.take() else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.delete_quarantined_document(&issue.path) {
+            Ok(()) => self.dismiss_issue(&issue),
+            Err(error) => {
+                let message = format!("could not delete preserved document: {}", error.detail());
+                match self
+                    .issues
+                    .iter_mut()
+                    .find(|candidate| **candidate == issue)
+                {
+                    Some(existing) => existing.message = message,
+                    None => self.issues.push(StorageIssue {
+                        path: issue.path,
+                        message,
+                    }),
+                }
+            }
+        }
+    }
+
     /// Refreshes the derived metadata for one collection from memory.
     fn sync_index(&self, store: &WorkspaceStore, slug: &str) {
         match self.collection(slug) {
@@ -2575,6 +2639,162 @@ mod tests {
         assert_eq!(state.save_status, SaveStatus::Saved);
         assert!(!state.needs_resync);
         assert!(!state.issues.iter().any(|issue| issue.path == request_path));
+    }
+
+    #[test]
+    fn dismissing_an_issue_removes_only_that_row() {
+        let (_dir, mut state) = workspace();
+        let first = StorageIssue {
+            path: PathBuf::from("same-path"),
+            message: "first".into(),
+        };
+        let second = StorageIssue {
+            path: PathBuf::from("same-path"),
+            message: "second".into(),
+        };
+        state.issues.push(first.clone());
+        state.issues.push(second.clone());
+
+        state.dismiss_issue(&first);
+
+        assert_eq!(state.issues, vec![second]);
+    }
+
+    #[test]
+    fn a_dismissed_save_issue_is_reported_again_by_the_next_failed_save() {
+        let (_dir, mut state) = workspace();
+        let collection = state.create_collection("Demo").expect("collection");
+        let request = state
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        let store = state.store.clone().expect("store");
+        let request_path = store.request_file(&collection.id, request.id).unwrap();
+        std::fs::remove_file(&request_path).unwrap();
+        std::fs::create_dir(&request_path).unwrap();
+
+        let result = state.resave(&store);
+        state.record_save(result);
+        let issue = state
+            .issues
+            .iter()
+            .find(|issue| issue.path == request_path)
+            .cloned()
+            .expect("the failed write is reported");
+        state.dismiss_issue(&issue);
+
+        assert!(matches!(state.save_status, SaveStatus::Failed(_)));
+        assert!(
+            state.needs_resync,
+            "dismissing does not make the save succeed"
+        );
+        assert!(!state.issues.iter().any(|issue| issue.path == request_path));
+
+        let result = state.resave(&store);
+        state.record_save(result);
+
+        assert!(
+            state.issues.iter().any(|issue| issue.path == request_path),
+            "a later failure is reported again: {:?}",
+            state.issues
+        );
+    }
+
+    #[test]
+    fn confirming_a_preserved_document_delete_removes_file_and_issue() {
+        let (_dir, mut state) = workspace();
+        let store = state.store.clone().expect("store");
+        let preserved = store.root().join("workspace.json.corrupt-1");
+        std::fs::write(&preserved, b"damaged").unwrap();
+        let issue = StorageIssue {
+            path: preserved.clone(),
+            message: "damaged workspace document preserved".into(),
+        };
+        state.issues.push(issue.clone());
+
+        state.request_issue_delete(&issue);
+        state.confirm_issue_delete();
+
+        assert!(!preserved.exists());
+        assert!(!state.issues.iter().any(|candidate| candidate == &issue));
+        assert!(state.pending_issue_delete().is_none());
+    }
+
+    #[test]
+    fn cancelling_an_issue_delete_keeps_the_file_and_row() {
+        let (_dir, mut state) = workspace();
+        let store = state.store.clone().expect("store");
+        let preserved = store.root().join("workspace.json.corrupt-2");
+        std::fs::write(&preserved, b"damaged").unwrap();
+        let issue = StorageIssue {
+            path: preserved.clone(),
+            message: "damaged workspace document preserved".into(),
+        };
+        state.issues.push(issue.clone());
+
+        state.request_issue_delete(&issue);
+        state.cancel_issue_delete();
+
+        assert!(preserved.is_file());
+        assert!(state.issues.contains(&issue));
+        assert!(state.pending_issue_delete().is_none());
+    }
+
+    #[test]
+    fn a_live_document_cannot_be_deleted_from_an_issue() {
+        let (_dir, mut state) = workspace();
+        let collection = state.create_collection("Demo").expect("collection");
+        let request = state
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        let store = state.store.clone().expect("store");
+        let live = store.request_file(&collection.id, request.id).unwrap();
+        let before = std::fs::read(&live).unwrap();
+        let issue = StorageIssue {
+            path: live.clone(),
+            message: "the document could not be written".into(),
+        };
+        state.issues.push(issue.clone());
+
+        state.request_issue_delete(&issue);
+        state.confirm_issue_delete();
+
+        assert_eq!(std::fs::read(&live).unwrap(), before);
+        assert!(state.issues.iter().any(|candidate| candidate.path == live));
+        assert!(state.pending_issue_delete().is_none());
+    }
+
+    #[test]
+    fn a_failed_issue_delete_keeps_one_row_naming_the_failure() {
+        let (_dir, mut state) = workspace();
+        let store = state.store.clone().expect("store");
+        // A directory in place of the preserved file makes removal fail on
+        // every platform.
+        let preserved = store.root().join("workspace.json.corrupt-9");
+        std::fs::create_dir(&preserved).unwrap();
+        let issue = StorageIssue {
+            path: preserved.clone(),
+            message: "damaged workspace document preserved".into(),
+        };
+        state.issues.push(issue.clone());
+
+        state.request_issue_delete(&issue);
+        state.confirm_issue_delete();
+
+        assert!(preserved.is_dir());
+        let rows: Vec<_> = state
+            .issues
+            .iter()
+            .filter(|candidate| candidate.path == preserved)
+            .collect();
+        assert_eq!(rows.len(), 1, "no stacked rows: {:?}", state.issues);
+        assert!(
+            rows[0]
+                .message
+                .contains("could not delete preserved document"),
+            "{}",
+            rows[0].message
+        );
+        assert!(state.pending_issue_delete().is_none());
     }
 
     #[test]

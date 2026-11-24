@@ -102,6 +102,7 @@ text_table! {
     SidebarDefaults => "Defaults" / "默认值",
     SidebarNoEnvironment => "No environment" / "无环境",
     SidebarDismiss => "Dismiss" / "忽略",
+    SidebarDeleteFile => "Delete file" / "删除文件",
     // Shared empty states.
     CommonNoMatches => "No matches" / "无匹配项",
     SidebarNoHistory => "No history yet" / "尚无历史记录",

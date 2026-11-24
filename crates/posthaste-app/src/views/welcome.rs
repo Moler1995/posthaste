@@ -45,29 +45,39 @@ const BRAND_MARK: f32 = 80.;
 
 /// The welcome panel shown in place of the request/response split.
 pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
+    // A workspace that failed to load has no requests to start and no
+    // collections to add, so the standing actions would only fail. The panel
+    // reports why instead, and offers the recovery paths that can succeed.
+    let fatal = app.workspace().fatal_error.clone();
+    let recent_requests = app.recent_requests();
+    let history: Vec<&HistoryEntry> = app.history().entries.iter().take(5).collect();
+    let has_recent = !recent_requests.is_empty() || !history.is_empty();
+    // Only the welcome content is centered: a diagnostic panel is read from
+    // the top, and the cover-sheet layout with Recent below the hero keeps its
+    // fixed top offset.
+    let centered = fatal.is_none() && !has_recent;
+
     let mut column = div()
         .w_full()
         .max_w(px(CONTENT))
         .flex()
         .flex_col()
         .gap(layout::SECTION_GAP)
-        .pt(px(56.))
         .pb(layout::PANE_PADDING)
         .px(layout::PANE_PADDING);
+    column = if centered {
+        column.py(layout::PANE_PADDING)
+    } else {
+        column.pt(px(56.))
+    };
 
-    // A workspace that failed to load has no requests to start and no
-    // collections to add, so the standing actions would only fail. The panel
-    // reports why instead, and offers the recovery paths that can succeed.
-    column = match app.workspace().fatal_error.clone() {
+    column = match fatal {
         Some(message) => column.child(unavailable(
             state,
             message,
             app.workspace().creatable_root.clone(),
         )),
         None => {
-            let recent_requests = app.recent_requests();
-            let history: Vec<&HistoryEntry> = app.history().entries.iter().take(5).collect();
-            let has_recent = !recent_requests.is_empty() || !history.is_empty();
             let mut column = column.child(hero(state.clone(), app.shell().draft().method));
             if has_recent {
                 column = column.child(recent_section(state, recent_requests, &history));
@@ -75,6 +85,19 @@ pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
             column
         }
     };
+
+    // The wrapper fills the panel before centering. Centering on the scroll
+    // container itself would clip the start of a hero taller than the panel,
+    // because a scroll container cannot scroll to overflow above its origin.
+    let mut content = div()
+        .w_full()
+        .min_h(gpui::relative(1.))
+        .flex()
+        .flex_col()
+        .items_center();
+    if centered {
+        content = content.justify_center();
+    }
 
     div()
         .id("welcome-panel")
@@ -88,7 +111,7 @@ pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
         .flex()
         .flex_col()
         .items_center()
-        .child(column)
+        .child(content.child(column))
         .into_any_element()
 }
 
@@ -101,6 +124,7 @@ pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
 /// the panel's only content while no request is open.
 fn hero(state: Entity<AppState>, method: HttpMethod) -> AnyElement {
     div()
+        .debug_selector(|| "welcome-hero".to_owned())
         .w_full()
         .flex()
         .flex_col()

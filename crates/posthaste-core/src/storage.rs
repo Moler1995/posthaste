@@ -85,6 +85,8 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "My Workspace";
 pub const MAX_SLUG_CHARS: usize = 48;
 
 const WORKSPACE_FILE: &str = "workspace.json";
+/// Marker inserted before the timestamp of a preserved damaged document.
+const QUARANTINE_MARKER: &str = ".corrupt-";
 const COLLECTION_FILE: &str = "collection.json";
 const COLLECTIONS_DIR: &str = "collections";
 const REQUESTS_DIR: &str = "requests";
@@ -831,6 +833,37 @@ impl WorkspaceStore {
     /// `<root>/workspace.json`.
     pub fn workspace_file(&self) -> PathBuf {
         self.root.join(WORKSPACE_FILE)
+    }
+
+    /// Whether `path` names a document preserved by a quarantine rename.
+    ///
+    /// A quarantined document is a file inside the workspace whose name is
+    /// `<stem>.corrupt-<unix-millis>`, with `-<n>` appended when the name
+    /// collided. The file does not have to exist: a preserved copy the user
+    /// already deleted is still a quarantined path, so its report can be
+    /// cleared by deleting it again.
+    pub fn is_quarantined_document(&self, path: &Path) -> bool {
+        is_beneath(&self.root, path)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_quarantine_name)
+    }
+
+    /// Deletes a preserved damaged document, refusing every other path.
+    ///
+    /// This is the only deletion entry point that the storage reports offer.
+    /// The predicate is checked here as well as by the view, so a caller
+    /// mistake cannot delete a live workspace document. A file that is already
+    /// gone counts as deleted.
+    pub fn delete_quarantined_document(&self, path: &Path) -> Result<(), StorageError> {
+        if !self.is_quarantined_document(path) {
+            return Err(StorageError::InvalidEntry {
+                path: path.to_path_buf(),
+                reason: "only a preserved damaged document can be deleted".into(),
+            });
+        }
+        remove_document(path)
     }
 
     /// `<root>/collections`.
@@ -2387,9 +2420,9 @@ fn quarantine_document(path: &Path) -> Result<PathBuf, StorageError> {
         .unwrap_or(0);
     for attempt in 1.. {
         let suffix = if attempt == 1 {
-            format!(".corrupt-{millis}")
+            format!("{QUARANTINE_MARKER}{millis}")
         } else {
-            format!(".corrupt-{millis}-{attempt}")
+            format!("{QUARANTINE_MARKER}{millis}-{attempt}")
         };
         let candidate = path.with_file_name(format!("{name}{suffix}"));
         if candidate.exists() {
@@ -2400,6 +2433,50 @@ fn quarantine_document(path: &Path) -> Result<PathBuf, StorageError> {
             .map_err(|error| io_error(path, error));
     }
     unreachable!("suffix space is unbounded")
+}
+
+/// Whether `path` is lexically inside `root`.
+///
+/// `Path::starts_with` compares components only, so a path that leaves the root
+/// through `..` and names something there would otherwise pass. Every component
+/// after the root prefix is required to be a normal name.
+fn is_beneath(root: &Path, path: &Path) -> bool {
+    if !path.starts_with(root) {
+        return false;
+    }
+    let root_components = root.components().count();
+    path.components()
+        .skip(root_components)
+        .all(|component| !matches!(component, Component::ParentDir))
+}
+
+/// Whether a file name carries the quarantine marker and timestamp.
+///
+/// The accepted forms are `<stem>.corrupt-<millis>` and
+/// `<stem>.corrupt-<millis>-<n>`, with a non-empty stem and decimal numbers.
+fn is_quarantine_name(name: &str) -> bool {
+    let Some((stem, suffix)) = name.rsplit_once(QUARANTINE_MARKER) else {
+        return false;
+    };
+    if stem.is_empty() {
+        return false;
+    }
+    let mut parts = suffix.split('-');
+    let Some(millis) = parts.next() else {
+        return false;
+    };
+    if !is_decimal(millis) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(attempt) if is_decimal(attempt) && parts.next().is_none() => true,
+        _ => false,
+    }
+}
+
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Removes atomic-write residue from a directory the app owns.
@@ -4915,6 +4992,11 @@ mod tests {
         let (environment_slug, _environment) = store.create_environment("Dev").unwrap();
         let preserved = store.root().join("workspace.json.corrupt-123");
         fs::write(&preserved, "not: [valid").unwrap();
+        let nested = store
+            .request_file(&collection.id, request.id)
+            .unwrap()
+            .with_file_name("preserved.json.corrupt-42");
+        fs::write(&nested, "not: [valid").unwrap();
 
         let loaded = store.load().unwrap();
 
@@ -4925,6 +5007,116 @@ mod tests {
         assert_eq!(loaded.environments.len(), 1);
         assert_eq!(loaded.environments[0].slug, environment_slug);
         assert_eq!(fs::read(&preserved).unwrap(), b"not: [valid");
+        assert_eq!(fs::read(&nested).unwrap(), b"not: [valid");
+        assert!(store.is_quarantined_document(&nested));
+    }
+
+    #[test]
+    fn only_quarantined_documents_are_deletable() {
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let preserved = store.root().join("workspace.json.corrupt-1700000000000");
+        let collided = store.root().join("workspace.json.corrupt-1700000000000-2");
+        let nested_dir = store.collections_dir().join("demo").join(REQUESTS_DIR);
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("request.json.corrupt-9");
+        for path in [&preserved, &collided, &nested] {
+            fs::write(path, b"damaged").unwrap();
+        }
+
+        assert!(store.is_quarantined_document(&preserved));
+        assert!(store.is_quarantined_document(&collided));
+        assert!(store.is_quarantined_document(&nested));
+
+        assert!(!store.is_quarantined_document(&store.workspace_file()));
+        assert!(!store.is_quarantined_document(&store.root().join("workspace.json.corrupt")));
+        assert!(!store.is_quarantined_document(&store.root().join("workspace.json.corrupt-abc")));
+        assert!(!store.is_quarantined_document(&store.root().join("workspace.json.corrupt-5-x")));
+        assert!(!store.is_quarantined_document(&store.root().join(".corrupt-5")));
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("workspace.json.corrupt-5");
+        fs::write(&outside, b"damaged").unwrap();
+        assert!(!store.is_quarantined_document(&outside));
+
+        let traversal = store
+            .root()
+            .join("..")
+            .join(store.root().file_name().unwrap())
+            .join("workspace.json.corrupt-5");
+        assert!(!store.is_quarantined_document(&traversal));
+    }
+
+    #[test]
+    fn deleting_a_quarantined_document_removes_only_that_file() {
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let preserved = store.root().join("workspace.json.corrupt-77");
+        fs::write(&preserved, b"damaged").unwrap();
+        let workspace_before = fs::read(store.workspace_file()).unwrap();
+
+        store.delete_quarantined_document(&preserved).unwrap();
+
+        assert!(!preserved.exists());
+        assert_eq!(fs::read(store.workspace_file()).unwrap(), workspace_before);
+
+        // A preserved file that is already gone counts as deleted.
+        store.delete_quarantined_document(&preserved).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_live_document_is_refused() {
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let collection = store.create_collection("Demo", 0).unwrap();
+        let request = store.create_request(&collection.id, "Ping").unwrap();
+        let live = store.request_file(&collection.id, request.id).unwrap();
+        let before = fs::read(&live).unwrap();
+
+        let error = store.delete_quarantined_document(&live).unwrap_err();
+
+        assert!(matches!(error, StorageError::InvalidEntry { .. }));
+        assert_eq!(fs::read(&live).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_quarantined_document_is_not_deleted() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let preserved = store.root().join("workspace.json.corrupt-5");
+        fs::write(&preserved, b"damaged").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&preserved)
+            .unwrap();
+
+        let error = store.delete_quarantined_document(&preserved).unwrap_err();
+        drop(locked);
+
+        assert!(matches!(error, StorageError::Io { .. }), "{error:?}");
+        assert_eq!(fs::read(&preserved).unwrap(), b"damaged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_quarantined_document_in_an_unwritable_directory_is_not_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, store) = store();
+        store.load().unwrap();
+        let preserved = store.root().join("workspace.json.corrupt-5");
+        fs::write(&preserved, b"damaged").unwrap();
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = store.delete_quarantined_document(&preserved).unwrap_err();
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(error, StorageError::Io { .. }), "{error:?}");
+        assert_eq!(fs::read(&preserved).unwrap(), b"damaged");
     }
 
     #[test]

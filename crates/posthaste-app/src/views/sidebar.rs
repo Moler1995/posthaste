@@ -258,29 +258,157 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
             .bg(theme::status::danger_subtle())
             .border_1()
             .border_color(theme::status::danger())
-            .text_role(type_role::BODY)
-            .text_color(theme::status::danger())
-            .child(message)
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .text_role(type_role::BODY)
+                    .text_color(theme::status::danger())
+                    .child(message),
+            )
             .into_any_element()
     });
 
+    // A storage report is actionable: Dismiss clears it for the session, and a
+    // preserved damaged document can be deleted after an inline confirmation.
+    // The store decides whether the path is deletable; the view only decides
+    // whether to offer the control.
     let issues = (!workspace.issues.is_empty()).then(|| {
-        let lines: Vec<AnyElement> = storage_issue_lines(workspace)
-            .into_iter()
-            .map(|line| {
-                div()
-                    .text_role(type_role::META)
+        // One line per issue, built once: the row and the text assertions in
+        // tests both use the same string.
+        let lines = storage_issue_lines(workspace);
+        let rows: Vec<AnyElement> = workspace
+            .issues
+            .iter()
+            .zip(lines)
+            .enumerate()
+            .map(|(index, (issue, line))| {
+                let pending_delete = workspace
+                    .pending_issue_delete()
+                    .is_some_and(|pending| pending == issue);
+                let deletable = workspace
+                    .store
+                    .as_ref()
+                    .is_some_and(|store| store.is_quarantined_document(&issue.path));
+
+                let dismiss_selector = format!("storage-issue-{index}-dismiss");
+                let dismiss_state = state.clone();
+                let dismissed = issue.clone();
+                let dismiss = ghost_button(
+                    SharedString::from(dismiss_selector.clone()),
+                    i18n::t(Key::SidebarDismiss),
+                )
+                .debug_selector(move || dismiss_selector.clone())
+                .h(px(20.))
+                .px(space::S6)
+                .text_role(type_role::MICRO)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    dismiss_state.update(cx, |state, cx| {
+                        state.dismiss_storage_issue(&dismissed, cx);
+                    });
+                });
+
+                let mut actions = div()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .gap_1()
+                    .child(dismiss);
+
+                if pending_delete {
+                    let confirm_selector = format!("storage-issue-{index}-confirm");
+                    let confirm_state = state.clone();
+                    let confirm = ghost_button(
+                        SharedString::from(confirm_selector.clone()),
+                        i18n::t(Key::CommonDelete),
+                    )
+                    .debug_selector(move || confirm_selector.clone())
+                    .h(px(20.))
+                    .px(space::S6)
+                    .text_role(type_role::MICRO)
                     .text_color(theme::status::danger())
-                    .child(line)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        confirm_state.update(cx, |state, cx| {
+                            state.confirm_storage_issue_delete(cx);
+                        });
+                    });
+
+                    let cancel_selector = format!("storage-issue-{index}-cancel");
+                    let cancel_state = state.clone();
+                    let cancel = ghost_button(
+                        SharedString::from(cancel_selector.clone()),
+                        i18n::t(Key::CommonCancel),
+                    )
+                    .debug_selector(move || cancel_selector.clone())
+                    .h(px(20.))
+                    .px(space::S6)
+                    .text_role(type_role::MICRO)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        cancel_state.update(cx, |state, cx| {
+                            state.cancel_storage_issue_delete(cx);
+                        });
+                    });
+
+                    actions = actions.child(confirm).child(cancel);
+                } else if deletable {
+                    let delete_selector = format!("storage-issue-{index}-delete");
+                    let delete_state = state.clone();
+                    let targeted = issue.clone();
+                    let delete = ghost_button(
+                        SharedString::from(delete_selector.clone()),
+                        i18n::t(Key::SidebarDeleteFile),
+                    )
+                    .debug_selector(move || delete_selector.clone())
+                    .h(px(20.))
+                    .px(space::S6)
+                    .text_role(type_role::MICRO)
+                    .text_color(theme::status::danger())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        delete_state.update(cx, |state, cx| {
+                            state.request_storage_issue_delete(&targeted, cx);
+                        });
+                    });
+                    actions = actions.child(delete);
+                }
+
+                // The message gets the full width and the actions sit under
+                // it. A path is long and unbreakable, so putting the buttons
+                // on the same line would squeeze the text into a column a few
+                // characters wide.
+                let row_selector = format!("storage-issue-{index}");
+                let text_selector = format!("storage-issue-{index}-text");
+                div()
+                    .debug_selector(move || row_selector.clone())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(move || text_selector.clone())
+                            .min_w(px(0.))
+                            .text_role(type_role::META)
+                            .text_color(theme::status::danger())
+                            .child(line),
+                    )
+                    .child(actions.justify_end())
                     .into_any_element()
             })
             .collect();
+        // Reports share the sidebar with the collections and history bands, so
+        // a long list scrolls inside a fixed budget instead of pushing them
+        // out.
         div()
+            .id("storage-issues-scroll")
             .debug_selector(|| "storage-issues".to_owned())
             .flex()
             .flex_col()
             .gap_1()
-            .children(lines)
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .children(rows)
             .into_any_element()
     });
 
@@ -1097,14 +1225,16 @@ fn history_list(state: Entity<AppState>, app: &AppState, matching: &[&HistoryEnt
         );
     }
     for issue in &history.issues {
+        let line = i18n::msg(
+            MessageKey::StorageIssueLine,
+            &[&issue.path.display(), &issue.message],
+        );
         list = list.child(
             div()
+                .min_w(px(0.))
                 .text_role(type_role::MICRO)
                 .text_color(theme::status::danger())
-                .child(i18n::msg(
-                    MessageKey::StorageIssueLine,
-                    &[&issue.path.display(), &issue.message],
-                )),
+                .child(line),
         );
     }
     list.into_any_element()

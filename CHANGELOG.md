@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix).
 - Plain-JSON workspace storage with atomic writes, per-workspace collections,
   requests, environments, and workspace default variables.
+- Actionable storage reports: dismiss a report for the session and delete a
+  preserved damaged document after an inline confirmation.
 - `{{variable}}` substitution from workspace defaults and the active
   environment, with completion, missing-variable marks, and in-place
   assignment.
@@ -59,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On a fresh workspace with no Recent section, the welcome block is vertically
+  centered in the panel instead of sitting near its top; when Recent is present
+  the cover-sheet layout is unchanged.
 - A damaged root `workspace.json` is preserved as
   `workspace.json.corrupt-<timestamp>` instead of being overwritten, and a
   default workspace opens in its place; if the file cannot be moved aside, it is
