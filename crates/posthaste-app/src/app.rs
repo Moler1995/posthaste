@@ -12268,6 +12268,9 @@ mod tests {
     async fn send_rejects_missing_variables_without_reaching_the_server(
         cx: &mut gpui::TestAppContext,
     ) {
+        // The error text is English prose, so keep a language test from
+        // switching the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         use crate::test_support::LocalServer;
         use gpui::AppContext as _;
         use std::time::Instant;
@@ -18430,6 +18433,9 @@ mod tests {
 
     #[gpui::test]
     async fn a_missing_variable_stays_written_and_sets_the_notice(cx: &mut gpui::TestAppContext) {
+        // The notice is English prose, so keep a language test from switching
+        // the interface while this one asserts it.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let dir = tempfile::tempdir().expect("temp workspace");
         let store = WorkspaceStore::at(dir.path());
         store.load().expect("bootstrap workspace");
