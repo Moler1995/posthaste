@@ -86,7 +86,7 @@ pub(crate) struct HoverState {
 
 /// A field's complete placeholders, split by whether the merged set defines
 /// the name.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PlaceholderSpans {
     /// Defined names, including empty-valued ones. They wear the field's
     /// accent — the request method's hue — so a filled-in placeholder reads as

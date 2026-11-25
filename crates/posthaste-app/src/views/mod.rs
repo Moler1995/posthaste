@@ -2,6 +2,8 @@
 
 mod code_lines;
 mod cookie_selection;
+#[cfg(test)]
+mod editor_suite;
 pub(crate) mod environment_panel;
 mod event_stream;
 mod json_syntax;
@@ -19,8 +21,10 @@ mod sidebar;
 pub(crate) mod status_bar;
 pub(crate) mod tab_strip;
 pub mod text_area;
+mod text_engine;
 mod text_history;
 pub mod text_input;
+mod text_layout;
 mod text_selection;
 #[cfg(target_os = "windows")]
 mod title_bar;

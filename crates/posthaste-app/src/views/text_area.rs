@@ -6,28 +6,29 @@
 
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, IsZero as _, KeyBinding, LayoutId,
+    GlobalElementId, InspectorElementId, IntoElement, IsZero as _, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, fill, point, prelude::*, px, relative, size,
+    Rgba, ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, UTF16Selection, Window,
+    actions, fill, point, prelude::*, px, relative, size,
 };
 use posthaste_core::variables::VariableCatalog;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::i18n::{self, Key};
 use crate::metrics::{TypeStyle as _, mono_font, resolve_type_role, space, type_role};
 use crate::theme;
-use crate::views::json_syntax::{self, TokenKind};
-use crate::views::text_history::{self, EditEntry, EditKind, Selection, TextHistory};
+use crate::views::text_engine::{TextEngine, TextMode};
+use crate::views::text_history::{EditKind, Selection};
 use crate::views::text_input::TextInput;
 use crate::views::text_input::variable_assist::{
-    self, AcceptCompletion, DismissCompletion, MissingSpan, PlaceholderSpans, VariableAssist,
+    self, AcceptCompletion, DismissCompletion, MissingSpan, PlaceholderSpans,
 };
+use crate::views::text_layout::{LayoutSpec, TextLayout};
 use crate::views::text_selection::{Drag, Granularity};
 use crate::views::ui::text_field_shell;
 
@@ -111,20 +112,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// How long after an IME commit a following Enter still belongs to the
-/// composition that committed it.
-const IME_ENTER_GRACE: Duration = Duration::from_millis(100);
-
-/// The text and selection at the start of an in-progress IME composition.
-struct Composition {
-    content: String,
-    selection: Selection,
-}
-
-/// Longest line rendered as JSON tokens. A longer line falls back to one plain
-/// run so a minified paste cannot produce thousands of runs.
-const HIGHLIGHT_LINE_LIMIT: usize = 8 * 1024;
-
 /// How the editor colors its text. Highlighting never changes the text itself,
 /// so caret and selection indices stay identical to the plain rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -137,48 +124,28 @@ pub enum Syntax {
 /// Multiline editable text.
 pub struct TextArea {
     focus_handle: FocusHandle,
-    content: SharedString,
     placeholder: SharedString,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-    last_layouts: Vec<ShapedLine>,
+    /// Content, selection, composition, history, and variable assistance.
+    pub(crate) engine: TextEngine,
+    /// Shaped lines, the gutter, and the viewport scroll, cached across frames.
+    layout: TextLayout,
     last_bounds: Option<Bounds<Pixels>>,
-    last_line_height: Pixels,
     /// The pointer selection in progress, if the button is down.
     drag: Option<Drag>,
     /// Rest color of the focused outline and halo.
     accent: Rgba,
     /// Whether lines are shaped as plain text or JSON tokens.
     syntax: Syntax,
-    /// Distance the viewport is scrolled into the content, in pixels. Positive
-    /// values hide content above and to the left. The last painted frame's value
-    /// is the one mouse and IME mapping read.
-    scroll: Point<Pixels>,
     /// Set by a caret or text change, cleared once the prepaint has brought the
     /// caret back into view. A manual wheel scroll leaves it clear, so the next
     /// repaint does not undo the reader's scroll.
     follow: bool,
     /// Whether a line-number gutter sits at the left of the text.
     line_numbers: bool,
-    /// Gutter width of the last painted frame. Mouse and IME mapping subtract
-    /// it so the caret stays on the glyph under the pointer.
-    last_gutter: Pixels,
     on_change: Option<ChangeHandler>,
-    history: TextHistory,
-    composition: Option<Composition>,
-    /// When the last IME composition committed. Windows may deliver the Enter
-    /// that committed it as a key press once the marked text is already gone.
-    ime_committed_at: Option<Instant>,
-    /// Set by paste and cut so the recorded step does not merge with typing.
-    edit_kind: EditKind,
-    /// The pre-edit selection when backspace or delete synthesized a selection
-    /// from a collapsed caret.
-    pending_before: Option<Selection>,
     /// Attached on the first render so losing focus ends the current group.
     blur_subscription: Option<Subscription>,
     on_assign_variable: Option<AssignVariableHandler>,
-    assist: VariableAssist,
     pending_assignment_click: Option<PendingAssignmentClick>,
     /// Whether the request editor mounts this editor's assist card at the app
     /// root instead of the body painting it locally.
@@ -199,34 +166,20 @@ impl TextArea {
         placeholder: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = content.into();
-        let end = content.len();
         Self {
             focus_handle: cx.focus_handle(),
-            selected_range: end..end,
-            selection_reversed: false,
-            content,
             placeholder: placeholder.into(),
-            marked_range: None,
-            last_layouts: Vec::new(),
+            engine: TextEngine::new(content, TextMode::Multiline),
+            layout: TextLayout::new(),
             last_bounds: None,
-            last_line_height: px(0.),
             drag: None,
             accent: theme::accent::base(),
             syntax: Syntax::Plain,
-            scroll: Point::default(),
             follow: false,
             line_numbers: false,
-            last_gutter: px(0.),
             on_change: None,
-            history: TextHistory::default(),
-            composition: None,
-            ime_committed_at: None,
-            edit_kind: EditKind::Insert,
-            pending_before: None,
             blur_subscription: None,
             on_assign_variable: None,
-            assist: VariableAssist::default(),
             pending_assignment_click: None,
             root_hosted: false,
             on_overlay_change: None,
@@ -311,51 +264,47 @@ impl TextArea {
     pub fn set_variable_catalog(&mut self, catalog: VariableCatalog, cx: &mut Context<Self>) {
         // An open list re-filters in place; a catalog change alone does not
         // open one at the current caret.
-        if self.assist.set_catalog(catalog) {
+        if self.engine.assist.set_catalog(catalog) {
             cx.notify();
         }
     }
 
     /// Whether this editor currently has a completion list or assignment card.
     pub(crate) fn has_variable_overlay(&self) -> bool {
-        self.assist.has_overlay()
+        self.engine.assist.has_overlay()
     }
 
     /// Whether an assignment card, rather than a completion list, is open.
     pub(crate) fn has_variable_assignment(&self) -> bool {
-        self.assist.assignment().is_some()
+        self.engine.assist.assignment().is_some()
     }
 
     /// Whether the pointer is over a complete placeholder, so this editor's
     /// value card should be mounted even when it is not focused.
     pub(crate) fn has_variable_hover(&self) -> bool {
-        self.assist.has_hover()
+        self.engine.assist.has_hover()
     }
 
     /// The name of the placeholder under the pointer, if any.
     #[cfg(test)]
     pub fn hovered_variable(&self) -> Option<&str> {
-        self.assist.hover().map(|hover| hover.name.as_str())
+        self.engine.assist.hover().map(|hover| hover.name.as_str())
     }
 
     /// Every complete placeholder whose name the merged catalog lacks.
     #[cfg(test)]
     pub fn missing_spans(&self) -> Vec<MissingSpan> {
-        self.assist.missing_spans(&self.content)
+        self.engine.assist.missing_spans(&self.engine.content)
     }
 
     #[cfg(test)]
     pub fn completion(&self) -> Option<&variable_assist::CompletionState> {
-        self.assist.completion()
+        self.engine.assist.completion()
     }
 
     /// Recomputes the completion trigger from the current text and caret.
     fn sync_completion(&mut self, cx: &mut Context<Self>) {
-        if self.assist.sync_completion(
-            &self.content,
-            self.cursor_offset(),
-            self.selected_range.is_empty(),
-        ) {
+        if self.engine.sync_assist() {
             cx.notify();
         }
     }
@@ -363,29 +312,23 @@ impl TextArea {
     /// The complete placeholder covering `offset`, resolved or unresolved, with
     /// the name the hover card reads from the catalog.
     fn placeholder_at(&self, offset: usize) -> Option<(String, Range<usize>)> {
-        let spans = self.assist.placeholder_spans(&self.content);
-        if let Some(range) = spans.resolved.iter().find(|range| range.contains(&offset)) {
-            let name = self
-                .content
-                .get(range.start + 2..range.end.saturating_sub(2))?
-                .trim()
-                .to_owned();
-            return Some((name, range.clone()));
-        }
-        spans
-            .missing
-            .into_iter()
-            .find(|span| span.range.contains(&offset))
-            .map(|span| (span.name, span.range))
+        self.engine.placeholder_at(offset)
     }
 
     /// Window-space rectangle of a byte range on its first shaped line.
-    fn range_anchor(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
+    fn range_anchor(
+        &mut self,
+        range: &Range<usize>,
+        window: &mut Window,
+    ) -> Option<Bounds<Pixels>> {
         let bounds = self.last_bounds?;
-        let (line, _) = self.line_col(range.start);
-        let layout = self.last_layouts.get(line)?;
-        let line_start = self.line_start(line);
-        let line_end = self.line_end(line);
+        let (line, _) = self.layout.line_col(range.start);
+        let shaped = match self.layout.line(line) {
+            Some(shaped) => shaped.clone(),
+            None => self.layout.ensure_line(window, line)?,
+        };
+        let line_start = self.layout.line_start(line);
+        let line_end = self.layout.line_end(line);
         let start = range.start.min(line_end).saturating_sub(line_start);
         let end = range
             .end
@@ -393,15 +336,16 @@ impl TextArea {
             .max(range.start)
             .saturating_sub(line_start);
         let line_height = self.line_height();
+        let gutter = self.layout.gutter();
+        let scroll = self.layout.scroll();
         Some(Bounds::from_corners(
             point(
-                bounds.left() + self.last_gutter + layout.x_for_index(start) - self.scroll.x,
-                bounds.top() + line_height * line as f32 - self.scroll.y,
+                bounds.left() + gutter + shaped.x_for_index(start) - scroll.x,
+                bounds.top() + line_height * line as f32 - scroll.y,
             ),
             point(
-                bounds.left() + self.last_gutter + layout.x_for_index(end.max(start))
-                    - self.scroll.x,
-                bounds.top() + line_height * (line + 1) as f32 - self.scroll.y,
+                bounds.left() + gutter + shaped.x_for_index(end.max(start)) - scroll.x,
+                bounds.top() + line_height * (line + 1) as f32 - scroll.y,
             ),
         ))
     }
@@ -409,7 +353,7 @@ impl TextArea {
     /// Opens the quick-assignment card for a marked body placeholder and
     /// focuses its value field. The body text and caret are left untouched.
     fn open_assignment(&mut self, span: MissingSpan, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(anchor) = self.range_anchor(&span.range) else {
+        let Some(anchor) = self.range_anchor(&span.range, window) else {
             return;
         };
         let owner = cx.entity().downgrade();
@@ -418,6 +362,7 @@ impl TextArea {
         // Prefill the scope's current value; a defined variable opens as an
         // edit, and an undefined one opens empty for its first assignment.
         let current = self
+            .engine
             .assist
             .catalog()
             .value(&span.name)
@@ -442,8 +387,9 @@ impl TextArea {
         });
         let focus = value.read(cx).focus_handle().clone();
         window.focus(&focus);
-        let scope = self.assist.catalog().target_scope();
-        self.assist
+        let scope = self.engine.assist.catalog().target_scope();
+        self.engine
+            .assist
             .open_assignment(span.name, scope, span.range, anchor, value);
         cx.notify();
     }
@@ -456,7 +402,7 @@ impl TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(assignment) = self.assist.take_assignment() else {
+        let Some(assignment) = self.engine.assist.take_assignment() else {
             return;
         };
         let value = text.unwrap_or_else(|| assignment.value.read(cx).content().to_owned());
@@ -469,7 +415,7 @@ impl TextArea {
     }
 
     fn cancel_assignment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.take_assignment().is_some() {
+        if self.engine.assist.take_assignment().is_some() {
             window.focus(&self.focus_handle);
             cx.notify();
         }
@@ -482,7 +428,7 @@ impl TextArea {
         entity: Entity<TextArea>,
         window: &Window,
     ) -> Option<AnyElement> {
-        if let Some(assignment) = self.assist.assignment() {
+        if let Some(assignment) = self.engine.assist.assignment() {
             let anchor = assignment.anchor?;
             let save_entity = entity;
             let cancel_entity = save_entity.clone();
@@ -500,7 +446,7 @@ impl TextArea {
                 cancel,
             ));
         }
-        if let Some(completion) = self.assist.completion() {
+        if let Some(completion) = self.engine.assist.completion() {
             let anchor = completion.anchor?;
             return Some(variable_assist::completion_overlay(
                 completion,
@@ -513,7 +459,7 @@ impl TextArea {
         }
         // The value card is the last resort: an open list or assignment card
         // owns the space beside the field.
-        let hover = self.assist.hover()?;
+        let hover = self.engine.assist.hover()?;
         let anchor = hover.anchor?;
         let pin_entity = entity.clone();
         let on_hover = Rc::new(move |pinned: bool, _window: &mut Window, cx: &mut App| {
@@ -525,7 +471,7 @@ impl TextArea {
                 // Ctrl+C after a drag belongs to this field's copy, so the
                 // field takes focus even when the card came from a hover.
                 window.focus(&area.focus_handle);
-                if area.assist.start_hover_selection(offset) {
+                if area.engine.assist.start_hover_selection(offset) {
                     cx.notify();
                 }
             });
@@ -533,7 +479,7 @@ impl TextArea {
         let extend_entity = entity.clone();
         let on_select_extend = Rc::new(move |offset: usize, _window: &mut Window, cx: &mut App| {
             extend_entity.update(cx, |area, cx| {
-                if area.assist.extend_hover_selection(offset) {
+                if area.engine.assist.extend_hover_selection(offset) {
                     cx.notify();
                 }
             });
@@ -541,7 +487,7 @@ impl TextArea {
         let end_entity = entity.clone();
         let on_select_end = Rc::new(move |_window: &mut Window, cx: &mut App| {
             end_entity.update(cx, |area, cx| {
-                if area.assist.end_hover_selection() {
+                if area.engine.assist.end_hover_selection() {
                     cx.notify();
                 }
             });
@@ -550,7 +496,7 @@ impl TextArea {
         let on_double_click = Rc::new(move |window: &mut Window, cx: &mut App| {
             double_entity.update(cx, |area, cx| {
                 window.focus(&area.focus_handle);
-                if area.assist.select_hover_all() {
+                if area.engine.assist.select_hover_all() {
                     cx.notify();
                 }
             });
@@ -558,7 +504,7 @@ impl TextArea {
         Some(variable_assist::hover_card(
             hover,
             anchor,
-            self.assist.catalog(),
+            self.engine.assist.catalog(),
             self.accent,
             variable_assist::HoverCardHandlers {
                 on_hover,
@@ -579,14 +525,10 @@ impl TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = content.into();
-        let end = content.len();
-        self.content = content;
-        self.selected_range = end..end;
-        self.selection_reversed = false;
+        self.engine.load_caret_end(content);
         // A loaded body starts at its first line, not at the caret's row at the
         // end, which is where an edit would have scrolled.
-        self.scroll = Point::default();
+        self.layout.reset_scroll();
         self.follow = false;
         self.reset_history();
         self.sync_completion(cx);
@@ -597,12 +539,8 @@ impl TextArea {
     /// Replaces the content without firing [`Self::on_change`]. Used when
     /// loading a value into the editor.
     pub(crate) fn set_content_quiet(&mut self, content: impl Into<SharedString>) {
-        let content = content.into();
-        let end = content.len();
-        self.content = content;
-        self.selected_range = end..end;
-        self.selection_reversed = false;
-        self.scroll = Point::default();
+        self.engine.load_caret_end(content);
+        self.layout.reset_scroll();
         self.follow = false;
         self.reset_history();
     }
@@ -633,61 +571,30 @@ impl TextArea {
         content: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let content = content.into();
-        let before = self.selection();
-        let after = Selection::new(content.len()..content.len(), false);
         // Paste semantics make the replacement exactly one step and keep it
         // from merging into adjacent typing.
-        if let Some(entry) = text_history::diff_edit(
-            &self.content,
-            &content,
-            before,
-            after.clone(),
-            EditKind::Paste,
-        ) {
-            self.history.record(entry, Instant::now());
-        }
-        self.assist.clear_hover();
-        self.content = content;
-        let end = self.content.len();
-        self.selected_range = end..end;
-        self.selection_reversed = false;
-        self.scroll = Point::default();
+        self.engine.replace_content(content);
+        self.layout.reset_scroll();
         self.follow = false;
-        self.marked_range = None;
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
         self.sync_completion(cx);
         cx.notify();
     }
 
     /// A loaded value starts a new history: undo must not reach across requests.
     fn reset_history(&mut self) {
-        self.marked_range = None;
-        self.history.clear();
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
-        self.assist.dismiss_completion();
-        self.assist.take_assignment();
-        self.assist.clear_hover();
+        self.engine.reset_history();
         self.pending_assignment_click = None;
-    }
-
-    fn selection(&self) -> Selection {
-        Selection::new(self.selected_range.clone(), self.selection_reversed)
     }
 
     #[cfg(test)]
     pub fn content(&self) -> &str {
-        &self.content
+        &self.engine.content
     }
 
     /// The viewport's offset, written back after each paint.
     #[cfg(test)]
     pub fn scroll_offset(&self) -> Point<Pixels> {
-        self.scroll
+        self.layout.scroll()
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -696,109 +603,102 @@ impl TextArea {
 
     fn notify_change(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handler) = self.on_change.as_ref() {
-            handler(self.content.to_string(), window, cx);
+            handler(self.engine.content.to_string(), window, cx);
         }
+    }
+
+    /// Brings the caret back into view on the next prepaint.
+    fn after_caret_move(&mut self, cx: &mut Context<Self>) {
+        self.follow = true;
+        self.sync_completion(cx);
+        cx.notify();
+    }
+
+    /// Reports an engine edit and lets the next prepaint follow the caret.
+    fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow = true;
+        self.sync_completion(cx);
+        self.notify_change(window, cx);
+        cx.notify();
     }
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.start, cx);
-        }
+        self.engine.move_left();
+        self.after_caret_move(cx);
     }
 
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), cx);
-        } else {
-            self.move_to(self.selected_range.end, cx);
-        }
+        self.engine.move_right();
+        self.after_caret_move(cx);
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.engine.select_left();
+        self.after_caret_move(cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_to(self.next_boundary(self.selected_range.end), cx);
+        self.engine.select_right();
+        self.after_caret_move(cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.move_to(0, cx);
-        self.select_to(self.content.len(), cx);
+        self.engine.select_all();
+        self.after_caret_move(cx);
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.completion_open() {
-            if self.assist.move_completion(-1) {
+        if self.engine.assist.completion_open() {
+            if self.engine.assist.move_completion(-1) {
                 cx.notify();
             }
             return;
         }
-        self.history.end_group();
-        self.move_vertical(-1, cx);
+        self.engine.move_vertical(-1);
+        self.after_caret_move(cx);
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.completion_open() {
-            if self.assist.move_completion(1) {
+        if self.engine.assist.completion_open() {
+            if self.engine.assist.move_completion(1) {
                 cx.notify();
             }
             return;
         }
-        self.history.end_group();
-        self.move_vertical(1, cx);
+        self.engine.move_vertical(1);
+        self.after_caret_move(cx);
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_vertical(-1, cx);
+        self.engine.select_vertical(-1);
+        self.after_caret_move(cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_vertical(1, cx);
+        self.engine.select_vertical(1);
+        self.after_caret_move(cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        let (line, _) = self.line_col(self.cursor_offset());
-        self.move_to(self.line_start(line), cx);
+        self.engine.home();
+        self.after_caret_move(cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        let (line, _) = self.line_col(self.cursor_offset());
-        self.move_to(self.line_end(line), cx);
+        self.engine.end();
+        self.after_caret_move(cx);
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        // An IME composition owns Enter: it picks or commits the candidate,
-        // and must not also break the candidate with a line feed.
-        if self.marked_range.is_some() || self.composition.is_some() {
-            return;
-        }
-        // The commit can land before the key press; the Enter that ended the
-        // composition must not also insert a line.
-        if self
-            .ime_committed_at
-            .take()
-            .is_some_and(|at| at.elapsed() < IME_ENTER_GRACE)
-        {
-            return;
-        }
         // While the list is open, Enter accepts instead of inserting a line.
-        if self.assist.completion_open() {
+        // The engine guards the IME composition and its trailing Enter.
+        if self.engine.assist.completion_open() {
             self.accept_selected(window, cx);
             return;
         }
-        self.replace_text_in_range(None, "\n", window, cx);
+        if self.engine.newline(Instant::now()).changed {
+            self.after_edit(window, cx);
+        }
     }
 
     fn accept_completion(
@@ -816,196 +716,101 @@ impl TextArea {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.assist.dismiss_completion() {
+        if self.engine.assist.dismiss_completion() {
             cx.notify();
         }
     }
 
     /// Accepts the highlighted suggestion as one undoable edit.
     fn accept_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(accepted) = self.assist.accept_span() else {
-            return;
-        };
-        let before = self.selection();
-        let range = accepted.range.clone();
-        let removed = self.content[range.clone()].to_owned();
-        self.history.end_group();
-        self.assist.clear_hover();
-        self.content = (self.content[0..range.start].to_owned()
-            + &accepted.replacement
-            + &self.content[range.end..])
-            .into();
-        let caret = accepted.caret.min(self.content.len());
-        self.selected_range = caret..caret;
-        self.selection_reversed = false;
-        self.follow = true;
-        self.marked_range = None;
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
-        self.history.record(
-            EditEntry {
-                range,
-                inserted: accepted.replacement,
-                removed,
-                before,
-                after: self.selection(),
-                kind: EditKind::Insert,
-            },
-            Instant::now(),
-        );
-        self.assist.dismiss_completion();
-        self.sync_completion(cx);
-        self.notify_change(window, cx);
-        cx.notify();
+        if self.engine.accept_completion().changed {
+            self.after_edit(window, cx);
+        }
     }
 
     fn accept_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(completion) = self.assist.completion() {
+        if let Some(completion) = self.engine.assist.completion() {
             if index >= completion.candidates.len() {
                 return;
             }
             let delta = index as isize - completion.selected as isize;
             if delta != 0 {
-                self.assist.move_completion(delta);
+                self.engine.assist.move_completion(delta);
             }
         }
         self.accept_selected(window, cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.selection();
-        if self.selected_range.is_empty() {
-            self.pending_before = Some(before);
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx);
-        } else {
-            self.pending_before = None;
-        }
-        self.edit_kind = EditKind::Delete;
-        self.replace_text_in_range(None, "", window, cx);
+        self.engine.backspace(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.selection();
-        if self.selected_range.is_empty() {
-            self.pending_before = Some(before);
-            self.select_to(self.next_boundary(self.selected_range.end), cx);
-        } else {
-            self.pending_before = None;
-        }
-        self.edit_kind = EditKind::Delete;
-        self.replace_text_in_range(None, "", window, cx);
+        self.engine.delete_forward(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit_kind = EditKind::Paste;
-            self.replace_text_in_range(None, &normalize_newlines(&text), window, cx);
+            self.engine
+                .replace_text_in_range(None, &text, EditKind::Paste, Instant::now());
+            self.after_edit(window, cx);
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         // A selection dragged out of the hover card is what the pointer last
         // picked, so it wins over the editor's own selection.
-        if let Some(text) = self.assist.hover_selection_text() {
+        if let Some(text) = self.engine.assist.hover_selection_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        if let Some(text) = self.engine.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
-            self.edit_kind = EditKind::Cut;
-            self.replace_text_in_range(None, "", window, cx);
+        if let Some(text) = self.engine.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+            self.engine
+                .replace_text_in_range(None, "", EditKind::Cut, Instant::now());
+            self.after_edit(window, cx);
         }
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(replay) = self.history.undo() {
-            self.apply_replay(replay, window, cx);
+        if self.engine.undo(Instant::now()).changed {
+            self.after_edit(window, cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(replay) = self.history.redo() {
-            self.apply_replay(replay, window, cx);
-        }
-    }
-
-    /// Puts a replay step back into the text and selection. The change is
-    /// reported like any other edit so the draft and autosave stay in sync.
-    fn apply_replay(
-        &mut self,
-        replay: text_history::Replay,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let start = replay.range.start.min(self.content.len());
-        let end = replay.range.end.min(self.content.len());
-        debug_assert!(
-            self.content.is_char_boundary(start) && self.content.is_char_boundary(end),
-            "history ranges stay on character boundaries"
-        );
-        self.content =
-            (self.content[0..start].to_owned() + &replay.text + &self.content[end..]).into();
-        self.assist.clear_hover();
-        let len = self.content.len();
-        let selection_start = replay.selection.range.start.min(len);
-        let selection_end = replay.selection.range.end.clamp(selection_start, len);
-        self.selected_range = selection_start..selection_end;
-        self.selection_reversed = replay.selection.reversed;
-        self.marked_range = None;
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
-        self.sync_completion(cx);
-        self.notify_change(window, cx);
-        cx.notify();
-    }
-
-    /// Records the whole composition as one step once it commits.
-    fn finish_composition(&mut self) {
-        let Some(composition) = self.composition.take() else {
-            return;
-        };
-        let after = self.selection();
-        if let Some(entry) = text_history::diff_edit(
-            &composition.content,
-            &self.content,
-            composition.selection,
-            after,
-            EditKind::Ime,
-        ) {
-            self.history.record(entry, Instant::now());
+        if self.engine.redo(Instant::now()).changed {
+            self.after_edit(window, cx);
         }
     }
 
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.history.end_group();
-        self.assist.clear_hover();
+        self.engine.history.end_group();
+        self.engine.assist.clear_hover();
         self.pending_assignment_click = None;
-        let offset = self.index_for_mouse_position(event.position);
+        let offset = self.index_for_mouse_position(event.position, window);
         if event.modifiers.shift {
             // Shift extends the existing selection one character at a time;
             // the click count never changes that.
-            self.select_to(offset, cx);
-            self.drag = Some(Drag::new(Granularity::Char, &self.content, offset));
+            self.engine.select_to(offset);
+            self.after_caret_move(cx);
+            self.drag = Some(Drag::new(Granularity::Char, &self.engine.content, offset));
             return;
         }
-        let before = self.selection();
+        let before = self.engine.selection();
         if event.click_count <= 1 {
             self.pending_assignment_click =
                 self.placeholder_at(offset)
@@ -1017,14 +822,14 @@ impl TextArea {
                     });
         }
         let granularity = Granularity::for_click_count(event.click_count);
-        self.selected_range = granularity.range_at(&self.content, offset);
-        self.selection_reversed = false;
-        self.drag = Some(Drag::new(granularity, &self.content, offset));
+        self.engine
+            .set_selection(granularity.range_at(&self.engine.content, offset), false);
+        self.drag = Some(Drag::new(granularity, &self.engine.content, offset));
         self.follow = true;
         if self.pending_assignment_click.is_some() {
             // The release opens the assignment card; a click is not typing, so
             // do not flash a one-row completion list for the same name.
-            self.assist.dismiss_completion();
+            self.engine.assist.dismiss_completion();
         } else {
             self.sync_completion(cx);
         }
@@ -1039,26 +844,31 @@ impl TextArea {
         if pending.dragged {
             return;
         }
-        let released = self.index_for_mouse_position(event.position);
+        let released = self.index_for_mouse_position(event.position, window);
         if !pending.span.range.contains(&released) {
             return;
         }
         // The press moved the caret; a click on the mark leaves it where it
         // was before the gesture.
-        self.selected_range = pending.before.range;
-        self.selection_reversed = pending.before.reversed;
+        self.engine
+            .set_selection(pending.before.range.clone(), pending.before.reversed);
         self.follow = true;
         self.open_assignment(pending.span, window, cx);
     }
 
     /// Tracks the complete placeholder under the pointer so hovering one shows
     /// its value. Only a change of placeholder redraws.
-    fn on_pointer_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_pointer_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // While dragging, the pointer edits the text rather than inspecting it.
         if self.drag.is_some() {
             return;
         }
-        let offset = self.index_for_mouse_position(event.position);
+        let offset = self.index_for_mouse_position(event.position, window);
         match self.placeholder_at(offset) {
             // The card waits for the pointer to rest, so crossing the text
             // does not flash a card for every span on the way.
@@ -1066,8 +876,8 @@ impl TextArea {
             None => {
                 // Ordinary text may be the pointer's path to the card, so the
                 // card lingers briefly instead of vanishing under it.
-                let canceled = self.assist.cancel_hover_delay();
-                if self.assist.has_hover() {
+                let canceled = self.engine.assist.cancel_hover_delay();
+                if self.engine.assist.has_hover() {
                     self.schedule_hover_clear(cx);
                 }
                 if canceled {
@@ -1079,22 +889,30 @@ impl TextArea {
 
     /// Arms the show timer for a span the pointer is resting on.
     fn request_hover(&mut self, name: String, range: Range<usize>, cx: &mut Context<Self>) {
-        if self.assist.hover_matches(&name, &range) {
+        if self.engine.assist.hover_matches(&name, &range) {
             // Still on the same span: a pending close must not fire while the
             // pointer rests here.
-            self.assist.set_hover(name, range);
+            self.engine.assist.set_hover(name, range);
             return;
         }
-        if !self.assist.begin_hover_delay(name.clone(), range.clone()) {
+        if !self
+            .engine
+            .assist
+            .begin_hover_delay(name.clone(), range.clone())
+        {
             return;
         }
-        let generation = self.assist.hover_generation();
+        let generation = self.engine.assist.hover_generation();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(variable_assist::HOVER_SHOW_DELAY)
                 .await;
             let _ = this.update(cx, |area, cx| {
-                if area.assist.finish_hover_delay(generation, name, range) {
+                if area
+                    .engine
+                    .assist
+                    .finish_hover_delay(generation, name, range)
+                {
                     cx.notify();
                 }
             });
@@ -1112,15 +930,15 @@ impl TextArea {
     /// both the field and the card. Entering the card pins the hover, which
     /// cancels this timer, so a pointer crossing the gap keeps the card open.
     fn schedule_hover_clear(&mut self, cx: &mut Context<Self>) {
-        let generation = self.assist.next_hover_generation();
+        let generation = self.engine.assist.next_hover_generation();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(variable_assist::HOVER_LINGER)
                 .await;
             let _ = this.update(cx, |area, cx| {
-                if area.assist.hover_generation() == generation
-                    && !area.assist.hover_pinned()
-                    && area.assist.clear_hover()
+                if area.engine.assist.hover_generation() == generation
+                    && !area.engine.assist.hover_pinned()
+                    && area.engine.assist.clear_hover()
                 {
                     cx.notify();
                 }
@@ -1132,7 +950,7 @@ impl TextArea {
     /// Pins the card open while the pointer is over it. Leaving it arms the
     /// same close timer the field uses.
     fn set_hover_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
-        let changed = self.assist.set_hover_pinned(pinned);
+        let changed = self.engine.assist.set_hover_pinned(pinned);
         if !pinned {
             self.schedule_hover_clear(cx);
         }
@@ -1144,24 +962,24 @@ impl TextArea {
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(drag) = self.drag.clone() else {
             return;
         };
-        let offset = self.index_for_mouse_position(event.position);
+        let offset = self.index_for_mouse_position(event.position, window);
         if let Some(pending) = self.pending_assignment_click.as_mut()
             && offset != pending.offset
         {
             pending.dragged = true;
         }
         if drag.granularity() == Granularity::Char {
-            self.select_to(offset, cx);
+            self.engine.select_to(offset);
+            self.after_caret_move(cx);
         } else {
-            let (range, reversed) = drag.extend(&self.content, offset);
-            self.selected_range = range;
-            self.selection_reversed = reversed;
+            let (range, reversed) = drag.extend(&self.engine.content, offset);
+            self.engine.set_selection(range, reversed);
             self.follow = true;
             self.sync_completion(cx);
             cx.notify();
@@ -1180,217 +998,51 @@ impl TextArea {
         } else {
             (px(0.), delta.y)
         };
-        let before = self.scroll;
-        self.scroll.x = (self.scroll.x - dx).max(px(0.));
-        self.scroll.y = (self.scroll.y - dy).max(px(0.));
+        let before = self.layout.scroll();
+        self.layout.scroll_by(dx, dy);
         self.follow = false;
-        if self.scroll != before {
+        if self.layout.scroll() != before {
             cx.notify();
         }
     }
 
-    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        // Any caret move brings the caret back into view on the next prepaint.
-        self.follow = true;
-        self.sync_completion(cx);
-        cx.notify();
-    }
-
-    fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
-    }
-
-    fn move_vertical(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let target = self.vertical_target(delta);
-        self.move_to(target, cx);
-    }
-
-    fn select_vertical(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let target = self.vertical_target(delta);
-        self.select_to(target, cx);
-    }
-
-    fn vertical_target(&self, delta: isize) -> usize {
-        let cursor = self.cursor_offset();
-        let (line, column) = self.line_col(cursor);
-        let target_line = line.saturating_add_signed(delta);
-        if target_line == line {
-            return cursor;
-        }
-        let start = self.line_start(target_line);
-        let end = self.line_end(target_line);
-        let target = start.saturating_add(column).min(end);
-        self.floor_boundary(target)
-    }
-
-    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+    fn index_for_mouse_position(&mut self, position: Point<Pixels>, window: &mut Window) -> usize {
         let line_height = self.line_height();
         if line_height <= px(0.) {
-            return self.content.len();
+            return self.engine.content.len();
         }
         let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
         };
         // Positions outside the viewport clamp to the nearest row and column,
         // which is what lets a drag past an edge select the row it points at.
-        let y = (position.y - bounds.top() + self.scroll.y).max(px(0.));
-        let line = ((y / line_height).floor() as usize).min(self.line_count().saturating_sub(1));
-        let start = self.line_start(line);
-        let Some(layout) = self.last_layouts.get(line) else {
-            return start;
+        let scroll = self.layout.scroll();
+        let y = (position.y - bounds.top() + scroll.y).max(px(0.));
+        let line =
+            ((y / line_height).floor() as usize).min(self.layout.line_count().saturating_sub(1));
+        let start = self.layout.line_start(line);
+        // A row the viewport has never painted has no measured geometry yet;
+        // shape it now so the click lands on the right column.
+        let shaped = match self.layout.line(line) {
+            Some(shaped) => shaped.clone(),
+            None => match self.layout.ensure_line(window, line) {
+                Some(shaped) => shaped,
+                None => return start,
+            },
         };
         // Past the viewport's right edge the pointer is beyond every visible
         // column, and the viewport has not scrolled yet during a drag. Treat
         // that as the end of the row rather than the column under the pointer.
         if position.x > bounds.right() {
-            return self.line_end(line);
+            return self.layout.line_end(line);
         }
-        let x = position.x - bounds.left() - self.last_gutter + self.scroll.x;
-        start + layout.closest_index_for_x(x)
+        let x = position.x - bounds.left() - self.layout.gutter() + scroll.x;
+        start + shaped.closest_index_for_x(x)
     }
 
     fn line_height(&self) -> Pixels {
-        self.last_line_height
+        self.layout.line_height()
     }
-
-    fn line_count(&self) -> usize {
-        self.content.split('\n').count()
-    }
-
-    fn line_start(&self, target: usize) -> usize {
-        let mut line = 0;
-        for (idx, ch) in self.content.char_indices() {
-            if line == target {
-                return idx;
-            }
-            if ch == '\n' {
-                line += 1;
-            }
-        }
-        self.content.len()
-    }
-
-    fn line_end(&self, target: usize) -> usize {
-        let start = self.line_start(target);
-        self.content[start..]
-            .find('\n')
-            .map(|offset| start + offset)
-            .unwrap_or(self.content.len())
-    }
-
-    fn line_col(&self, offset: usize) -> (usize, usize) {
-        let mut line = 0;
-        let mut start = 0;
-        for (idx, ch) in self.content.char_indices() {
-            if idx >= offset {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                start = idx + 1;
-            }
-        }
-        (line, offset.saturating_sub(start))
-    }
-
-    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        if self.selection_reversed {
-            self.selected_range.start = offset;
-        } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        // The head of a pointer or keyboard selection is the moving caret.
-        self.follow = true;
-        self.sync_completion(cx);
-        cx.notify();
-    }
-
-    fn floor_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .map(|(idx, _)| idx)
-            .take_while(|idx| *idx <= offset)
-            .last()
-            .unwrap_or(0)
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .as_str()
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .as_str()
-            .grapheme_indices(true)
-            .find_map(|(idx, _)| (idx > offset).then_some(idx))
-            .unwrap_or(self.content.len())
-    }
-
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-
-        utf8_offset
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        utf16_offset
-    }
-
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
-    }
-
-    fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
-    }
-
-    /// Bounds a range carried in the editor's state. A composition that commits
-    /// empty text can leave a stale marked range; clamping keeps every slice
-    /// safe.
-    fn clamp_range(&self, range: Range<usize>) -> Range<usize> {
-        let start = range.start.min(self.content.len());
-        let end = range.end.clamp(start, self.content.len());
-        start..end
-    }
-}
-
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Width reserved for line numbers, right-aligned with a small gap before the
@@ -1415,9 +1067,9 @@ impl EntityInputHandler for TextArea {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
-        actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        let range = self.engine.range_from_utf16(&range_utf16);
+        actual_range.replace(self.engine.range_to_utf16(&range));
+        Some(self.engine.content[range].to_string())
     }
 
     fn selected_text_range(
@@ -1427,8 +1079,8 @@ impl EntityInputHandler for TextArea {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
-            reversed: self.selection_reversed,
+            range: self.engine.range_to_utf16(&self.engine.selected_range),
+            reversed: self.engine.selection_reversed,
         })
     }
 
@@ -1437,14 +1089,14 @@ impl EntityInputHandler for TextArea {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.marked_range
+        self.engine
+            .marked_range
             .as_ref()
-            .map(|range| self.range_to_utf16(range))
+            .map(|range| self.engine.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
-        self.finish_composition();
+        self.engine.unmark_text();
     }
 
     fn replace_text_in_range(
@@ -1454,62 +1106,13 @@ impl EntityInputHandler for TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Windows also posts the key's character message while a composition
-        // owns Enter, so a bare carriage return arrives here after the
-        // candidate has committed. The commit already wrote the text; the
-        // stray CR must not also break the line.
-        if new_text == "\r" {
-            return;
-        }
-
-        let new_text = normalize_newlines(new_text);
-
-        let range = self.clamp_range(
-            range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .or(self.marked_range.clone())
-                .unwrap_or(self.selected_range.clone()),
-        );
-
-        let before = self
-            .pending_before
-            .take()
-            .unwrap_or_else(|| self.selection());
-        let removed = self.content[range.clone()].to_owned();
-        let kind = self.edit_kind;
-
-        self.content =
-            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
-                .into();
-        self.assist.clear_hover();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range.take();
-        self.selection_reversed = false;
-        self.edit_kind = EditKind::Insert;
-        // Typed text moves the caret, so the next paint pulls the viewport
-        // along with it.
-        self.follow = true;
-
-        if self.composition.is_some() {
-            self.ime_committed_at = Some(Instant::now());
-            self.finish_composition();
-        } else {
-            self.history.record(
-                EditEntry {
-                    range,
-                    inserted: new_text,
-                    removed,
-                    before,
-                    after: self.selection(),
-                    kind,
-                },
-                Instant::now(),
-            );
-        }
-        self.sync_completion(cx);
-        self.notify_change(window, cx);
-        cx.notify();
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.engine.range_from_utf16(range_utf16));
+        let kind = self.engine.edit_kind;
+        self.engine
+            .replace_text_in_range(range, new_text, kind, Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1520,70 +1123,39 @@ impl EntityInputHandler for TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.clamp_range(
-            range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .or(self.marked_range.clone())
-                .unwrap_or(self.selected_range.clone()),
-        );
-        let new_text = normalize_newlines(new_text);
-
-        if !new_text.is_empty() && self.composition.is_none() {
-            let selection = self.selection();
-            self.composition = Some(Composition {
-                content: self.content.to_string(),
-                selection,
-            });
-            self.pending_before = None;
-        }
-
-        self.content =
-            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
-                .into();
-        self.assist.clear_hover();
-        if new_text.is_empty() {
-            self.marked_range = None;
-        } else {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        }
-        // `new_selected_range_utf16` is relative to `new_text`, so both ends
-        // shift by the replacement start.
-        self.selected_range = new_selected_range_utf16
+        let range = range_utf16
             .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
-        self.selection_reversed = false;
-
-        if new_text.is_empty() {
-            self.finish_composition();
-        }
-        self.sync_completion(cx);
-        self.notify_change(window, cx);
-        cx.notify();
+            .map(|range_utf16| self.engine.range_from_utf16(range_utf16));
+        self.engine
+            .replace_and_mark_text_in_range(range, new_text, new_selected_range_utf16);
+        self.after_edit(window, cx);
     }
 
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
         bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let range = self.range_from_utf16(&range_utf16);
-        let (line, column) = self.line_col(range.start);
-        let layout = self.last_layouts.get(line)?;
-        let start = self.line_start(line);
-        let x = layout.x_for_index((start + column).min(self.line_end(line)) - start);
+        let range = self.engine.range_from_utf16(&range_utf16);
+        let (line, column) = self.layout.line_col(range.start);
+        let shaped = match self.layout.line(line) {
+            Some(shaped) => shaped.clone(),
+            None => self.layout.ensure_line(window, line)?,
+        };
+        let start = self.layout.line_start(line);
+        let x = shaped.x_for_index((start + column).min(self.layout.line_end(line)) - start);
+        let gutter = self.layout.gutter();
+        let scroll = self.layout.scroll();
         Some(Bounds::from_corners(
             point(
-                bounds.left() + self.last_gutter + x - self.scroll.x,
-                bounds.top() + self.line_height() * line as f32 - self.scroll.y,
+                bounds.left() + gutter + x - scroll.x,
+                bounds.top() + self.line_height() * line as f32 - scroll.y,
             ),
             point(
-                bounds.left() + self.last_gutter + x - self.scroll.x,
-                bounds.top() + self.line_height() * (line + 1) as f32 - self.scroll.y,
+                bounds.left() + gutter + x - scroll.x,
+                bounds.top() + self.line_height() * (line + 1) as f32 - scroll.y,
             ),
         ))
     }
@@ -1591,10 +1163,11 @@ impl EntityInputHandler for TextArea {
     fn character_index_for_point(
         &mut self,
         point: gpui::Point<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
+        let offset = self.index_for_mouse_position(point, window);
+        Some(self.engine.offset_to_utf16(offset))
     }
 }
 
@@ -1603,9 +1176,12 @@ struct TextAreaElement {
 }
 
 struct PrepaintState {
-    lines: Vec<ShapedLine>,
-    /// One number per content line, empty when the gutter is off.
-    numbers: Vec<ShapedLine>,
+    /// The shaped lines in the visible range, starting at `first_line`.
+    lines: Vec<Arc<ShapedLine>>,
+    /// The content line index of `lines[0]`.
+    first_line: usize,
+    /// One number per visible line, empty when the gutter is off.
+    numbers: Vec<Arc<ShapedLine>>,
     /// Width the text is inset by, zero without a gutter.
     gutter: Pixels,
     /// Offset this frame paints at, clamped to the content.
@@ -1660,174 +1236,149 @@ impl Element for TextAreaElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
-        let style = window.text_style();
+        let content = input.engine.content.clone();
+        let content_is_empty = content.is_empty();
+        let selected_range = input.engine.selected_range.clone();
+        let cursor_offset = input.engine.cursor_offset();
+        let accent = input.accent;
         let syntax = input.syntax;
+        let line_numbers = input.line_numbers;
+        let follow = input.follow;
+        // Anchored overlays may point at lines the viewport has scrolled away
+        // from; their lines are shaped on demand below.
+        let assignment_start = input.engine.assist.assignment().map(|a| a.range.start);
+        let hover_start = input.engine.assist.hover().map(|h| h.range.start);
+        let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
 
-        let display_text = if content.is_empty() {
+        let display_text = if content_is_empty {
             input.placeholder.clone()
         } else {
             content.clone()
         };
-        let text_color = if content.is_empty() {
+        let text_color = if content_is_empty {
             theme::text::tertiary().into()
         } else {
             style.color
         };
-
-        // The gutter is editor chrome: it insets the shaped text, the caret,
-        // the selection, and the click mapping, but never the content itself.
-        let line_count = display_text.split('\n').count();
-        let gutter = if input.line_numbers {
-            line_number_gutter(window, line_count)
-        } else {
-            px(0.)
-        };
-        let number_color = theme::text::tertiary().into();
-        let mut numbers = Vec::new();
-        let mut lines = Vec::new();
-        // Text span of each shaped line, so selection quads can be built once
-        // the scroll offset is known.
-        let mut spans: Vec<Range<usize>> = Vec::new();
-        let mut line_start = 0;
-        let content_lines = display_text.split('\n');
-        // Highlighting only changes the run colors: the runs always cover the
-        // whole line, so `x_for_index` keeps caret and selection positions.
-        let highlighted = syntax == Syntax::Json && !content.is_empty();
         // Resolved placeholders wear the method hue; unresolved ones wear the
         // warning color and underline. Both are presentation only.
-        let placeholders = if content.is_empty() {
+        let spans = if content_is_empty {
             PlaceholderSpans::default()
         } else {
-            input.assist.placeholder_spans(&content)
+            input.engine.assist.placeholder_spans(&content)
         };
-        for display_line in content_lines {
-            let base = TextRun {
-                len: display_line.len(),
-                font: style.font(),
-                color: text_color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let line_range = line_start..line_start + display_line.len();
-            let line_missing: Vec<Range<usize>> = placeholders
-                .missing
-                .iter()
-                .filter_map(|span| clip_to_line(&span.range, &line_range, line_start))
-                .collect();
-            let line_resolved: Vec<Range<usize>> = placeholders
-                .resolved
-                .iter()
-                .filter_map(|range| clip_to_line(range, &line_range, line_start))
-                .collect();
-            let runs = if highlighted && display_line.len() <= HIGHLIGHT_LINE_LIMIT {
-                syntax_runs(display_line, &base)
+        // Highlighting only changes the run colors: the runs always cover the
+        // whole line, so `x_for_index` keeps caret and selection positions.
+        let spec = LayoutSpec {
+            text: display_text,
+            placeholder: content_is_empty,
+            font: style.font(),
+            font_size,
+            text_color,
+            accent,
+            syntax,
+            spans,
+            marked_range: input.engine.marked_range.clone(),
+            line_numbers,
+            gutter: px(0.),
+            line_height,
+            width: bounds.size.width,
+            generation: input.engine.generation,
+            delta: input.engine.last_delta().cloned(),
+            mode: TextMode::Multiline,
+        };
+        let _ = input;
+
+        // The gutter width depends on the line count, which the layout knows
+        // once it has indexed the text; the caret-follow and clamping need it.
+        let (gutter, scroll, first_line, last_line) = self.input.update(cx, |input, _cx| {
+            input.layout.sync(spec);
+            let line_count = input.layout.line_count();
+            let gutter = if line_numbers {
+                line_number_gutter(window, line_count)
             } else {
-                vec![base]
+                px(0.)
             };
-            let runs = overlay_spans(runs, &line_missing, &line_resolved, input.accent);
-            let shaped = window.text_system().shape_line(
-                SharedString::from(display_line.to_owned()),
-                font_size,
-                &runs,
-                None,
-            );
-
-            if input.line_numbers {
-                let label = (numbers.len() + 1).to_string();
-                numbers.push(window.text_system().shape_line(
-                    SharedString::from(label.clone()),
-                    font_size,
-                    &[TextRun {
-                        len: label.len(),
-                        font: style.font(),
-                        color: number_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                ));
+            input.layout.set_gutter(gutter);
+            // Only vertical clamping is safe before any line is shaped: the
+            // content height is numeric, while the horizontal extent grows
+            // from measured widths.
+            if follow {
+                input
+                    .layout
+                    .follow_caret(window, cursor_offset, bounds.size);
+            } else {
+                input.layout.clamp_vertical(bounds.size.height);
             }
-
-            spans.push(line_start..line_start + display_line.len());
-            lines.push(shaped);
-            line_start += display_line.len() + 1;
-        }
-
-        // The viewport's offset is clamped to the content, then adjusted to keep
-        // the caret visible when a caret or text change asked for it.
-        let viewport = bounds.size;
-        let content_width = gutter
-            + lines
-                .iter()
-                .map(|line| line.width)
-                .fold(px(0.), |widest, width| widest.max(width));
-        let content_height = line_height * lines.len().max(1) as f32;
-        let max = point(
-            (content_width - viewport.width).max(px(0.)),
-            (content_height - viewport.height).max(px(0.)),
-        );
-        let mut scroll = point(
-            input.scroll.x.clamp(px(0.), max.x),
-            input.scroll.y.clamp(px(0.), max.y),
-        );
-        let (cursor_line, cursor_column) = input.line_col(cursor);
-        if input.follow
-            && let Some(line) = lines.get(cursor_line)
-        {
-            let start = input.line_start(cursor_line);
-            let column = (start + cursor_column).min(input.line_end(cursor_line)) - start;
-            let caret_x = gutter + line.x_for_index(column);
-            let caret_top = line_height * cursor_line as f32;
-            let caret_bottom = caret_top + line_height;
-            if caret_top < scroll.y {
-                scroll.y = caret_top;
-            } else if caret_bottom > scroll.y + viewport.height {
-                scroll.y = caret_bottom - viewport.height;
+            let visible = input.layout.visible_lines(bounds.size.height);
+            input.layout.ensure_range(window, visible.clone());
+            // The caret and an anchored overlay can sit outside the viewport.
+            let (cursor_line, _) = input.layout.line_col(cursor_offset);
+            input.layout.ensure_line(window, cursor_line);
+            for offset in [assignment_start, hover_start].into_iter().flatten() {
+                let (line, _) = input.layout.line_col(offset);
+                input.layout.ensure_line(window, line);
             }
-            if caret_x < scroll.x {
-                scroll.x = caret_x;
-            } else if caret_x + px(2.) > scroll.x + viewport.width {
-                scroll.x = caret_x + px(2.) - viewport.width;
-            }
-            scroll = point(scroll.x.clamp(px(0.), max.x), scroll.y.clamp(px(0.), max.y));
-        }
+            let scroll = input.layout.clamp_scroll(bounds.size);
+            (gutter, scroll, visible.start, visible.end.min(line_count))
+        });
+
+        let area = self.input.read(cx);
+        let line_height = area.layout.line_height();
+        let visible = first_line..last_line;
+        let (cursor_line, _) = area.layout.line_col(cursor_offset);
+        let lines: Vec<Arc<ShapedLine>> = visible
+            .clone()
+            .filter_map(|index| area.layout.line(index).cloned())
+            .collect();
+        let numbers: Vec<Arc<ShapedLine>> = if line_numbers {
+            visible
+                .clone()
+                .filter_map(|index| area.layout.number(index).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut selection_quads = Vec::new();
-        if !selected_range.is_empty() && !content.is_empty() {
-            for (index, (shaped, span)) in lines.iter().zip(&spans).enumerate() {
-                let start = selected_range.start.max(span.start);
-                let end = selected_range.end.min(span.end);
+        if !selected_range.is_empty() && !content_is_empty {
+            for index in visible.clone() {
+                let Some(shaped) = area.layout.line(index) else {
+                    continue;
+                };
+                let span_start = area.layout.line_start(index);
+                let span_end = area.layout.line_end(index);
+                let start = selected_range.start.max(span_start);
+                let end = selected_range.end.min(span_end);
                 if start < end {
                     selection_quads.push(fill(
                         Bounds::from_corners(
                             point(
-                                bounds.left() + gutter + shaped.x_for_index(start - span.start)
+                                bounds.left() + gutter + shaped.x_for_index(start - span_start)
                                     - scroll.x,
                                 bounds.top() + line_height * index as f32 - scroll.y,
                             ),
                             point(
-                                bounds.left() + gutter + shaped.x_for_index(end - span.start)
+                                bounds.left() + gutter + shaped.x_for_index(end - span_start)
                                     - scroll.x,
                                 bounds.top() + line_height * (index + 1) as f32 - scroll.y,
                             ),
                         ),
-                        theme::accent::subtle_for(input.accent),
+                        theme::accent::subtle_for(accent),
                     ));
                 }
             }
         }
 
-        let cursor = lines.get(cursor_line).map(|line| {
-            let start = input.line_start(cursor_line);
-            let column = (start + cursor_column).min(input.line_end(cursor_line)) - start;
-            let x = line.x_for_index(column);
+        // A caret outside the viewport is clipped by the content mask; not
+        // shaping its line leaves the same pixels.
+        let cursor_quad = area.layout.line(cursor_line).map(|shaped| {
+            let line_start = area.layout.line_start(cursor_line);
+            let line_end = area.layout.line_end(cursor_line);
+            let column = cursor_offset.min(line_end).saturating_sub(line_start);
+            let x = shaped.x_for_index(column);
             fill(
                 Bounds::new(
                     point(
@@ -1836,29 +1387,30 @@ impl Element for TextAreaElement {
                     ),
                     size(px(2.), line_height),
                 ),
-                input.accent,
+                accent,
             )
         });
 
         // Anchors come from the viewed line's shaped geometry each frame, so
         // the card follows the caret's line and stays put across scrolling.
-        let completion_anchor = input.assist.completion().and_then(|_| {
-            let line = lines.get(cursor_line)?;
-            let start = input.line_start(cursor_line);
-            let column = (start + cursor_column).min(input.line_end(cursor_line)) - start;
+        let completion_anchor = area.engine.assist.completion().and_then(|_| {
+            let shaped = area.layout.line(cursor_line)?;
+            let line_start = area.layout.line_start(cursor_line);
+            let line_end = area.layout.line_end(cursor_line);
+            let column = cursor_offset.min(line_end).saturating_sub(line_start);
             Some(Bounds::new(
                 point(
-                    bounds.left() + gutter + line.x_for_index(column) - scroll.x,
+                    bounds.left() + gutter + shaped.x_for_index(column) - scroll.x,
                     bounds.top() + line_height * cursor_line as f32 - scroll.y,
                 ),
                 size(px(2.), line_height),
             ))
         });
-        let assignment_anchor = input.assist.assignment().and_then(|assignment| {
-            let (line, _) = input.line_col(assignment.range.start);
-            let shaped = lines.get(line)?;
-            let line_start = input.line_start(line);
-            let line_end = input.line_end(line);
+        let assignment_anchor = area.engine.assist.assignment().and_then(|assignment| {
+            let (line, _) = area.layout.line_col(assignment.range.start);
+            let shaped = area.layout.line(line)?;
+            let line_start = area.layout.line_start(line);
+            let line_end = area.layout.line_end(line);
             let start = assignment
                 .range
                 .start
@@ -1883,11 +1435,11 @@ impl Element for TextAreaElement {
         });
         // The hover card anchors to the placeholder it describes, so it follows
         // scrolling and resizing without waiting for the pointer to move.
-        let hover_anchor = input.assist.hover().and_then(|hover| {
-            let (line, _) = input.line_col(hover.range.start);
-            let shaped = lines.get(line)?;
-            let line_start = input.line_start(line);
-            let line_end = input.line_end(line);
+        let hover_anchor = area.engine.assist.hover().and_then(|hover| {
+            let (line, _) = area.layout.line_col(hover.range.start);
+            let shaped = area.layout.line(line)?;
+            let line_start = area.layout.line_start(line);
+            let line_end = area.layout.line_end(line);
             let start = hover.range.start.min(line_end).saturating_sub(line_start);
             let end = hover
                 .range
@@ -1906,16 +1458,17 @@ impl Element for TextAreaElement {
                 ),
             ))
         });
+        let _ = area;
         self.input.update(cx, |input, cx| {
             let mut changed = false;
             if let Some(anchor) = completion_anchor {
-                changed |= input.assist.set_completion_anchor(anchor);
+                changed |= input.engine.assist.set_completion_anchor(anchor);
             }
             if let Some(anchor) = assignment_anchor {
-                changed |= input.assist.set_assignment_anchor(anchor);
+                changed |= input.engine.assist.set_assignment_anchor(anchor);
             }
             if let Some(anchor) = hover_anchor {
-                changed |= input.assist.set_hover_anchor(anchor);
+                changed |= input.engine.assist.set_hover_anchor(anchor);
             }
             if changed {
                 cx.notify();
@@ -1924,10 +1477,11 @@ impl Element for TextAreaElement {
 
         PrepaintState {
             lines,
+            first_line,
             numbers,
             gutter,
             scroll,
-            cursor,
+            cursor: cursor_quad,
             selections: selection_quads,
         }
     }
@@ -1991,7 +1545,8 @@ impl Element for TextAreaElement {
                         line.paint(
                             point(
                                 bounds.left() + gutter - scroll.x,
-                                bounds.top() + line_height * index as f32 - scroll.y,
+                                bounds.top() + line_height * (prepaint.first_line + index) as f32
+                                    - scroll.y,
                             ),
                             line_height,
                             window,
@@ -2017,7 +1572,9 @@ impl Element for TextAreaElement {
                             .paint(
                                 point(
                                     bounds.left() + gutter - space::S8 - number.width,
-                                    bounds.top() + line_height * index as f32 - scroll.y,
+                                    bounds.top()
+                                        + line_height * (prepaint.first_line + index) as f32
+                                        - scroll.y,
                                 ),
                                 line_height,
                                 window,
@@ -2029,116 +1586,10 @@ impl Element for TextAreaElement {
             );
         });
 
-        let layouts = std::mem::take(&mut prepaint.lines);
         self.input.update(cx, |input, _cx| {
-            input.last_layouts = layouts;
             input.last_bounds = Some(bounds);
-            input.last_line_height = line_height;
-            input.last_gutter = gutter;
-            input.scroll = scroll;
             input.follow = false;
         });
-    }
-}
-
-/// Clips a placeholder range to one line and rebases it to that line's start.
-fn clip_to_line(
-    range: &Range<usize>,
-    line: &Range<usize>,
-    line_start: usize,
-) -> Option<Range<usize>> {
-    let start = range.start.max(line.start);
-    let end = range.end.min(line.end);
-    (start < end).then(|| start - line_start..end - line_start)
-}
-
-/// Splits runs at placeholder boundaries, painting resolved placeholders with
-/// `accent` — the field's method hue — and unresolved ones with the warning
-/// color and underline. Placeholders win over the JSON token color, and the
-/// runs still cover the whole line.
-fn overlay_spans(
-    runs: Vec<TextRun>,
-    missing: &[Range<usize>],
-    resolved: &[Range<usize>],
-    accent: Rgba,
-) -> Vec<TextRun> {
-    if missing.is_empty() && resolved.is_empty() {
-        return runs;
-    }
-    let danger: Hsla = theme::status::danger().into();
-    let accent: Hsla = accent.into();
-    let mut out = Vec::new();
-    let mut run_start = 0;
-    for run in runs {
-        let run_end = run_start + run.len;
-        let mut boundaries = vec![run_start, run_end];
-        for span in missing.iter().chain(resolved) {
-            for boundary in [span.start.max(run_start), span.end.min(run_end)] {
-                if run_start < boundary && boundary < run_end {
-                    boundaries.push(boundary);
-                }
-            }
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        for pair in boundaries.windows(2) {
-            let (start, end) = (pair[0], pair[1]);
-            let uncovered = missing
-                .iter()
-                .any(|span| span.start < end && span.end > start);
-            let covered = resolved
-                .iter()
-                .any(|span| span.start < end && span.end > start);
-            let mut segment = run.clone();
-            segment.len = end - start;
-            if uncovered {
-                segment.color = danger;
-                segment.underline = Some(UnderlineStyle {
-                    color: Some(danger),
-                    thickness: px(1.),
-                    wavy: false,
-                });
-            } else if covered {
-                segment.color = accent;
-            }
-            out.push(segment);
-        }
-        run_start = run_end;
-    }
-    out
-}
-
-/// Splits one JSON line into colored runs. The tokens cover the whole line, so
-/// the runs do too.
-fn syntax_runs(line: &str, base: &TextRun) -> Vec<TextRun> {
-    let tokens = json_syntax::tokenize(line);
-    if tokens.is_empty() {
-        return vec![base.clone()];
-    }
-    let runs: Vec<TextRun> = tokens
-        .into_iter()
-        .filter(|(range, _)| range.start < range.end)
-        .map(|(range, kind)| TextRun {
-            len: range.end - range.start,
-            color: token_color(kind, base.color),
-            ..base.clone()
-        })
-        .collect();
-    if runs.is_empty() {
-        vec![base.clone()]
-    } else {
-        runs
-    }
-}
-
-fn token_color(kind: TokenKind, default: gpui::Hsla) -> gpui::Hsla {
-    match kind {
-        TokenKind::Key => theme::json_key().into(),
-        TokenKind::String => theme::json_string().into(),
-        TokenKind::Number => theme::json_number().into(),
-        TokenKind::Literal => theme::json_literal().into(),
-        TokenKind::Punctuation => theme::syntax::punctuation().into(),
-        TokenKind::Plain => default,
     }
 }
 
@@ -2149,9 +1600,9 @@ impl Render for TextArea {
             self.blur_subscription =
                 Some(
                     cx.on_blur(&self.focus_handle, window, |this, _window, _cx| {
-                        this.history.end_group();
-                        this.assist.dismiss_completion();
-                        this.assist.clear_hover();
+                        this.engine.history.end_group();
+                        this.engine.assist.dismiss_completion();
+                        this.engine.assist.clear_hover();
                     }),
                 );
         }
@@ -2159,7 +1610,7 @@ impl Render for TextArea {
         // The shell paints a root-hosted card, and it only repaints when told.
         // Hand it a deferred redraw whenever the card differs from the one this
         // editor last reported; the body's own repaint cannot reach the shell.
-        let signature = self.assist.overlay_signature();
+        let signature = self.engine.assist.overlay_signature();
         if self.overlay_seen.as_ref() != Some(&signature) {
             self.overlay_seen = Some(signature);
             if let Some(handler) = self.on_overlay_change.clone() {
@@ -2172,7 +1623,7 @@ impl Render for TextArea {
         } else {
             self.variable_overlay(cx.entity(), window)
         };
-        let key_context = if self.assist.completion_open() {
+        let key_context = if self.engine.assist.completion_open() {
             "TextArea VariableCompletion"
         } else {
             "TextArea"
@@ -2238,6 +1689,9 @@ mod tests {
     use gpui::div;
 
     use super::*;
+    use crate::views::text_engine::IME_ENTER_GRACE;
+    use crate::views::text_layout::HIGHLIGHT_LINE_LIMIT;
+    use std::time::Duration;
 
     /// Hosts an editor at the window's size. The editor fills the height its
     /// host gives it, so a bare view would leave it without a definite height to
@@ -2430,7 +1884,7 @@ mod tests {
         cx.simulate_keystrokes("secondary-z");
         cx.update(|_, app| {
             assert_eq!(area.read(app).content(), "");
-            assert_eq!(area.read(app).selected_range, 0..0);
+            assert_eq!(area.read(app).engine.selected_range, 0..0);
         });
         cx.simulate_keystrokes("secondary-shift-z");
         cx.update(|_, app| assert_eq!(area.read(app).content(), "line one\nline two"));
@@ -2450,7 +1904,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), "one\ntwo");
-            assert_eq!(area.selected_range, 7..7);
+            assert_eq!(area.engine.selected_range, 7..7);
         });
     }
 
@@ -2543,7 +1997,7 @@ mod tests {
             let area = area.read(app);
             assert_eq!(area.content(), "{\n  \"a\": 1\n}");
             // The replaced text leaves the caret at the end.
-            assert_eq!(area.selection().range, 12..12);
+            assert_eq!(area.engine.selection().range, 12..12);
         });
 
         cx.simulate_keystrokes("secondary-z");
@@ -2551,21 +2005,21 @@ mod tests {
             let area = area.read(app);
             assert_eq!(area.content(), "{\"a\":1}");
             // Undo restores the pre-replacement caret, not the document start.
-            assert_eq!(area.selection().range, 7..7);
+            assert_eq!(area.engine.selection().range, 7..7);
         });
     }
 
     /// The pointer position that resolves to `offset` in a painted editor.
     fn pointer_at(area: &TextArea, offset: usize) -> Point<Pixels> {
         let bounds = area.last_bounds.expect("the editor painted once");
-        let (line, column) = area.line_col(offset);
-        let start = area.line_start(line);
-        let end = area.line_end(line);
+        let (line, column) = area.engine.line_col(offset);
+        let start = area.engine.line_start(line);
+        let end = area.engine.line_end(line);
         let index = (start + column).min(end);
-        let layout = area.last_layouts.get(line).expect("a shaped line");
+        let layout = area.layout.line(line).expect("a shaped line");
         point(
-            bounds.left() + area.last_gutter + layout.x_for_index(index - start) + px(1.),
-            bounds.top() + area.last_line_height * (line as f32 + 0.5),
+            bounds.left() + area.layout.gutter() + layout.x_for_index(index - start) + px(1.),
+            bounds.top() + area.layout.line_height() * (line as f32 + 0.5),
         )
     }
 
@@ -2643,7 +2097,7 @@ mod tests {
 
         let position = cx.update(|_, app| pointer_at(area.read(app), 3));
         press(&area, position, 2, false, cx);
-        cx.update(|_, app| assert_eq!(area.read(app).selected_range, 0..7));
+        cx.update(|_, app| assert_eq!(area.read(app).engine.selected_range, 0..7));
     }
 
     #[gpui::test]
@@ -2656,8 +2110,8 @@ mod tests {
         press(&area, position, 3, false, cx);
         cx.update(|_, app| {
             let area = area.read(app);
-            assert_eq!(area.selected_range, 4..7);
-            assert_eq!(&area.content()[area.selected_range.clone()], "two");
+            assert_eq!(area.engine.selected_range, 4..7);
+            assert_eq!(&area.content()[area.engine.selected_range.clone()], "two");
         });
     }
 
@@ -2669,7 +2123,7 @@ mod tests {
 
         let position = cx.update(|_, app| pointer_at(area.read(app), 5));
         press(&area, position, 4, false, cx);
-        cx.update(|_, app| assert_eq!(area.read(app).selected_range, 0..7));
+        cx.update(|_, app| assert_eq!(area.read(app).engine.selected_range, 0..7));
     }
 
     #[gpui::test]
@@ -2680,14 +2134,17 @@ mod tests {
 
         let start = cx.update(|_, app| pointer_at(area.read(app), 2));
         press(&area, start, 2, false, cx);
-        cx.update(|_, app| assert_eq!(area.read(app).selected_range, 0..5));
+        cx.update(|_, app| assert_eq!(area.read(app).engine.selected_range, 0..5));
 
         let target = cx.update(|_, app| pointer_at(area.read(app), 8));
         drag_to(&area, target, cx);
         cx.update(|_, app| {
             let area = area.read(app);
-            assert_eq!(area.selected_range, 0..10);
-            assert_eq!(&area.content()[area.selected_range.clone()], "alpha beta");
+            assert_eq!(area.engine.selected_range, 0..10);
+            assert_eq!(
+                &area.content()[area.engine.selected_range.clone()],
+                "alpha beta"
+            );
         });
     }
 
@@ -2701,7 +2158,7 @@ mod tests {
         press(&area, start, 1, false, cx);
         let end = cx.update(|_, app| pointer_at(area.read(app), 7));
         press(&area, end, 2, true, cx);
-        cx.update(|_, app| assert_eq!(area.read(app).selected_range, 1..7));
+        cx.update(|_, app| assert_eq!(area.read(app).engine.selected_range, 1..7));
     }
 
     #[gpui::test]
@@ -2739,12 +2196,16 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             let bounds = area.last_bounds.expect("the editor painted once");
-            assert!(area.scroll.y > px(0.), "the viewport followed the caret");
+            assert!(
+                area.layout.scroll().y > px(0.),
+                "the viewport followed the caret"
+            );
             // The caret's row is the last one, and it is inside the viewport.
-            let caret_row = area.line_col(area.cursor_offset()).0 as f32;
-            let caret_top = area.last_line_height * caret_row - area.scroll.y;
+            let caret_row = area.engine.line_col(area.engine.cursor_offset()).0 as f32;
+            let line_height = area.layout.line_height();
+            let caret_top = line_height * caret_row - area.layout.scroll().y;
             assert!(caret_top >= px(0.));
-            assert!(caret_top + area.last_line_height <= bounds.size.height);
+            assert!(caret_top + line_height <= bounds.size.height);
         });
     }
 
@@ -2760,12 +2221,342 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             let bounds = area.last_bounds.expect("the editor painted once");
-            assert!(area.scroll.x > px(0.), "the viewport moved sideways");
+            assert!(
+                area.layout.scroll().x > px(0.),
+                "the viewport moved sideways"
+            );
             // The caret is at the end of the line, inside the viewport.
-            let caret_row = area.line_col(area.cursor_offset()).0;
-            let caret_x =
-                area.last_gutter + area.last_layouts[caret_row].x_for_index(401) - area.scroll.x;
+            let caret_row = area.engine.line_col(area.engine.cursor_offset()).0;
+            let caret_x = area.layout.gutter()
+                + area
+                    .layout
+                    .line(caret_row)
+                    .expect("a shaped line")
+                    .x_for_index(401)
+                - area.layout.scroll().x;
             assert!(caret_x <= bounds.size.width + px(4.));
+        });
+    }
+
+    #[gpui::test]
+    async fn typing_at_the_end_of_a_long_body_shapes_only_the_edited_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| app.bind_keys(key_bindings()));
+        let area = cx.new(|cx| TextArea::new(long_body(5_000), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.focus(area.read(app).focus_handle()));
+        cx.update(|window, app| window.draw(app).clear());
+        // The first paint shapes the visible rows; the edit is what must not
+        // reshape anything outside its line.
+        cx.update(|_, app| {
+            area.update(app, |area, _| {
+                area.layout.take_lines_shaped();
+            });
+        });
+
+        cx.simulate_input("x");
+        cx.update(|window, app| window.draw(app).clear());
+        let shaped =
+            cx.update(|_, app| area.update(app, |area, _| area.layout.take_lines_shaped()));
+        assert_eq!(shaped, 1, "typing at the end reshaped one line");
+        assert_eq!(
+            cx.update(|_, app| area.read(app).engine.line_count()),
+            5_000,
+            "the newline count is unchanged"
+        );
+    }
+
+    /// The vertical extent is line count times line height, so a huge body can
+    /// jump to an unseen line without shaping the rows in between.
+    #[gpui::test]
+    async fn a_huge_body_shapes_only_the_viewport(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new(long_body(100_000), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+
+        let (shaped, visible) = cx.update(|_, app| {
+            let bounds = area.read(app).last_bounds.expect("the editor painted once");
+            let visible = area.read(app).layout.visible_lines(bounds.size.height);
+            let shaped = area.update(app, |area, _| area.layout.take_lines_shaped());
+            let area = area.read(app);
+            assert_eq!(area.layout.content_len(), area.content().len());
+            assert_eq!(area.layout.line_starts().len(), 100_000);
+            assert!(
+                area.layout.max_width() > px(0.),
+                "the visible rows measured their width"
+            );
+            (shaped, visible)
+        });
+        assert_eq!(
+            cx.update(|_, app| area.read(app).layout.line_count()),
+            100_000,
+            "the line index covers the whole body"
+        );
+        assert!(
+            shaped <= visible.len() + 1,
+            "the first paint shaped {shaped} lines for {} visible rows",
+            visible.len()
+        );
+
+        let line_height = cx.update(|_, app| area.read(app).layout.line_height());
+        let middle = line_height * 50_000.;
+        cx.update(|_, app| {
+            area.update(app, |area, _| {
+                area.layout.set_scroll(point(px(0.), middle));
+            });
+        });
+        cx.update(|window, app| window.draw(app).clear());
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert_eq!(
+                area.layout.scroll().y,
+                middle,
+                "the numeric extent reaches a line nothing has shaped"
+            );
+            assert!(
+                area.layout.line(50_000).is_some(),
+                "the destination line is shaped"
+            );
+            assert!(
+                area.layout.line(25_000).is_none(),
+                "the rows in between stay unshaped"
+            );
+        });
+    }
+
+    /// Clicks land on the row and column the pointer covers, for both the first
+    /// and the last row the viewport paints.
+    #[gpui::test]
+    async fn clicking_the_first_and_last_visible_lines_maps_to_them(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new(long_body(200), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+
+        let (first, last) = cx.update(|_, app| {
+            let area = area.read(app);
+            let bounds = area.last_bounds.expect("the editor painted once");
+            let visible = area.layout.visible_lines(bounds.size.height);
+            let line_height = f32::from(area.layout.line_height());
+            let rows = (f32::from(bounds.size.height) / line_height).ceil().max(1.) as usize;
+            let last = (visible.start + rows - 1).min(area.layout.line_count() - 1);
+            (visible.start, last)
+        });
+        let first_offset = cx.update(|_, app| area.read(app).engine.line_start(first));
+        let last_offset = cx.update(|_, app| area.read(app).engine.line_start(last));
+
+        let position = cx.update(|_, app| pointer_at(area.read(app), first_offset));
+        press(&area, position, 1, false, cx);
+        cx.update(|_, app| {
+            assert_eq!(area.read(app).engine.cursor_offset(), first_offset);
+        });
+
+        let position = cx.update(|_, app| pointer_at(area.read(app), last_offset));
+        press(&area, position, 1, false, cx);
+        cx.update(|_, app| {
+            assert_eq!(
+                area.read(app).engine.cursor_offset(),
+                last_offset,
+                "the last painted row accepts a click"
+            );
+        });
+    }
+
+    /// A row the viewport has scrolled to but never painted still hit-tests
+    /// exactly: the line is shaped on demand for the pointer and for IME.
+    #[gpui::test]
+    async fn an_unpainted_row_is_shaped_on_demand_for_pointer_and_ime(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let area = cx.new(|cx| TextArea::new(long_body(500), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = reshaped_since_last_draw(&area, cx);
+
+        let (bounds, line_height, gutter) = cx.update(|_, app| {
+            let area = area.read(app);
+            (
+                area.last_bounds.expect("the editor painted once"),
+                area.layout.line_height(),
+                area.layout.gutter(),
+            )
+        });
+        // Jump the viewport without painting: the destination row is cold.
+        cx.update(|_, app| {
+            area.update(app, |area, _| {
+                area.layout.set_scroll(point(px(0.), line_height * 300.));
+            });
+        });
+        cx.update(|_, app| {
+            assert!(
+                area.read(app).layout.line(300).is_none(),
+                "the destination row has never been shaped"
+            );
+        });
+
+        let position = point(
+            bounds.left() + gutter + px(1.),
+            bounds.top() + line_height * 0.5,
+        );
+        press(&area, position, 1, false, cx);
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert!(
+                area.layout.line(300).is_some(),
+                "the pointer shaped the cold row"
+            );
+            assert_eq!(area.engine.cursor_offset(), area.engine.line_start(300));
+        });
+        assert_eq!(
+            reshaped_since_last_draw(&area, cx),
+            1,
+            "the click shaped only the row it hit"
+        );
+
+        // IME asks for the caret rectangle without a pointer or a paint first.
+        cx.update(|_, app| {
+            area.update(app, |area, _| {
+                area.layout.set_scroll(point(px(0.), line_height * 320.));
+            });
+        });
+        let ime_offset = cx.update(|_, app| area.read(app).engine.line_start(320));
+        cx.update(|_, app| {
+            assert!(area.read(app).layout.line(320).is_none());
+        });
+        let mapped = cx.update(|window, app| {
+            area.update(app, |area, cx| {
+                area.bounds_for_range(ime_offset..ime_offset, bounds, window, cx)
+            })
+        });
+        assert!(mapped.is_some(), "IME placement found the cold row");
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert!(
+                area.layout.line(320).is_some(),
+                "IME shaping filled the cold row"
+            );
+        });
+    }
+
+    fn reshaped_since_last_draw(
+        area: &Entity<TextArea>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> usize {
+        cx.update(|_, app| area.update(app, |area, _| area.layout.take_lines_shaped()))
+    }
+
+    /// A width change bakes into each shaped line's geometry, so the cache must
+    /// drop every line even though the text did not change.
+    #[gpui::test]
+    async fn a_width_change_reshapes_the_body(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new("{\"a\": 1}\n{\"b\": 2}", "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = reshaped_since_last_draw(&area, cx);
+
+        cx.simulate_resize(size(px(320.), px(240.)));
+        cx.update(|window, app| window.draw(app).clear());
+        assert_eq!(
+            reshaped_since_last_draw(&area, cx),
+            2,
+            "the width change reshaped both lines"
+        );
+    }
+
+    /// A variable resolving recolors its span without editing the text, so the
+    /// cache cannot key on the content generation alone.
+    #[gpui::test]
+    async fn a_variable_resolving_reshapes_the_body(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new("{{host}}\n{{token}}", "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = reshaped_since_last_draw(&area, cx);
+
+        cx.update(|_, app| {
+            area.update(app, |area, cx| {
+                area.set_variable_catalog(assist_catalog(), cx);
+            });
+        });
+        cx.update(|window, app| window.draw(app).clear());
+        let shaped = reshaped_since_last_draw(&area, cx);
+        assert!(shaped >= 1, "the resolved span was reshaped");
+        assert_eq!(
+            cx.update(|_, app| area.read(app).engine.generation()),
+            0,
+            "the text generation did not change"
+        );
+    }
+
+    struct RestoreTheme(theme::Mode);
+
+    impl Drop for RestoreTheme {
+        fn drop(&mut self) {
+            theme::set_mode(self.0);
+        }
+    }
+
+    /// Token colors come from the process-wide palette; a switch must reshape
+    /// the lines even though the text and selection are unchanged.
+    #[gpui::test]
+    async fn a_theme_switch_reshapes_the_body(cx: &mut gpui::TestAppContext) {
+        let _guard = crate::test_globals::InterfaceGuard::take();
+        let _restore = RestoreTheme(theme::mode());
+        theme::set_mode(theme::Mode::Dark);
+
+        let area = cx.new(|cx| TextArea::new("{\"a\": 1}\n{\"b\": 2}", "Body", cx));
+        cx.update(|app| {
+            area.update(app, |area, cx| area.set_syntax(Syntax::Json, cx));
+        });
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = reshaped_since_last_draw(&area, cx);
+
+        theme::set_mode(theme::Mode::Light);
+        cx.update(|window, app| window.draw(app).clear());
+        assert_eq!(
+            reshaped_since_last_draw(&area, cx),
+            2,
+            "the theme switch reshaped both lines"
+        );
+    }
+
+    /// Without a text or presentation change, the second frame reuses every
+    /// shaped line instead of rebuilding the viewport.
+    #[gpui::test]
+    async fn a_repaint_without_an_edit_shapes_no_lines(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new(long_body(200), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = reshaped_since_last_draw(&area, cx);
+
+        cx.update(|window, app| window.draw(app).clear());
+        assert_eq!(
+            reshaped_since_last_draw(&area, cx),
+            0,
+            "a repaint with nothing new shapes no lines"
+        );
+    }
+
+    /// A body that fits the viewport still visits every row, so the visible
+    /// range covers the document and paint offsets start at the first line.
+    #[gpui::test]
+    async fn a_short_document_paints_every_line_from_the_top(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new("one\ntwo\nthree", "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.draw(app).clear());
+
+        cx.update(|_, app| {
+            let area = area.read(app);
+            let bounds = area.last_bounds.expect("the editor painted once");
+            assert_eq!(
+                area.layout.visible_lines(bounds.size.height),
+                0..area.layout.line_count(),
+                "the visible range is the whole short document"
+            );
+            assert!(
+                (0..area.layout.line_count()).all(|line| area.layout.line(line).is_some()),
+                "every line of a short document is shaped"
+            );
         });
     }
 
@@ -2785,9 +2576,9 @@ mod tests {
 
         cx.update(|_, app| {
             let area = area.read(app);
-            assert_eq!(area.selected_range, 2..text.len());
+            assert_eq!(area.engine.selected_range, 2..text.len());
             assert!(
-                area.scroll.x > px(0.),
+                area.layout.scroll().x > px(0.),
                 "the drag scrolled toward the pointer"
             );
         });
@@ -2799,7 +2590,7 @@ mod tests {
         let cx = area_window(cx, area.clone());
         cx.update(|window, app| window.draw(app).clear());
 
-        let before = cx.update(|_, app| area.read(app).selected_range.clone());
+        let before = cx.update(|_, app| area.read(app).engine.selected_range.clone());
         let bounds = cx.update(|_, app| area.read(app).last_bounds.expect("painted"));
         let position = bounds.center();
         cx.update(|window, app| {
@@ -2819,8 +2610,8 @@ mod tests {
         cx.update(|window, app| window.draw(app).clear());
         cx.update(|_, app| {
             let area = area.read(app);
-            assert!(area.scroll.y > px(0.), "the wheel scrolled down");
-            assert_eq!(area.selected_range, before, "the caret did not move");
+            assert!(area.layout.scroll().y > px(0.), "the wheel scrolled down");
+            assert_eq!(area.engine.selected_range, before, "the caret did not move");
         });
     }
 
@@ -2877,7 +2668,10 @@ mod tests {
         });
         cx.update(|_, app| {
             let area = area.read(app);
-            assert!(area.scroll.y > px(0.), "the wheel scrolled the body");
+            assert!(
+                area.layout.scroll().y > px(0.),
+                "the wheel scrolled the body"
+            );
             assert_eq!(
                 area.hovered_variable(),
                 Some("host"),
@@ -2979,7 +2773,7 @@ mod tests {
         cx.update(|_, app| assert!(area.read(app).completion().is_some()));
         cx.simulate_keystrokes("left left left");
         cx.update(|_, app| {
-            assert_eq!(area.read(app).selected_range, 6..6);
+            assert_eq!(area.read(app).engine.selected_range, 6..6);
             assert!(
                 area.read(app).completion().is_none(),
                 "the caret no longer follows the opening braces"
@@ -2987,7 +2781,7 @@ mod tests {
         });
         cx.simulate_keystrokes("shift-left");
         cx.update(|_, app| {
-            assert_eq!(area.read(app).selected_range, 5..6);
+            assert_eq!(area.read(app).engine.selected_range, 5..6);
             assert!(
                 area.read(app).completion().is_none(),
                 "a selection closes the list"
@@ -3007,7 +2801,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), "line\n{{host}}");
-            assert_eq!(area.selected_range, 13..13);
+            assert_eq!(area.engine.selected_range, 13..13);
             assert!(area.completion().is_none());
         });
 
@@ -3017,7 +2811,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), "line\n{{ho");
-            assert_eq!(area.selected_range, 9..9);
+            assert_eq!(area.engine.selected_range, 9..9);
             assert!(area.completion().is_some());
         });
 
@@ -3030,7 +2824,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), "{{token}}");
-            assert_eq!(area.selected_range, 9..9);
+            assert_eq!(area.engine.selected_range, 9..9);
         });
 
         cx.simulate_keystrokes("secondary-z");
@@ -3038,7 +2832,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), "{{");
-            assert_eq!(area.selected_range, 2..2);
+            assert_eq!(area.engine.selected_range, 2..2);
             assert!(area.completion().is_none());
         });
     }
@@ -3070,7 +2864,7 @@ mod tests {
                 }]
             );
             assert_eq!(area.content(), json);
-            assert_eq!(area.selected_range, json.len()..json.len());
+            assert_eq!(area.engine.selected_range, json.len()..json.len());
         });
 
         let cross_line = "a\n{{mis\nsing}}\nb";
@@ -3125,7 +2919,7 @@ mod tests {
             let area = area.read(app);
             assert_eq!(area.missing_spans().len(), 1);
             assert_eq!(area.content(), text);
-            assert_eq!(area.selected_range, end..end);
+            assert_eq!(area.engine.selected_range, end..end);
         });
 
         cx.simulate_input("x");
@@ -3138,7 +2932,7 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert_eq!(area.content(), text);
-            assert_eq!(area.selected_range, end..end);
+            assert_eq!(area.engine.selected_range, end..end);
             assert_eq!(area.missing_spans().len(), 1);
         });
     }
@@ -3211,7 +3005,11 @@ mod tests {
         cx.update(|_, app| {
             let area = area.read(app);
             assert!(area.has_variable_assignment());
-            assert_eq!(area.selected_range, end..end, "the body caret stays put");
+            assert_eq!(
+                area.engine.selected_range,
+                end..end,
+                "the body caret stays put"
+            );
             assert_eq!(area.content(), text);
         });
 
