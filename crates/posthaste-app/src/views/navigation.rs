@@ -11,11 +11,26 @@
 //! `&LoadedCollection`. A history row keeps its index into
 //! `HistoryState::entries`, valid for the generation the cache was built at,
 //! so the view never searches for an entry by id.
+//!
+//! `SidebarRows` is the flat index the collection tree's uniform list walks.
+//! It is derived here, beside the collections it comes from, so a repaint only
+//! clones an `Rc`: neither the tree nor the index is rebuilt. The model also
+//! owns both scroll handles (the tree's uniform list and history's
+//! variable-height list) so the cache, the rows, and the scroll positions live
+//! in one place.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{ListAlignment, ListState, Pixels, UniformListScrollHandle, px};
+use posthaste_core::history::HistoryId;
 use posthaste_core::model::{FolderId, HttpMethod, RequestId, RequestProtocol};
 
 use crate::app::AppState;
-use crate::views::tree::{self, Reveal, RowRef};
+use crate::views::tree::{self, Reveal, RevealedItem, RowRef};
+
+/// Extra space above and below the history viewport that the list may measure.
+const HISTORY_LIST_OVERDRAW: Pixels = px(240.);
 
 /// One request row, owned so it outlives the tree that produced it.
 #[derive(Clone, Debug)]
@@ -62,11 +77,133 @@ pub(crate) struct NavCollection {
     pub rows: Vec<NavRow>,
 }
 
+/// One indexed row of the collection tree.
+///
+/// The variant carries every display field the row builder needs, so the list
+/// closure resolves only selection, rename, menu, move, and save state from
+/// `AppState`. The empty-request and empty-folder rows are items; the
+/// empty-collections and no-match blocks are not and stay outside the list.
+#[derive(Clone, Debug)]
+pub(crate) enum SidebarItem {
+    Collection {
+        slug: String,
+        name: String,
+        request_count: usize,
+        expanded: bool,
+    },
+    Folder {
+        slug: String,
+        folder: NavFolder,
+    },
+    Request {
+        slug: String,
+        request: NavRequest,
+    },
+    EmptyRequests {
+        slug: String,
+    },
+    EmptyFolder {
+        slug: String,
+        id: FolderId,
+        depth: usize,
+    },
+}
+
+impl SidebarItem {
+    /// Whether `reveal` names this row.
+    fn is_revealed_by(&self, reveal: &Reveal) -> bool {
+        match self {
+            SidebarItem::Collection { slug, .. } => {
+                reveal.slug == *slug && reveal.item == RevealedItem::Collection
+            }
+            SidebarItem::Folder { slug, folder } => {
+                reveal.slug == *slug && reveal.item == RevealedItem::Folder(folder.id)
+            }
+            SidebarItem::Request { slug, request } => {
+                reveal.slug == *slug && reveal.item == RevealedItem::Request(request.id)
+            }
+            SidebarItem::EmptyRequests { .. } | SidebarItem::EmptyFolder { .. } => false,
+        }
+    }
+}
+
+/// The collection tree as one flat, ordered index.
+#[derive(Default, Debug)]
+pub(crate) struct SidebarRows {
+    pub(crate) items: Vec<SidebarItem>,
+}
+
+impl SidebarRows {
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub(crate) fn item(&self, index: usize) -> Option<&SidebarItem> {
+        self.items.get(index)
+    }
+
+    /// The index of the row `reveal` names, if the index holds it.
+    pub(crate) fn index_of(&self, reveal: &Reveal) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|item| item.is_revealed_by(reveal))
+    }
+
+    /// Appends one collection and, when open, its child rows in paint order.
+    fn push_collection(&mut self, collection: &NavCollection, show_empty_folders: bool) {
+        self.items.push(SidebarItem::Collection {
+            slug: collection.slug.clone(),
+            name: collection.name.clone(),
+            request_count: collection.request_count,
+            expanded: collection.expanded,
+        });
+        if !collection.expanded {
+            return;
+        }
+        if collection.rows.is_empty() {
+            self.items.push(SidebarItem::EmptyRequests {
+                slug: collection.slug.clone(),
+            });
+            return;
+        }
+        for row in &collection.rows {
+            match row {
+                NavRow::Folder(folder) => {
+                    self.items.push(SidebarItem::Folder {
+                        slug: collection.slug.clone(),
+                        folder: folder.clone(),
+                    });
+                    // An expanded folder with nothing beneath it gets a quiet
+                    // child row; it is suppressed while a search is active,
+                    // where only the match itself should show.
+                    if show_empty_folders && folder.expanded && !folder.has_children {
+                        self.items.push(SidebarItem::EmptyFolder {
+                            slug: collection.slug.clone(),
+                            id: folder.id,
+                            depth: folder.depth + 1,
+                        });
+                    }
+                }
+                NavRow::Request(request) => self.items.push(SidebarItem::Request {
+                    slug: collection.slug.clone(),
+                    request: request.clone(),
+                }),
+            }
+        }
+    }
+}
+
 /// One entry of the history list.
 #[derive(Clone, Debug)]
 pub(crate) struct NavHistoryRow {
     /// Index into `HistoryState::entries` at the cached generation.
     pub index: usize,
+    /// The entry's identifier, so the list can reveal a selected row by index.
+    pub id: HistoryId,
     /// The linked saved request's current name, when the entry links to one.
     pub linked_name: Option<String>,
 }
@@ -87,44 +224,175 @@ struct NavigationKey {
 }
 
 /// The sidebar's cached rows, rebuilt only when [`NavigationKey`] moves.
-#[derive(Default)]
 pub(crate) struct NavigationModel {
     key: Option<NavigationKey>,
     collections: Vec<NavCollection>,
     /// Collections the section holds for the current filter, whether or not
     /// the section is open.
     collection_count: usize,
-    history: Vec<NavHistoryRow>,
+    /// The flat collection-tree index the uniform list walks.
+    rows: Rc<SidebarRows>,
+    /// The uniform list's scroll handle. Reveal scrolls it by row index.
+    tree_scroll: UniformListScrollHandle,
+    /// The matching history entries, shared with the history list closure.
+    history: Rc<Vec<NavHistoryRow>>,
+    /// The variable-height history list.
+    history_list: ListState,
     /// Entries the history section holds for the current filter, whether or
     /// not the section is open.
     history_count: usize,
+    /// The reveal value the tree last scrolled to, so a repaint does not move
+    /// the list again.
+    revealed_tree: Cell<Option<Reveal>>,
+    /// The selected history entry the list last scrolled to.
+    revealed_history: Cell<Option<HistoryId>>,
+    /// Rows the sidebar's list builders constructed. Test-only readers compare
+    /// deltas; construction itself stays free of index-walk work.
+    rows_built: Rc<Cell<u64>>,
     /// Refreshes that walked the collections tree. Test-only, so a collapsed
     /// section can prove it does no tree work.
     #[cfg(test)]
     walks: u64,
+    /// Refreshes that rebuilt the flat index. Test-only, so a repaint can
+    /// prove it reads the cached index instead of walking the tree again.
+    #[cfg(test)]
+    index_builds: u64,
+}
+
+impl Default for NavigationModel {
+    fn default() -> Self {
+        Self {
+            key: None,
+            collections: Vec::new(),
+            collection_count: 0,
+            rows: Rc::new(SidebarRows::default()),
+            tree_scroll: UniformListScrollHandle::new(),
+            history: Rc::from(Vec::new()),
+            // Measure every row once when the list is (re)built. Rows are
+            // variable height, and a selected offscreen entry can only be
+            // revealed exactly when every row's height is known. The one-time
+            // measurement is bounded by history retention (default 500, max
+            // 5000) and happens only on list (re)build; later repaints
+            // construct only the visible window and its overdraw.
+            history_list: ListState::new(0, ListAlignment::Top, HISTORY_LIST_OVERDRAW)
+                .measure_all(),
+            history_count: 0,
+            revealed_tree: Cell::new(None),
+            revealed_history: Cell::new(None),
+            rows_built: Rc::new(Cell::new(0)),
+            #[cfg(test)]
+            walks: 0,
+            #[cfg(test)]
+            index_builds: 0,
+        }
+    }
 }
 
 impl NavigationModel {
-    pub(crate) fn collections(&self) -> &[NavCollection] {
-        &self.collections
-    }
-
     pub(crate) fn collection_count(&self) -> usize {
         self.collection_count
     }
 
+    /// The flat collection-tree index. Cloning the handle is O(1), so a
+    /// repaint never copies the rows.
+    pub(crate) fn rows(&self) -> &Rc<SidebarRows> {
+        &self.rows
+    }
+
+    pub(crate) fn tree_scroll(&self) -> UniformListScrollHandle {
+        self.tree_scroll.clone()
+    }
+
     pub(crate) fn history(&self) -> &[NavHistoryRow] {
-        &self.history
+        self.history.as_slice()
+    }
+
+    /// The matching history rows, shared with the list closure.
+    pub(crate) fn history_rows(&self) -> Rc<Vec<NavHistoryRow>> {
+        Rc::clone(&self.history)
+    }
+
+    pub(crate) fn history_scroll(&self) -> ListState {
+        self.history_list.clone()
     }
 
     pub(crate) fn history_count(&self) -> usize {
         self.history_count
     }
 
+    /// The counter the sidebar's row builders increment. Test-only readers
+    /// take deltas around a frame.
+    pub(crate) fn rows_built_counter(&self) -> Rc<Cell<u64>> {
+        Rc::clone(&self.rows_built)
+    }
+
+    /// The tree index to reveal, returned once per reveal value.
+    ///
+    /// The handles and the last revealed value live here, so a later repaint
+    /// with the same reveal does not move the list. Resetting or revealing a
+    /// different item makes the next call scroll again.
+    pub(crate) fn take_tree_reveal(&self, reveal: Option<&Reveal>) -> Option<usize> {
+        let previous = self.revealed_tree.replace(reveal.cloned());
+        if previous.as_ref() == reveal {
+            return None;
+        }
+        reveal.and_then(|reveal| self.rows.index_of(reveal))
+    }
+
+    /// The history index to reveal, returned once per selected entry.
+    ///
+    /// A selection the current filter hides is not consumed: the stored value
+    /// stays put, so clearing the filter can still reveal it later.
+    pub(crate) fn take_history_reveal(&self, selected: Option<HistoryId>) -> Option<usize> {
+        let id = selected?;
+        let index = self.history.iter().position(|row| row.id == id)?;
+        if self.revealed_history.get() == Some(id) {
+            return None;
+        }
+        self.revealed_history.set(Some(id));
+        Some(index)
+    }
+
     /// Tree walks performed so far. Test-only.
     #[cfg(test)]
     pub(crate) fn walks(&self) -> u64 {
         self.walks
+    }
+
+    /// Index builds performed so far. Test-only.
+    #[cfg(test)]
+    pub(crate) fn index_builds(&self) -> u64 {
+        self.index_builds
+    }
+
+    /// Rows both lists have constructed so far. Test-only.
+    #[cfg(test)]
+    pub(crate) fn rows_built(&self) -> u64 {
+        self.rows_built.get()
+    }
+
+    /// The tree list's current vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn tree_offset(&self) -> Pixels {
+        self.tree_scroll.0.borrow().base_handle.offset().y
+    }
+
+    /// The history list's current vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn history_offset(&self) -> Pixels {
+        self.history_list.scroll_px_offset_for_scrollbar().y
+    }
+
+    /// The history list's largest vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn history_max_offset(&self) -> Pixels {
+        self.history_list.max_offset_for_scrollbar().height
+    }
+
+    /// Clears the row-build counter. Test-only, so a repaint can be measured.
+    #[cfg(test)]
+    pub(crate) fn reset_rows_built(&self) {
+        self.rows_built.set(0);
     }
 
     /// Rebuilds the rows when the key no longer matches.
@@ -187,7 +455,19 @@ impl NavigationModel {
             self.collection_count = app.workspace().collections.len();
         }
 
-        self.history.clear();
+        // The flat index follows the same visible rows the tree built, in the
+        // same order: a collection, then its folders and requests, with the
+        // empty child rows in the positions they paint.
+        let mut rows = SidebarRows::default();
+        if show_collections {
+            let show_empty_folders = filter.is_empty();
+            for collection in &self.collections {
+                rows.push_collection(collection, show_empty_folders);
+            }
+        }
+        self.rows = Rc::new(rows);
+
+        let mut history = Vec::new();
         if show_history {
             // The linked request is resolved once per entry, not once per
             // rendered row: the resolution compares a whole spec, and the
@@ -208,14 +488,67 @@ impl NavigationModel {
                         .as_deref()
                         .is_some_and(|name| name.to_lowercase().contains(&filter));
                 if matches {
-                    self.history.push(NavHistoryRow { index, linked_name });
+                    history.push(NavHistoryRow {
+                        index,
+                        id: entry.id,
+                        linked_name,
+                    });
                 }
             }
-            self.history_count = self.history.len();
+            self.history_count = history.len();
         } else {
             self.history_count = app.history().entries.len();
         }
 
+        // The list's measured rows must follow the count, or a deleted entry
+        // leaves a phantom row and a new one is never measured. The old and new
+        // id sequences share a prefix and a suffix around whatever changed, so
+        // an append, a prepend, a filter hiding a middle entry, or a middle
+        // deletion splices only the difference. Unchanged rows keep their
+        // measurements.
+        //
+        // A closed section empties the list, and reopening it splices in rows
+        // with no measured height. That transition resets the list instead, so
+        // the next paint measures every row and the scrollbar and an offscreen
+        // reveal stay exact.
+        let old_history = self.history.as_slice();
+        let old_len = old_history.len();
+        let previous = self.history_list.item_count();
+        let next = history.len();
+        if previous != old_len {
+            // The list diverged from the rows (an earlier transition reset one
+            // but not the other); rebuild the count rather than splice.
+            self.history_list.reset(next);
+        } else if next == 0 {
+            self.history_list.reset(0);
+        } else if previous == 0 {
+            self.history_list.reset(next);
+        } else {
+            let prefix = old_history
+                .iter()
+                .zip(&history)
+                .take_while(|(old, new)| old.id == new.id)
+                .count();
+            let shared = old_len.min(next) - prefix;
+            let suffix = old_history
+                .iter()
+                .rev()
+                .zip(history.iter().rev())
+                .take(shared)
+                .take_while(|(old, new)| old.id == new.id)
+                .count();
+            let removed = old_len - prefix - suffix;
+            let added = next - prefix - suffix;
+            if removed != 0 || added != 0 {
+                self.history_list.splice(prefix..old_len - suffix, added);
+            }
+        }
+        self.history = Rc::new(history);
+
+        #[cfg(test)]
+        {
+            self.index_builds += 1;
+        }
         self.key = Some(key);
     }
 }

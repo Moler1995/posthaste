@@ -3850,6 +3850,63 @@ impl AppState {
         self.navigation.borrow().walks()
     }
 
+    /// Refreshes that rebuilt the cached flat index. Test-only, so a repaint
+    /// can prove it did not walk the tree again.
+    #[cfg(test)]
+    pub(crate) fn navigation_index_builds(&self) -> u64 {
+        self.navigation.borrow().index_builds()
+    }
+
+    /// Labels of the cached flat index in paint order. Test-only, so the list
+    /// can be compared with the rows the tree would have produced.
+    #[cfg(test)]
+    pub(crate) fn navigation_row_labels(&self) -> Vec<String> {
+        use crate::views::navigation::SidebarItem;
+        self.navigation
+            .borrow()
+            .rows()
+            .items
+            .iter()
+            .map(|item| match item {
+                SidebarItem::Collection { name, .. } => name.clone(),
+                SidebarItem::Folder { folder, .. } => folder.name.clone(),
+                SidebarItem::Request { request, .. } => request.name.clone(),
+                SidebarItem::EmptyRequests { slug } => format!("empty-requests:{slug}"),
+                SidebarItem::EmptyFolder { slug, id, .. } => format!("empty-folder:{slug}:{id}"),
+            })
+            .collect()
+    }
+
+    /// Rows the sidebar's list builders have constructed. Test-only.
+    #[cfg(test)]
+    pub(crate) fn navigation_rows_built(&self) -> u64 {
+        self.navigation.borrow().rows_built()
+    }
+
+    /// The collection tree's vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn navigation_tree_offset(&self) -> gpui::Pixels {
+        self.navigation.borrow().tree_offset()
+    }
+
+    /// The history list's vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn navigation_history_offset(&self) -> gpui::Pixels {
+        self.navigation.borrow().history_offset()
+    }
+
+    /// The history list's largest vertical scroll offset. Test-only.
+    #[cfg(test)]
+    pub(crate) fn navigation_history_max_offset(&self) -> gpui::Pixels {
+        self.navigation.borrow().history_max_offset()
+    }
+
+    /// Clears the row-build counter. Test-only.
+    #[cfg(test)]
+    pub(crate) fn navigation_reset_rows_built(&self) {
+        self.navigation.borrow().reset_rows_built();
+    }
+
     /// The history entries the cached model shows, in display order.
     /// Test-only, so a search can be compared with the rows the sidebar paints.
     #[cfg(test)]

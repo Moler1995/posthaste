@@ -9605,7 +9605,11 @@ mod tests {
             .debug_bounds(leaked(format!("folder-row-{}-rail-1", auth.id)))
             .expect("the first-level folder connects to the collection");
         assert_eq!(auth_rail.size.width, px(1.));
-        assert_eq!(auth_rail.size.height, crate::metrics::layout::ROW + px(2.));
+        assert_eq!(
+            auth_rail.size.height,
+            crate::metrics::layout::TREE_ROW,
+            "a rail spans its row plus the gap the uniform item adds"
+        );
         let auth_chevron = cx
             .debug_bounds(leaked(format!("folder-toggle-{}", auth.id)))
             .expect("folder chevron");
@@ -10236,22 +10240,32 @@ mod tests {
         let first = store
             .create_collection("Collection 0", 0)
             .expect("collection");
+        let mut still_visible = None;
         for index in 1..40 {
-            store
+            let created = store
                 .create_collection(&format!("Collection {index}"), index)
                 .expect("collection");
+            // A row far enough down the list to survive the scroll but near
+            // enough not to start below the fold.
+            if index == 8 {
+                still_visible = Some(created.id.clone());
+            }
         }
+        let still_visible = still_visible.expect("the eighth collection");
 
         let shell_store = store.clone();
         let (view, cx) =
             cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
-        let _state = shell_state(&view, cx);
-        let first_selector = leaked(format!("collection-row-{}", first.id));
+        let state = shell_state(&view, cx);
+        // The list, not the tree, scrolls; the first row leaves the viewport.
+        let visible_selector = leaked(format!("collection-row-{still_visible}"));
 
         let sidebar = cx.debug_bounds("sidebar").expect("sidebar");
         let request = cx.debug_bounds("request-region").expect("request region");
         let response = cx.debug_bounds("response-region").expect("response region");
-        let first_row = cx.debug_bounds(first_selector).expect("first collection");
+        let visible_row = cx
+            .debug_bounds(visible_selector)
+            .expect("a collection below the top");
 
         cx.simulate_event(ScrollWheelEvent {
             position: sidebar.center(),
@@ -10261,12 +10275,23 @@ mod tests {
         });
         redraw(cx);
 
-        let first_row_after = cx
-            .debug_bounds(first_selector)
-            .expect("first collection after scroll");
         assert!(
-            first_row_after.origin.y < first_row.origin.y,
+            cx.update(|_, app| state.read(app).navigation_tree_offset()) < px(0.),
+            "the tree's uniform list carries the scroll"
+        );
+        let visible_row_after = cx
+            .debug_bounds(visible_selector)
+            .expect("a collection below the top after scroll");
+        assert!(
+            visible_row_after.origin.y < visible_row.origin.y,
             "the sidebar tree scrolled"
+        );
+        // The first row left the viewport, so its stale debug bounds are not a
+        // reliable absence check; the index still holds it for the list.
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_row_labels().first().cloned()),
+            Some(first.name.clone()),
+            "the offscreen first row stays in the index"
         );
         assert_eq!(
             cx.debug_bounds("request-region").expect("request region"),
@@ -14178,6 +14203,464 @@ mod tests {
             settings_preferences(&state, cx).requests.timeout_seconds,
             45,
             "the changed value stays in effect despite the failure"
+        );
+    }
+
+    #[gpui::test]
+    async fn sidebar_index_matches_tree_order_and_is_not_rebuilt_on_repaint(
+        cx: &mut TestAppContext,
+    ) {
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let demo = store.create_collection("Demo", 0).expect("demo");
+        let auth = add_folder(&store, &demo.id, None, "Auth");
+        let _root = store.create_request(&demo.id, "Root").expect("root");
+        let empty = store.create_collection("Empty", 1).expect("empty");
+        let _collapsed = store.create_collection("Collapsed", 2).expect("collapsed");
+
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        expand_tree(&state, cx, &demo.id, &[auth.id]);
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.expand_collection(&empty.id);
+                cx.notify();
+            });
+        });
+        redraw(cx);
+
+        let labels = cx.update(|_, app| state.read(app).navigation_row_labels());
+        assert_eq!(
+            labels,
+            vec![
+                "Demo".to_owned(),
+                "Auth".to_owned(),
+                format!("empty-folder:{}:{}", demo.id, auth.id),
+                "Root".to_owned(),
+                "Empty".to_owned(),
+                format!("empty-requests:{}", empty.id),
+                "Collapsed".to_owned(),
+            ],
+            "the flat index follows paint order and holds the empty child rows"
+        );
+
+        // The row builder runs for the painted window, not for the index walk.
+        cx.update(|_, app| state.read(app).navigation_reset_rows_built());
+        redraw(cx);
+        assert!(
+            cx.update(|_, app| state.read(app).navigation_rows_built()) > 0,
+            "painting the tree constructs its visible rows"
+        );
+
+        let builds = cx.update(|_, app| state.read(app).navigation_index_builds());
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_index_builds()),
+            builds,
+            "a repaint reads the cached index instead of rebuilding it"
+        );
+    }
+
+    #[gpui::test]
+    async fn tree_rows_share_one_pitch_and_keep_it_during_rename_and_menu(cx: &mut TestAppContext) {
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let demo = store.create_collection("Demo", 0).expect("demo");
+        let auth = add_folder(&store, &demo.id, None, "Auth");
+        let login = store
+            .create_request_in(&demo.id, "Login", Some(auth.id))
+            .expect("login");
+        let empty = store.create_collection("Empty", 1).expect("empty");
+
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        expand_tree(&state, cx, &demo.id, &[auth.id]);
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.expand_collection(&empty.id);
+                cx.notify();
+            });
+        });
+        redraw(cx);
+
+        let bounds = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing debug selector {selector}"))
+        };
+        let collection_selector = leaked(format!("collection-row-{}", demo.id));
+        let folder_selector = leaked(format!("folder-row-{}", auth.id));
+        let request_selector = leaked(format!("request-row-{}", login.id));
+        let empty_selector = leaked(format!("empty-requests-{}", empty.id));
+
+        let collection = bounds(cx, collection_selector);
+        let folder = bounds(cx, folder_selector);
+        let request = bounds(cx, request_selector);
+        let empty_requests = bounds(cx, empty_selector);
+        for (selector, row) in [
+            (collection_selector, collection),
+            (folder_selector, folder),
+            (request_selector, request),
+            (empty_selector, empty_requests),
+        ] {
+            assert_eq!(
+                row.size.height,
+                crate::metrics::layout::ROW,
+                "{selector} keeps its 30 px content height"
+            );
+        }
+        assert_eq!(
+            folder.origin.y - collection.origin.y,
+            crate::metrics::layout::TREE_ROW,
+            "the uniform item adds the gap below each row"
+        );
+        assert_eq!(
+            request.origin.y - folder.origin.y,
+            crate::metrics::layout::TREE_ROW
+        );
+
+        // An inline rename and an open row menu change a row's contents, not
+        // its measured pitch.
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.begin_rename(
+                    crate::workspace::RenameTarget::Request {
+                        slug: demo.id.clone(),
+                        id: login.id,
+                    },
+                    cx,
+                );
+            });
+        });
+        redraw(cx);
+        assert_eq!(
+            bounds(cx, request_selector).size.height,
+            crate::metrics::layout::ROW,
+            "a renaming row keeps the uniform height"
+        );
+        cx.update(|_, app| {
+            state.update(app, |state, cx| state.cancel_rename(cx));
+        });
+        redraw(cx);
+
+        open_row_menu(cx, leaked(format!("row-menu-folder-{}", auth.id)));
+        assert_eq!(
+            bounds(cx, folder_selector).size.height,
+            crate::metrics::layout::ROW,
+            "a row with its menu open keeps the uniform height"
+        );
+    }
+
+    #[gpui::test]
+    async fn sidebar_reveals_a_collection_below_the_fold_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        for index in 0..30 {
+            store
+                .create_collection(&format!("Collection {index}"), index)
+                .expect("collection");
+        }
+
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_tree_offset()),
+            px(0.),
+            "the tree starts at its top"
+        );
+
+        new_collection(cx);
+        redraw(cx);
+
+        let created = cx
+            .update(|_, app| {
+                state
+                    .read(app)
+                    .workspace()
+                    .collections
+                    .last()
+                    .map(|entry| entry.collection.id.clone())
+            })
+            .expect("the collection is created");
+        let offset = cx.update(|_, app| state.read(app).navigation_tree_offset());
+        assert!(
+            offset < px(0.),
+            "creating a below-the-fold collection scrolls it into view"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("collection-row-{created}")))
+                .is_some(),
+            "the revealed row is painted"
+        );
+
+        // The reveal value did not change, so a later repaint leaves the list
+        // where the first scroll put it.
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_tree_offset()),
+            offset,
+            "the reveal scrolls the tree once, not on every repaint"
+        );
+    }
+
+    #[gpui::test]
+    async fn history_rows_measure_their_three_lines_and_empty_states_stay_outside(
+        cx: &mut TestAppContext,
+    ) {
+        use bytes::Bytes;
+        use posthaste_core::history::HistoryEntry;
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        let _guard = crate::test_globals::InterfaceGuard::take();
+        let previous_font = crate::metrics::editor_font_size();
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        click(cx, "history-toggle");
+        redraw(cx);
+
+        assert!(cx.debug_bounds("history-empty").is_some());
+        cx.update(|_, app| state.read(app).navigation_reset_rows_built());
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_rows_built()),
+            0,
+            "the empty state is not a list item"
+        );
+
+        let mut spec = RequestSpec::new("Ping");
+        spec.method = HttpMethod::Get;
+        spec.url = "http://example.test/alpha".to_owned();
+        let entry = HistoryEntry::completed(
+            1_700_000_000_000,
+            &spec,
+            &ResponseRecord {
+                status: 200,
+                headers: Vec::new(),
+                body: Bytes::copy_from_slice(b"{}"),
+                duration: Duration::from_millis(5),
+                truncated: false,
+                cookies: Vec::new(),
+            },
+        );
+        let id = entry.id;
+        cx.update(|_, app| {
+            state.update(app, |state, _| state.record_test_history(entry));
+        });
+        redraw(cx);
+
+        let row_selector = leaked(format!("history-row-{id}"));
+        let url_selector = leaked(format!("history-url-{id}"));
+        let row = cx.debug_bounds(row_selector).expect("the history row");
+        let url = cx.debug_bounds(url_selector).expect("the row's URL line");
+        assert!(
+            row.size.height > crate::metrics::layout::TREE_ROW,
+            "a three-line history row is taller than a tree row"
+        );
+        assert!(
+            url.origin.y + url.size.height <= row.origin.y + row.size.height,
+            "the URL line stays inside the measured row"
+        );
+        let default_height = row.size.height;
+
+        // A larger editor font grows the code line; the row measures its new
+        // height instead of clipping the three lines.
+        crate::metrics::set_editor_font_size(16);
+        redraw(cx);
+        let taller = cx
+            .debug_bounds(row_selector)
+            .expect("the measured history row");
+        assert!(
+            taller.size.height > default_height,
+            "the row measures the taller code line instead of clipping it"
+        );
+        let taller_url = cx.debug_bounds(url_selector).expect("the taller URL line");
+        assert!(
+            taller_url.origin.y + taller_url.size.height <= taller.origin.y + taller.size.height,
+            "the URL line stays inside the taller row"
+        );
+
+        set_sidebar_search(&state, cx, "missing");
+        assert!(cx.debug_bounds("history-no-matches").is_some());
+        cx.update(|_, app| state.read(app).navigation_reset_rows_built());
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_rows_built()),
+            0,
+            "the no-match state is not a list item"
+        );
+
+        crate::metrics::set_editor_font_size(previous_font);
+    }
+
+    #[gpui::test]
+    async fn history_selection_and_delete_work_outside_the_initial_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        use bytes::Bytes;
+        use posthaste_core::history::HistoryEntry;
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        click(cx, "history-toggle");
+
+        let entries: Vec<HistoryEntry> = (0..12u64)
+            .map(|index| {
+                let mut spec = RequestSpec::new("Ping");
+                spec.method = HttpMethod::Get;
+                spec.url = format!("http://example.test/entry-{index}");
+                HistoryEntry::completed(
+                    1_700_000_000_000 + index,
+                    &spec,
+                    &ResponseRecord {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: Bytes::copy_from_slice(b"{}"),
+                        duration: Duration::from_millis(5),
+                        truncated: false,
+                        cookies: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let ids: Vec<_> = entries.iter().map(|entry| entry.id).collect();
+        cx.update(|_, app| {
+            state.update(app, |state, _| {
+                for entry in entries {
+                    state.record_test_history(entry);
+                }
+            });
+        });
+        redraw(cx);
+
+        // History sorts newest first, so the earliest entry starts below the
+        // 200 px band.
+        let offscreen = ids[0];
+        let row_selector = leaked(format!("history-row-{offscreen}"));
+        assert!(
+            cx.debug_bounds(row_selector).is_none(),
+            "the earliest entry starts outside the initial viewport"
+        );
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_history_offset()),
+            px(0.),
+            "the list starts at its top"
+        );
+
+        cx.update(|_, app| {
+            state.update(app, |state, cx| state.select_history(offscreen, cx));
+        });
+        redraw(cx);
+
+        let revealed = cx.update(|_, app| state.read(app).navigation_history_offset());
+        assert!(
+            revealed < px(0.),
+            "selecting an offscreen entry scrolls it into view"
+        );
+        assert!(
+            cx.debug_bounds(row_selector).is_some(),
+            "the selected offscreen row is painted"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("history-selected-{offscreen}")))
+                .is_some(),
+            "selection follows the offscreen row"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("history-delete-{offscreen}")))
+                .is_some(),
+            "the offscreen row keeps its delete control"
+        );
+
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_history_offset()),
+            revealed,
+            "the selection reveals once, not on every repaint"
+        );
+
+        // Deleting the older entries shrinks the list under the scroll offset,
+        // which must clamp into the new range.
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                for id in ids.iter().take(6) {
+                    state.delete_history(*id, cx);
+                }
+            });
+        });
+        redraw(cx);
+        let offset = cx.update(|_, app| state.read(app).navigation_history_offset());
+        let max = cx.update(|_, app| state.read(app).navigation_history_max_offset());
+        assert!(
+            offset >= -max,
+            "the scroll offset is clamped after entries are deleted"
+        );
+    }
+
+    #[gpui::test]
+    async fn history_builds_a_bounded_window_for_500_entries(cx: &mut TestAppContext) {
+        use bytes::Bytes;
+        use posthaste_core::history::HistoryEntry;
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+
+        let entries: Vec<HistoryEntry> = (0..500u64)
+            .map(|index| {
+                let mut spec = RequestSpec::new("Ping");
+                spec.method = HttpMethod::Get;
+                spec.url = format!("http://example.test/entry-{index}");
+                HistoryEntry::completed(
+                    1_700_000_000_000 + index,
+                    &spec,
+                    &ResponseRecord {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: Bytes::copy_from_slice(b"{}"),
+                        duration: Duration::from_millis(5),
+                        truncated: false,
+                        cookies: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        cx.update(|_, app| {
+            state.update(app, |state, _| {
+                for entry in entries {
+                    state.record_test_history(entry);
+                }
+            });
+        });
+        click(cx, "history-toggle");
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("section-count-history-500").is_some(),
+            "the header counts every entry"
+        );
+
+        // The first paint measures the whole list once so the scrollbar and an
+        // offscreen reveal are exact. A repaint after that constructs only the
+        // rows the list measures: the 200 px band plus its overdraw, not all
+        // 500 entries.
+        cx.update(|_, app| state.read(app).navigation_reset_rows_built());
+        redraw(cx);
+        let built = cx.update(|_, app| state.read(app).navigation_rows_built());
+        assert!(built > 0, "the visible rows are built");
+        assert!(
+            built < 100,
+            "only the viewport and overdraw are constructed (built {built})"
         );
     }
 }
