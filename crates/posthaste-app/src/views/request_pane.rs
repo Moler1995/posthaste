@@ -433,9 +433,15 @@ pub(crate) fn save_picker_modal(state: Entity<AppState>, app: &AppState) -> AnyE
             .into_any_element()
     };
 
-    let cancel_state = state.clone();
-    let submit_state = state.clone();
-    let close_state = state.clone();
+    let dismiss_state = state.clone();
+    let dismiss = std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+        dismiss_state.update(cx, |state, cx| {
+            state.close_save_picker(cx);
+            state.focus_active_editor(window, cx);
+        });
+    });
+    let cancel = dismiss.clone();
+    let submit_state = state;
     let name_field: AnyElement = match app.save_picker_name() {
         Some(input) => div()
             .debug_selector(|| "save-picker-name".to_owned())
@@ -453,72 +459,37 @@ pub(crate) fn save_picker_modal(state: Entity<AppState>, app: &AppState) -> AnyE
             .child(message.to_owned())
     });
     let (title, subtitle) = save_picker_copy(app);
-    let panel = div()
-        .id("save-picker")
-        .debug_selector(|| "save-picker".to_owned())
-        .flex()
-        .flex_col()
-        .gap(space::S12)
-        .w(px(380.))
-        .max_h(px(520.))
-        .p(space::S16)
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .on_click(|_, _, cx| cx.stop_propagation())
-        // Every window-level dialog dismisses the same way: the glyph in its
-        // top-right corner. The footer's Cancel stays the labelled choice.
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(space::S12)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_role(type_role::PANE_TITLE)
-                                .text_color(theme::text::primary())
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .text_role(type_role::META)
-                                .text_color(theme::text::tertiary())
-                                .child(subtitle),
-                        ),
-                )
-                .child(
-                    super::ui::close_button("save-picker-close")
-                        .debug_selector(|| "save-picker-close".to_owned())
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            close_state.update(cx, |state, cx| state.close_save_picker(cx));
-                        }),
-                ),
-        )
-        .child(div().h(px(1.)).bg(theme::border::subtle()))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_role(type_role::MICRO)
-                        .text_color(theme::text::tertiary())
-                        .child(i18n::t(Key::PlaceholderName)),
-                )
-                .child(name_field),
-        )
-        .child(list)
-        .children(error_line)
-        .child(
+
+    let mut dialog = super::ui::modal(
+        "save-picker",
+        crate::metrics::modal::NARROW,
+        move |window, cx| dismiss(window, cx),
+    )
+    .max_height(crate::metrics::modal::TALL_BODY)
+    .title(title)
+    .subtitle(subtitle)
+    .body(div().h(px(1.)).bg(theme::border::subtle()))
+    .body(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_role(type_role::MICRO)
+                    .text_color(theme::text::tertiary())
+                    .child(i18n::t(Key::PlaceholderName)),
+            )
+            .child(name_field),
+    )
+    .body(list);
+
+    if let Some(error) = error_line {
+        dialog = dialog.body(error);
+    }
+
+    dialog
+        .actions(
             div()
                 .flex()
                 .items_center()
@@ -527,9 +498,9 @@ pub(crate) fn save_picker_modal(state: Entity<AppState>, app: &AppState) -> AnyE
                 .child(
                     super::ui::overlay_button("save-picker-cancel", i18n::t(Key::CommonCancel))
                         .debug_selector(|| "save-picker-cancel".to_owned())
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            cancel_state.update(cx, |state, cx| state.close_save_picker(cx));
+                            (cancel)(window, cx);
                         }),
                 )
                 .child(
@@ -544,31 +515,8 @@ pub(crate) fn save_picker_modal(state: Entity<AppState>, app: &AppState) -> AnyE
                         submit_state.update(cx, |state, cx| state.submit_save_picker(cx));
                     }),
                 ),
-        );
-
-    let backdrop_state = state.clone();
-    gpui::deferred(
-        div()
-            .id("save-picker-backdrop")
-            .debug_selector(|| "save-picker-backdrop".to_owned())
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.45))
-            .on_click(move |_, _, cx| {
-                backdrop_state.update(cx, |state, cx| state.close_save_picker(cx));
-            })
-            // The backdrop is a wall, not just a dimmer: presses inside the
-            // dialog's padding must not reach the panes behind it.
-            .occlude()
-            .child(panel),
-    )
-    .with_priority(100)
-    .into_any_element()
+        )
+        .into_any_element()
 }
 
 /// The script preview as a modal dialog.
@@ -590,65 +538,28 @@ pub(crate) fn script_modal(editor: Entity<RequestEditor>, cx: &App) -> Option<An
     // The Cookies dialog's own dimmer sits above this one; two dim layers
     // would make the window nearly black. With the dialog open the preview
     // keeps its panel but lets the dialog supply the dimming.
-    let dimmed = !view.cookies_open();
+    let backdrop = if view.cookies_open() {
+        theme::interaction::transparent()
+    } else {
+        theme::surface::scrim()
+    };
 
-    let escape_editor = editor.clone();
-    let backdrop_editor = editor;
-
-    let panel = div()
-        .id("script-preview-dialog")
-        .debug_selector(|| "script-preview-dialog".to_owned())
-        .track_focus(&focus)
-        .on_key_down(move |event, _, cx| {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                escape_editor.update(cx, |editor, cx| editor.close_script_preview(cx));
-            }
-        })
-        .flex()
-        .flex_col()
-        .gap(space::S12)
-        .w(px(720.))
-        .max_w(gpui::relative(0.92))
-        .h(px(520.))
-        .max_h(gpui::relative(0.9))
-        .p(space::S16)
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .on_click(|_, _, cx| cx.stop_propagation())
+    let dismiss_editor = editor;
+    Some(
+        super::ui::modal(
+            "script-preview-dialog",
+            crate::metrics::modal::WIDE,
+            move |_, cx| {
+                dismiss_editor.update(cx, |editor, cx| editor.close_script_preview(cx));
+            },
+        )
+        .backdrop_color(backdrop)
+        .height(crate::metrics::modal::TALL_BODY)
+        .focus(&focus)
         // The title and the dialog's actions are one bar, drawn by the preview
         // itself: a header row holding only Close left the controls split over
         // two lines and spent height the code could use.
-        .child(preview);
-
-    Some(
-        gpui::deferred(
-            div()
-                .id("script-preview-backdrop")
-                .debug_selector(|| "script-preview-backdrop".to_owned())
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(if dimmed {
-                    theme::surface::scrim()
-                } else {
-                    theme::interaction::transparent()
-                })
-                .on_click(move |_, _, cx| {
-                    backdrop_editor.update(cx, |editor, cx| editor.close_script_preview(cx));
-                })
-                // The backdrop is a wall: presses inside the dialog's padding
-                // must not reach the request surface behind it.
-                .occlude()
-                .child(panel),
-        )
-        .with_priority(100)
+        .header(preview)
         .into_any_element(),
     )
 }

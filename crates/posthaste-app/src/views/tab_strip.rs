@@ -700,110 +700,50 @@ pub(crate) fn close_confirmation_modal(state: Entity<AppState>, app: &AppState) 
             ),
         ),
     };
-    let backdrop_state = state.clone();
-    let cancel_state = state.clone();
-    let close_state = state.clone();
+    let dismiss_state = state.clone();
+    let dismiss = std::rc::Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+        dismiss_state.update(cx, |state, cx| {
+            state.cancel_close(cx);
+            state.focus_active_editor(window, cx);
+        });
+    });
+    let cancel = dismiss.clone();
     let confirm_state = state;
-    let panel = div()
-        .id("close-confirmation")
-        .debug_selector(|| "close-confirmation".to_owned())
-        .flex()
-        .flex_col()
-        .gap(space::S12)
-        .w(px(360.))
-        .p(space::S16)
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .on_click(|_, _, cx| cx.stop_propagation())
-        // Every window-level dialog dismisses the same way: the glyph in its
-        // top-right corner. The footer's Cancel stays the labelled choice.
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(space::S12)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_role(type_role::PANE_TITLE)
-                                .text_color(theme::text::primary())
-                                .child(heading),
-                        )
-                        .child(
-                            div()
-                                .text_role(type_role::META)
-                                .text_color(theme::text::tertiary())
-                                .child(message),
-                        ),
-                )
-                .child(
-                    super::ui::close_button("close-confirmation-close")
-                        .debug_selector(|| "close-confirmation-close".to_owned())
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            close_state.update(cx, |state, cx| state.cancel_close(cx));
-                        }),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(space::S8)
-                .child(
-                    super::ui::overlay_button(
-                        "close-confirmation-cancel",
-                        i18n::t(Key::CommonCancel),
-                    )
-                    .debug_selector(|| "close-confirmation-cancel".to_owned())
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        cancel_state.update(cx, |state, cx| state.cancel_close(cx));
-                    }),
-                )
-                .child(
-                    super::ui::overlay_button(
-                        "close-confirmation-confirm",
-                        i18n::t(Key::CloseTabConfirm),
-                    )
-                    .debug_selector(|| "close-confirmation-confirm".to_owned())
-                    .text_color(theme::status::danger())
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        confirm_state.update(cx, |state, cx| state.confirm_close(cx));
-                    }),
-                ),
-        );
 
-    gpui::deferred(
+    super::ui::modal(
+        "close-confirmation",
+        crate::metrics::modal::NARROW,
+        move |window, cx| dismiss(window, cx),
+    )
+    .title(heading)
+    .subtitle(message)
+    .actions(
         div()
-            .id("close-confirmation-backdrop")
-            .debug_selector(|| "close-confirmation-backdrop".to_owned())
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .size_full()
             .flex()
             .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.45))
-            .on_click(move |_, _, cx| {
-                backdrop_state.update(cx, |state, cx| state.cancel_close(cx));
-            })
-            // The backdrop is a wall, not just a dimmer: presses inside the
-            // dialog's padding must not reach the tab strip behind it.
-            .occlude()
-            .child(panel),
+            .justify_end()
+            .gap(space::S8)
+            .child(
+                super::ui::overlay_button("close-confirmation-cancel", i18n::t(Key::CommonCancel))
+                    .debug_selector(|| "close-confirmation-cancel".to_owned())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        (cancel)(window, cx);
+                    }),
+            )
+            .child(
+                super::ui::overlay_button(
+                    "close-confirmation-confirm",
+                    i18n::t(Key::CloseTabConfirm),
+                )
+                .debug_selector(|| "close-confirmation-confirm".to_owned())
+                .text_color(theme::status::danger())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    confirm_state.update(cx, |state, cx| state.confirm_close(cx));
+                }),
+            ),
     )
-    .with_priority(100)
     .into_any_element()
 }
 

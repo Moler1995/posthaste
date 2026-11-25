@@ -361,7 +361,7 @@ fn override_marker(key: &str, accent: Rgba) -> AnyElement {
         .items_center()
         .justify_center()
         .rounded(radius::ROW)
-        .bg(Rgba { a: 0.14, ..accent })
+        .bg(theme::accent::subtle_for(accent))
         .text_role(type_role::MICRO)
         .text_color(accent)
         .tooltip(|_, cx| cx.new(|_| OverrideTooltip).into())

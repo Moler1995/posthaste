@@ -359,6 +359,13 @@ pub mod surface {
     pub fn scrim() -> Rgba {
         super::rgba(0x00000073)
     }
+
+    /// Translucent black behind a card stacked inside a dialog. Lighter than
+    /// [`scrim`](Self::scrim): it separates the card from the dialog's own
+    /// surface without dimming the window a second time.
+    pub fn inner_scrim() -> Rgba {
+        super::rgba(0x00000059)
+    }
 }
 
 /// Text roles.
@@ -456,14 +463,28 @@ pub mod accent {
         tokens().accent_subtle
     }
 
-    /// Selected-row background tinted with `accent` at the same alpha as
-    /// [`subtle`], so a method-colored selection stays as quiet as the default.
+    /// The quiet accent tint: a selected row's background, selected text, and
+    /// a small badge behind an accent glyph. It carries `accent` at the same
+    /// alpha as [`subtle`], so a method-colored selection stays as quiet as the
+    /// default.
     pub fn subtle_for(accent: Rgba) -> Rgba {
         Rgba {
             r: accent.r,
             g: accent.g,
             b: accent.b,
             a: 0x24 as f32 / 255.,
+        }
+    }
+
+    /// The wash behind the current search match. It is the same hue as
+    /// [`subtle_for`] at a stronger alpha, so the match under the cursor stands
+    /// out from the quieter washes around it.
+    pub fn match_wash(accent: Rgba) -> Rgba {
+        Rgba {
+            r: accent.r,
+            g: accent.g,
+            b: accent.b,
+            a: 0x52 as f32 / 255.,
         }
     }
 
@@ -1103,7 +1124,9 @@ mod tests {
     }
 
     /// Guards the "views use tokens, not literals" rule: the palette lives in
-    /// this module, so any RGB call under `src/views` is a regression.
+    /// this module, so a color call or a raw alpha under `src/views` is a
+    /// regression. The offending `file:line: literal` is named so the fix is
+    /// one edit away.
     #[test]
     fn views_do_not_hardcode_colors() {
         fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
@@ -1113,10 +1136,9 @@ mod tests {
                     scan(&path, offenders);
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
                     let source = std::fs::read_to_string(&path).expect("view source is readable");
-                    let needles = [format!("{}{}", "r", "gb("), format!("{}{}", "r", "gba(")];
                     for (index, line) in source.lines().enumerate() {
-                        if needles.iter().any(|needle| line.contains(needle)) {
-                            offenders.push(format!("{}:{}", path.display(), index + 1));
+                        if let Some(literal) = hardcoded_color(line) {
+                            offenders.push(format!("{}:{}: {literal}", path.display(), index + 1));
                         }
                     }
                 }
@@ -1131,5 +1153,52 @@ mod tests {
             offenders.is_empty(),
             "views must use theme tokens instead of literal colors: {offenders:#?}"
         );
+    }
+
+    /// Names the first hardcoded color on `line`: a `rgb`/`rgba`/`hsla` call,
+    /// or an alpha field written as a raw literal. The alpha scan skips
+    /// lifetime bounds (`'a: 'b`) and strings such as `b"a: {}\n"` by requiring
+    /// a number after the colon.
+    fn hardcoded_color(line: &str) -> Option<&'static str> {
+        const CALLS: [&str; 3] = ["rgb(", "rgba(", "hsla("];
+        if let Some(call) = CALLS.iter().find(|call| line.contains(**call)) {
+            return Some(call);
+        }
+        line.match_indices("a:").find_map(|(index, _)| {
+            let starts_field = line[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !before.is_alphanumeric() && before != '_' && before != '\'');
+            let value = line[index + 2..].trim_start();
+            let number_follows = value.starts_with(|c: char| c.is_ascii_digit() || c == '.');
+            (starts_field && number_follows).then_some("a:")
+        })
+    }
+
+    #[test]
+    fn the_color_guard_catches_calls_and_raw_alpha() {
+        assert_eq!(
+            hardcoded_color("let shade = gpui::hsla(0., 0., 0., 0.45);"),
+            Some("hsla(")
+        );
+        assert_eq!(
+            hardcoded_color("let scrim = gpui::rgba(0x00000073);"),
+            Some("rgba(")
+        );
+        assert_eq!(
+            hardcoded_color(".bg(Rgba { a: 0.14, ..accent })"),
+            Some("a:")
+        );
+        for allowed in [
+            "let color = theme::text::primary();",
+            "fn shade<'a: 'b>(color: &'a str) -> &'b str { color }",
+            "append(&viewer, cx, b\"a: {}\\n\\n\");",
+        ] {
+            assert_eq!(
+                hardcoded_color(allowed),
+                None,
+                "{allowed} is not a color literal"
+            );
+        }
     }
 }

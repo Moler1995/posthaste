@@ -160,10 +160,6 @@ pub struct WorkspaceState {
     pub rename_target: Option<RenameTarget>,
     /// The item awaiting inline delete confirmation.
     pub delete_target: Option<DeleteTarget>,
-    /// The row whose action menu is open, if any.
-    pub row_menu: Option<RowMenuTarget>,
-    /// The item whose move destination is being chosen, if any.
-    pub move_picker: Option<MoveTarget>,
     /// Paths of issues that describe failed writes rather than failed loads.
     /// A later successful save clears exactly these.
     save_issue_paths: Vec<PathBuf>,
@@ -216,8 +212,6 @@ impl WorkspaceState {
             rename_error: None,
             rename_target: None,
             delete_target: None,
-            row_menu: None,
-            move_picker: None,
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
         }
@@ -243,8 +237,6 @@ impl WorkspaceState {
             rename_error: None,
             rename_target: None,
             delete_target: None,
-            row_menu: None,
-            move_picker: None,
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
         }

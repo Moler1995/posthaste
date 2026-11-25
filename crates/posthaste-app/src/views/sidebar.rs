@@ -51,6 +51,8 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     let workspace = app.workspace();
     let history = app.history();
     let rename_input = app.rename_input();
+    let row_menu = app.row_menu().cloned();
+    let move_picker = app.move_picker().cloned();
     let row_menu_focus = app.row_menu_focus().cloned();
     let move_picker_focus = app.move_picker_focus().cloned();
     let collections_menu_focus = app.collections_menu_focus().cloned();
@@ -130,6 +132,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                     visible.expanded,
                     workspace,
                     rename_input,
+                    row_menu.as_ref(),
                     row_menu_focus.as_ref(),
                     delete_tab_note.as_deref(),
                 )];
@@ -155,6 +158,8 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                                         row.request_count,
                                         workspace,
                                         rename_input,
+                                        row_menu.as_ref(),
+                                        move_picker.as_ref(),
                                         row_menu_focus.as_ref(),
                                         move_picker_focus.as_ref(),
                                         delete_tab_note.as_deref(),
@@ -171,6 +176,8 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                                         save_state,
                                         workspace,
                                         rename_input,
+                                        row_menu.as_ref(),
+                                        move_picker.as_ref(),
                                         row_menu_focus.as_ref(),
                                         move_picker_focus.as_ref(),
                                         delete_tab_note.as_deref(),
@@ -439,6 +446,7 @@ pub(crate) fn variables_popover(
 
     let workspace = app.workspace();
     let rename_input = app.rename_input();
+    let row_menu = app.row_menu().cloned();
     let row_menu_focus = app.row_menu_focus().cloned();
     let active_environment = app.active_environment();
     let filter = app.sidebar_filter().trim().to_lowercase();
@@ -462,6 +470,7 @@ pub(crate) fn variables_popover(
                 active_environment,
                 workspace,
                 rename_input,
+                row_menu.as_ref(),
                 row_menu_focus.as_ref(),
                 accent,
             )
@@ -1817,78 +1826,34 @@ pub(crate) fn export_confirm_modal(state: Entity<AppState>, app: &AppState) -> A
         .unwrap_or_else(|| slug.to_owned());
     let format = app.export_format();
     let focus = app.export_focus().cloned();
-    let cancel_state = state.clone();
-    let choose_state = state.clone();
-    let escape_state = state.clone();
-    let close_state = state.clone();
 
-    let panel = div()
-        .id("export-confirm")
-        .debug_selector(|| "export-confirm".to_owned())
-        .flex()
-        .flex_col()
-        .gap(space::S12)
-        .w(px(420.))
-        .p(space::S16)
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .key_context("ExportConfirm")
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .on_key_down(move |event, window, cx| {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                escape_state.update(cx, |state, cx| {
-                    state.cancel_export(cx);
-                    state.focus_active_editor(window, cx);
-                });
-            }
-        })
-        // Every window-level dialog dismisses the same way: the glyph in its
-        // top-right corner. The footer's Cancel stays the labelled choice.
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(space::S12)
-                .child(
-                    // The title and warning give way to the close button rather
-                    // than widening the header past the dialog.
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                .text_role(type_role::PANE_TITLE)
-                                .text_color(theme::text::primary())
-                                .child(format.confirm_prompt(&name)),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "export-warning".to_owned())
-                                .text_role(type_role::META)
-                                .text_color(theme::status::danger())
-                                .child(i18n::t(format.warning())),
-                        ),
-                )
-                .child(
-                    super::ui::close_button("export-confirm-close")
-                        .debug_selector(|| "export-confirm-close".to_owned())
-                        .on_click(move |_, window, cx| {
-                            cx.stop_propagation();
-                            close_state.update(cx, |state, cx| {
-                                state.cancel_export(cx);
-                                state.focus_active_editor(window, cx);
-                            });
-                        }),
-                ),
-        )
-        .child(div().h(px(1.)).bg(theme::border::subtle()))
-        .child(
+    let dismiss_state = state.clone();
+    let dismiss = std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+        dismiss_state.update(cx, |state, cx| {
+            state.cancel_export(cx);
+            state.focus_active_editor(window, cx);
+        });
+    });
+    let cancel = dismiss.clone();
+
+    let mut dialog = super::ui::modal(
+        "export-confirm",
+        crate::metrics::modal::STANDARD,
+        move |window, cx| dismiss(window, cx),
+    )
+    .title(format.confirm_prompt(&name))
+    .subtitle(i18n::t(format.warning()))
+    .subtitle_color(theme::status::danger())
+    .subtitle_selector("export-warning")
+    .body(div().h(px(1.)).bg(theme::border::subtle()));
+
+    if let Some(focus) = focus {
+        dialog = dialog.focus(&focus);
+    }
+
+    let choose_state = state;
+    dialog
+        .actions(
             div()
                 .flex()
                 .items_center()
@@ -1899,10 +1864,7 @@ pub(crate) fn export_confirm_modal(state: Entity<AppState>, app: &AppState) -> A
                         .debug_selector(|| "export-cancel".to_owned())
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            cancel_state.update(cx, |state, cx| {
-                                state.cancel_export(cx);
-                                state.focus_active_editor(window, cx);
-                            });
+                            (cancel)(window, cx);
                         }),
                 )
                 .child(
@@ -1916,33 +1878,8 @@ pub(crate) fn export_confirm_modal(state: Entity<AppState>, app: &AppState) -> A
                         choose_state.update(cx, |state, cx| state.choose_export_path(cx));
                     }),
                 ),
-        );
-    let panel = match focus {
-        Some(focus) => panel.track_focus(&focus),
-        None => panel,
-    };
-
-    let backdrop_state = state.clone();
-    gpui::deferred(
-        div()
-            .id("export-confirm-backdrop")
-            .debug_selector(|| "export-confirm-backdrop".to_owned())
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.45))
-            .on_click(move |_, _, cx| {
-                backdrop_state.update(cx, |state, cx| state.cancel_export(cx));
-            })
-            .occlude()
-            .child(panel),
-    )
-    .with_priority(100)
-    .into_any_element()
+        )
+        .into_any_element()
 }
 
 fn row_menu_panel(
@@ -1986,7 +1923,7 @@ fn row_menu_panel(
                 return;
             }
             outside_state.update(cx, |state, cx| {
-                if state.workspace().row_menu.as_ref() == Some(&outside_target) {
+                if state.row_menu() == Some(&outside_target) {
                     state.close_row_menu(cx);
                 }
             });
@@ -1995,7 +1932,7 @@ fn row_menu_panel(
             if event.keystroke.key == "escape" {
                 cx.stop_propagation();
                 escape_state.update(cx, |state, cx| {
-                    if state.workspace().row_menu.as_ref() == Some(&escape_target) {
+                    if state.row_menu() == Some(&escape_target) {
                         state.close_row_menu(cx);
                         state.focus_active_editor(window, cx);
                     }
@@ -2348,6 +2285,7 @@ fn collection_row(
     expanded: bool,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
+    row_menu: Option<&RowMenuTarget>,
     row_menu_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
 ) -> AnyElement {
@@ -2362,7 +2300,7 @@ fn collection_row(
     let row_state = state.clone();
     let row_slug = slug.clone();
     let menu_target = RowMenuTarget::Collection { slug: slug.clone() };
-    let menu_open = workspace.row_menu == Some(menu_target.clone());
+    let menu_open = row_menu == Some(&menu_target);
     let right_click_state = state.clone();
     let right_click_target = menu_target.clone();
 
@@ -2569,6 +2507,8 @@ fn folder_row(
     request_count: Option<usize>,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
+    row_menu: Option<&RowMenuTarget>,
+    move_picker: Option<&MoveTarget>,
     row_menu_focus: Option<&FocusHandle>,
     move_picker_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
@@ -2595,7 +2535,7 @@ fn folder_row(
         slug: slug.to_owned(),
         id,
     };
-    let menu_open = workspace.row_menu == Some(menu_target.clone());
+    let menu_open = row_menu == Some(&menu_target);
     let right_click_state = state.clone();
     let right_click_target = menu_target.clone();
 
@@ -2740,7 +2680,7 @@ fn folder_row(
         slug: slug.to_owned(),
         id,
     };
-    let move_picker = (workspace.move_picker.as_ref() == Some(&move_target))
+    let move_picker = (move_picker == Some(&move_target))
         .then(|| move_picker_panel(state.clone(), &move_target, workspace, move_picker_focus));
 
     let hint = (renaming && rename_error.is_none()).then(rename_hint);
@@ -3056,6 +2996,8 @@ fn request_row(
     save_state: &RequestSaveState,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
+    row_menu: Option<&RowMenuTarget>,
+    move_picker: Option<&MoveTarget>,
     row_menu_focus: Option<&FocusHandle>,
     move_picker_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
@@ -3084,7 +3026,7 @@ fn request_row(
         slug: slug.to_owned(),
         id,
     };
-    let menu_open = workspace.row_menu == Some(menu_target.clone());
+    let menu_open = row_menu == Some(&menu_target);
     let right_click_state = state.clone();
     let right_click_target = menu_target.clone();
 
@@ -3220,7 +3162,7 @@ fn request_row(
         slug: slug.to_owned(),
         id,
     };
-    let move_picker = (workspace.move_picker.as_ref() == Some(&move_target))
+    let move_picker = (move_picker == Some(&move_target))
         .then(|| move_picker_panel(state.clone(), &move_target, workspace, move_picker_focus));
 
     let hint = (renaming && rename_error.is_none()).then(rename_hint);
@@ -3292,6 +3234,7 @@ fn environment_row(
     active: Option<&str>,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
+    row_menu: Option<&RowMenuTarget>,
     row_menu_focus: Option<&FocusHandle>,
     accent: gpui::Rgba,
 ) -> AnyElement {
@@ -3308,7 +3251,7 @@ fn environment_row(
     let row_state = state.clone();
     let row_slug = slug.clone();
     let menu_target = RowMenuTarget::Environment { slug: slug.clone() };
-    let menu_open = workspace.row_menu == Some(menu_target.clone());
+    let menu_open = row_menu == Some(&menu_target);
     let right_click_state = state.clone();
     let right_click_target = menu_target.clone();
 

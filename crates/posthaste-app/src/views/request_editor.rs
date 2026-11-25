@@ -1216,6 +1216,7 @@ impl RequestEditor {
         self.tab = tab;
         self.method_menu_open = false;
         self.cookies_clear_open = false;
+        self.emit_overlay_change(cx);
         cx.notify();
     }
 
@@ -1230,6 +1231,7 @@ impl RequestEditor {
         self.cookies_add_focus_pending = false;
         self.cookies_selection = None;
         self.cookies_selecting = false;
+        self.emit_overlay_change(cx);
         cx.notify();
     }
 
@@ -1248,6 +1250,7 @@ impl RequestEditor {
             if self.script_preview.is_some() {
                 self.script_focus_pending = true;
             }
+            self.emit_overlay_change(cx);
             cx.notify();
         }
     }
@@ -1396,6 +1399,7 @@ impl RequestEditor {
 
     pub(crate) fn toggle_method_menu(&mut self, cx: &mut Context<Self>) {
         self.method_menu_open = !self.method_menu_open;
+        self.emit_overlay_change(cx);
         cx.notify();
     }
 
@@ -1404,6 +1408,7 @@ impl RequestEditor {
     pub(crate) fn close_method_menu(&mut self, cx: &mut Context<Self>) {
         if self.method_menu_open {
             self.method_menu_open = false;
+            self.emit_overlay_change(cx);
             cx.notify();
         }
     }
@@ -1419,6 +1424,7 @@ impl RequestEditor {
         self.method_menu_open = false;
         self.set_protocol(RequestProtocol::Http, window, cx);
         self.set_method(method, window, cx);
+        self.emit_overlay_change(cx);
         cx.notify();
     }
 
@@ -1433,6 +1439,7 @@ impl RequestEditor {
     ) {
         self.method_menu_open = false;
         self.set_protocol(protocol, window, cx);
+        self.emit_overlay_change(cx);
         cx.notify();
     }
 
@@ -3858,141 +3865,142 @@ pub(crate) fn cookies_modal(editor: Entity<RequestEditor>, cx: &App) -> AnyEleme
             close_editor.update(cx, |editor, cx| editor.close_cookies(cx));
         });
 
-    let panel = div()
-        .id("cookies-dialog")
-        .debug_selector(|| "cookies-dialog".to_owned())
-        .track_focus(&view.cookies_focus)
-        .on_key_down(move |event, _, cx| {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                key_editor.update(cx, |editor, cx| {
-                    if editor.cookies_add_open() {
-                        editor.close_cookie_add(cx);
-                    } else {
-                        editor.close_cookies(cx);
-                    }
-                });
-                return;
-            }
-            // Cells cannot host a text selection, so the dialog owns the
-            // rectangle: Ctrl+C copies it as tab-separated rows.
-            if event.keystroke.modifiers.secondary() && event.keystroke.key == "c" {
-                let copied = key_editor.update(cx, |editor, cx| {
-                    if editor.cookies_add_open() {
-                        return false;
-                    }
-                    match editor.cookie_selection_text() {
-                        Some(text) => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            true
-                        }
-                        None => false,
-                    }
-                });
-                if copied {
-                    cx.stop_propagation();
-                }
-            }
-        })
-        .flex()
-        .flex_col()
-        .gap(space::S12)
-        .w(px(960.))
-        .max_h(px(560.))
-        .p(space::S16)
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(space::S12)
-                .child(
-                    div()
-                        .text_role(type_role::PANE_TITLE)
-                        .text_color(theme::text::primary())
-                        .child(if adding {
-                            i18n::t(Key::CookieAdd)
-                        } else {
-                            i18n::t(Key::CookiesTitle)
-                        }),
-                )
-                .child(div().flex_1())
-                .child(actions)
-                .child(close_button),
-        )
-        .children(view.render_cookies_confirmation(&editor))
-        // The table keeps its place under the add card: adding a cookie is a
-        // detour over the list, not a page that replaces it, so the list stays
-        // as context. The body reserves the card's height at all times,
-        // otherwise the panel would grow and shift when the card opens.
-        .child(
-            div()
-                .relative()
-                .flex_1()
-                .min_h(px(280.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .id("cookies-dialog-body")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(view.render_cookies(&editor)),
-                )
-                .children(adding.then(|| {
-                    div()
-                        .id("cookies-add-overlay")
-                        .debug_selector(|| "cookies-add-overlay".to_owned())
-                        .absolute()
-                        .top(px(0.))
-                        .left(px(0.))
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(gpui::hsla(0., 0., 0., 0.35))
-                        .occlude()
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .w(px(640.))
-                                .max_w(gpui::relative(1.))
-                                .p(space::S16)
-                                .rounded(radius::OVERLAY)
-                                .bg(theme::surface::overlay())
-                                .border_1()
-                                .border_color(theme::border::default())
-                                .child(view.render_cookie_add_form(&editor)),
-                        )
-                })),
-        );
+    let dismiss_editor = backdrop_editor.clone();
+    let dismiss = Rc::new(move |window: &mut Window, cx: &mut App| {
+        dismiss_editor.update(cx, |editor, cx| editor.close_cookies(cx));
+        // Focus lingers on the script preview's panel when one is open; the
+        // editor's next render moves it there. Otherwise focus returns to the
+        // request's URL field.
+        if dismiss_editor.read(cx).script_preview_format().is_none() {
+            let focus = dismiss_editor
+                .read(cx)
+                .url_input()
+                .read(cx)
+                .focus_handle()
+                .clone();
+            window.focus(&focus);
+        }
+    });
 
-    gpui::deferred(
-        div()
-            .id("cookies-dialog-backdrop")
-            .debug_selector(|| "cookies-dialog-backdrop".to_owned())
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::surface::scrim())
-            .on_click(move |_, _, cx| {
-                backdrop_editor.update(cx, |editor, cx| editor.close_cookies(cx));
-            })
-            // The dimmer is a wall, not just a backdrop: presses inside the
-            // dialog's padding must not reach the panes behind it.
-            .occlude()
-            .child(panel),
+    // Escape closes the add card first, leaving the jar's dialog open; with no
+    // card open it runs the dialog's ordinary dismissal.
+    let escape_editor = editor.clone();
+    let escape = Rc::new(move |window: &mut Window, cx: &mut App| {
+        let closed_dialog = escape_editor.update(cx, |editor, cx| {
+            if editor.cookies_add_open() {
+                editor.close_cookie_add(cx);
+                false
+            } else {
+                editor.close_cookies(cx);
+                true
+            }
+        });
+        if closed_dialog && escape_editor.read(cx).script_preview_format().is_none() {
+            let focus = escape_editor
+                .read(cx)
+                .url_input()
+                .read(cx)
+                .focus_handle()
+                .clone();
+            window.focus(&focus);
+        }
+    });
+
+    let header = div()
+        .flex()
+        .items_center()
+        .gap(space::S12)
+        .child(
+            div()
+                .text_role(type_role::PANE_TITLE)
+                .text_color(theme::text::primary())
+                .child(if adding {
+                    i18n::t(Key::CookieAdd)
+                } else {
+                    i18n::t(Key::CookiesTitle)
+                }),
+        )
+        .child(div().flex_1())
+        .child(actions)
+        .child(close_button);
+
+    super::ui::modal(
+        "cookies-dialog",
+        crate::metrics::modal::WIDE,
+        move |window, cx| dismiss(window, cx),
     )
-    .with_priority(105)
+    .priority(105)
+    .max_height(crate::metrics::modal::TALL_BODY)
+    .focus(&view.cookies_focus)
+    .escape(move |window, cx| escape(window, cx))
+    // The dialog owns Ctrl+C for its table: cells cannot host a selection.
+    .key_handler(move |event, _, cx| {
+        if event.keystroke.modifiers.secondary() && event.keystroke.key == "c" {
+            let copied = key_editor.update(cx, |editor, cx| {
+                if editor.cookies_add_open() {
+                    return false;
+                }
+                match editor.cookie_selection_text() {
+                    Some(text) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if copied {
+                cx.stop_propagation();
+            }
+        }
+    })
+    .header(header)
+    .body(div().children(view.render_cookies_confirmation(&editor)))
+    // The table keeps its place under the add card: adding a cookie is a
+    // detour over the list, not a page that replaces it, so the list stays
+    // as context. The body reserves the card's height at all times,
+    // otherwise the panel would grow and shift when the card opens.
+    .body(
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(280.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("cookies-dialog-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(view.render_cookies(&editor)),
+            )
+            .children(adding.then(|| {
+                div()
+                    .id("cookies-add-overlay")
+                    .debug_selector(|| "cookies-add-overlay".to_owned())
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::surface::inner_scrim())
+                    .occlude()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .w(px(640.))
+                            .max_w(gpui::relative(1.))
+                            .p(space::S16)
+                            .rounded(radius::OVERLAY)
+                            .bg(theme::surface::overlay())
+                            .border_1()
+                            .border_color(theme::border::default())
+                            .child(view.render_cookie_add_form(&editor)),
+                    )
+            })),
+    )
     .into_any_element()
 }
 

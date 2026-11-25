@@ -8,6 +8,7 @@ mod assets;
 mod history;
 mod i18n;
 mod metrics;
+mod overlay;
 #[cfg(test)]
 mod test_globals;
 #[cfg(test)]

@@ -969,7 +969,7 @@ fn composed_runs(
             .find(|found| found.start <= start && found.end >= end)
             .map(|found| {
                 if current == Some(found.start) {
-                    Hsla::from(Rgba { a: 0.32, ..accent })
+                    Hsla::from(theme::accent::match_wash(accent))
                 } else {
                     Hsla::from(theme::status::warning_subtle())
                 }
@@ -1210,12 +1210,7 @@ mod tests {
     }
 
     fn accent() -> Rgba {
-        Rgba {
-            r: 1.,
-            g: 0.,
-            b: 0.,
-            a: 1.,
-        }
+        theme::accent::base()
     }
 
     #[test]
@@ -1396,10 +1391,7 @@ mod tests {
         assert_ne!(two[0].background_color, two[2].background_color);
         assert_eq!(
             two[2].background_color,
-            Some(Hsla::from(Rgba {
-                a: 0.32,
-                ..accent()
-            }))
+            Some(Hsla::from(theme::accent::match_wash(accent())))
         );
     }
 

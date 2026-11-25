@@ -9,10 +9,12 @@
 //!     .on_click(move |_, _, cx| { ... })
 //! ```
 
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, AppContext as _, BoxShadow, ClickEvent, Context, Div, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, TextAlign, Window, div, point, px, svg,
+    AnyElement, App, AppContext as _, BoxShadow, ClickEvent, Context, Div, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, TextAlign, Window, div, point, px, relative, svg,
 };
 use posthaste_core::model::{HttpMethod, RequestProtocol};
 
@@ -925,6 +927,308 @@ pub(crate) fn confirm_popover(
         )
 }
 
+/// A window-level dialog's shell: the dimming backdrop, the floating panel, the
+/// title row with its corner close, and every dismissal path.
+///
+/// A dialog supplies its width from [`crate::metrics::modal`], its title (or a
+/// custom [`Modal::header`] when the header carries controls of its own), its
+/// body, and one `on_dismiss` closure. That closure is the only way out: the
+/// corner close, Escape, and a click on the backdrop all run it, so a dialog
+/// cannot forget the work dismissal does — writing nothing, closing the
+/// overlay, and returning focus to the surface the dialog covered.
+///
+/// ```ignore
+/// modal("save-picker", modal::NARROW, move |window, cx| {
+///     state.update(cx, |state, cx| {
+///         state.close_save_picker(cx);
+///         state.focus_active_editor(window, cx);
+///     });
+/// })
+/// .title(title)
+/// .subtitle(subtitle)
+/// .body(fields)
+/// .actions(footer)
+/// .into_any_element()
+/// ```
+pub(crate) struct Modal {
+    id: SharedString,
+    width: Pixels,
+    height: Option<Pixels>,
+    max_height: Option<Pixels>,
+    max_height_fraction: f32,
+    backdrop_color: Option<gpui::Rgba>,
+    priority: usize,
+    focus: Option<FocusHandle>,
+    title: Option<SharedString>,
+    subtitle: Option<(SharedString, gpui::Rgba)>,
+    subtitle_selector: Option<SharedString>,
+    header: Option<AnyElement>,
+    children: Vec<AnyElement>,
+    close_selector: Option<SharedString>,
+    escape: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    key_handler: Option<Rc<dyn Fn(&gpui::KeyDownEvent, &mut Window, &mut App)>>,
+    on_dismiss: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+/// Starts a dialog shell. `id` names the panel, its backdrop (`{id}-backdrop`),
+/// and its corner close (`{id}-close`) for tests.
+pub(crate) fn modal(
+    id: impl Into<SharedString>,
+    width: Pixels,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> Modal {
+    Modal {
+        id: id.into(),
+        width,
+        height: None,
+        max_height: None,
+        max_height_fraction: 0.9,
+        backdrop_color: None,
+        priority: 100,
+        focus: None,
+        title: None,
+        subtitle: None,
+        subtitle_selector: None,
+        header: None,
+        children: Vec::new(),
+        close_selector: None,
+        escape: None,
+        key_handler: None,
+        on_dismiss: Rc::new(on_dismiss),
+    }
+}
+
+impl Modal {
+    /// The dialog's heading.
+    pub(crate) fn title(mut self, title: impl Into<SharedString>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// One quiet line under the heading.
+    pub(crate) fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
+        self.subtitle = Some((subtitle.into(), theme::text::tertiary()));
+        self
+    }
+
+    /// A subtitle in another tone, such as danger for an irreversible warning.
+    pub(crate) fn subtitle_color(mut self, color: gpui::Rgba) -> Self {
+        if let Some((text, _)) = self.subtitle.take() {
+            self.subtitle = Some((text, color));
+        }
+        self
+    }
+
+    /// Names the subtitle for tests, for a line whose content carries its own
+    /// meaning such as an irreversible-action warning.
+    pub(crate) fn subtitle_selector(mut self, selector: impl Into<SharedString>) -> Self {
+        self.subtitle_selector = Some(selector.into());
+        self
+    }
+
+    /// Replaces the default title row entirely. The content owns its header —
+    /// title, controls, and close — as the script preview and the cookie jar do.
+    pub(crate) fn header(mut self, header: impl IntoElement) -> Self {
+        self.header = Some(header.into_any_element());
+        self
+    }
+
+    /// Appends one block to the panel's body, in paint order.
+    pub(crate) fn body(mut self, body: impl IntoElement) -> Self {
+        self.children.push(body.into_any_element());
+        self
+    }
+
+    /// Appends the dialog's action row. It sits in the body flow after
+    /// [`Modal::body`] blocks, separated by the panel's gap.
+    pub(crate) fn actions(mut self, actions: impl IntoElement) -> Self {
+        self.children.push(actions.into_any_element());
+        self
+    }
+
+    /// The focus handle the panel tracks, so Escape reaches it when nothing
+    /// inside the dialog is focused.
+    pub(crate) fn focus(mut self, focus: &FocusHandle) -> Self {
+        self.focus = Some(focus.clone());
+        self
+    }
+
+    /// Paint priority among the window-level dialogs.
+    pub(crate) fn priority(mut self, priority: usize) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// A fixed panel height, for a dialog whose body is a fixed-size reading
+    /// surface such as the script preview.
+    pub(crate) fn height(mut self, height: Pixels) -> Self {
+        self.height = Some(height);
+        self
+    }
+
+    /// Caps the panel at a fixed height instead of the default window fraction.
+    pub(crate) fn max_height(mut self, max_height: Pixels) -> Self {
+        self.max_height = Some(max_height);
+        self
+    }
+
+    /// Replaces the default scrim. The script preview goes transparent while
+    /// the Cookies dialog above it supplies the dimming, so the window is never
+    /// dimmed twice.
+    pub(crate) fn backdrop_color(mut self, color: gpui::Rgba) -> Self {
+        self.backdrop_color = Some(color);
+        self
+    }
+
+    /// Replaces Escape's default dismissal when the dialog holds a nested card
+    /// that must close first. A dialog with no nested surface leaves this
+    /// unset, so Escape always runs the same dismissal as the close control.
+    pub(crate) fn escape(mut self, escape: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.escape = Some(Rc::new(escape));
+        self
+    }
+
+    /// Observes keys the dialog owns beyond dismissal, such as a copy shortcut
+    /// for a table that cannot host a text selection.
+    pub(crate) fn key_handler(
+        mut self,
+        handler: impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.key_handler = Some(Rc::new(handler));
+        self
+    }
+
+    /// Overrides the default `{id}-close` selector for the corner control.
+    pub(crate) fn close_selector(mut self, selector: impl Into<SharedString>) -> Self {
+        self.close_selector = Some(selector.into());
+        self
+    }
+
+    pub(crate) fn into_any_element(self) -> AnyElement {
+        let id = self.id.to_string();
+        let backdrop_id = format!("{id}-backdrop");
+        let close_id = self
+            .close_selector
+            .map(|selector| selector.to_string())
+            .unwrap_or_else(|| format!("{id}-close"));
+
+        let mut panel = div()
+            .id(self.id.clone())
+            .debug_selector({
+                let id = id.clone();
+                move || id.clone()
+            })
+            .flex()
+            .flex_col()
+            .gap(space::S12)
+            .w(self.width)
+            .max_w(relative(0.92))
+            .p(space::S16)
+            .rounded(radius::OVERLAY)
+            .bg(theme::surface::overlay())
+            .border_1()
+            .border_color(theme::border::default())
+            .on_click(|_, _, cx| cx.stop_propagation());
+
+        panel = match (self.height, self.max_height) {
+            (Some(height), _) => panel.h(height).max_h(relative(self.max_height_fraction)),
+            (None, Some(max_height)) => panel.max_h(max_height),
+            (None, None) => panel.max_h(relative(self.max_height_fraction)),
+        };
+
+        if let Some(focus) = self.focus.as_ref() {
+            panel = panel.track_focus(focus);
+        }
+
+        if let Some(header) = self.header {
+            panel = panel.child(header);
+        } else if let Some(title) = self.title {
+            let subtitle = self.subtitle;
+            let subtitle_selector = self.subtitle_selector;
+            let close_state = self.on_dismiss.clone();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(space::S12)
+                    .child(
+                        // The heading gives way to the close control rather
+                        // than widening the header past the dialog.
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_role(type_role::PANE_TITLE)
+                                    .text_color(theme::text::primary())
+                                    .child(title),
+                            )
+                            .children(subtitle.map(|(text, color)| {
+                                let line = div().text_role(type_role::META).text_color(color);
+                                match subtitle_selector {
+                                    Some(selector) => {
+                                        let selector = selector.to_string();
+                                        line.debug_selector(move || selector.clone()).child(text)
+                                    }
+                                    None => line.child(text),
+                                }
+                            })),
+                    )
+                    .child(
+                        close_button(SharedString::from(close_id.clone()))
+                            .debug_selector({
+                                let close_id = close_id.clone();
+                                move || close_id.clone()
+                            })
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                (close_state)(window, cx);
+                            }),
+                    ),
+            );
+        }
+
+        panel = panel.children(self.children);
+
+        if let Some(handler) = self.key_handler {
+            panel = panel.on_key_down(move |event, window, cx| (handler)(event, window, cx));
+        }
+
+        let escape_state = self.escape.unwrap_or_else(|| self.on_dismiss.clone());
+        panel = panel.on_key_down(move |event, window, cx| {
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                (escape_state)(window, cx);
+            }
+        });
+
+        let backdrop_state = self.on_dismiss.clone();
+        gpui::deferred(
+            div()
+                .id(SharedString::from(backdrop_id.clone()))
+                .debug_selector(move || backdrop_id.clone())
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(self.backdrop_color.unwrap_or_else(theme::surface::scrim))
+                // The backdrop is a wall, not just a dimmer: presses inside the
+                // dialog's padding must not reach the surface behind it.
+                .occlude()
+                .on_click(move |_, window, cx| (backdrop_state)(window, cx))
+                .child(panel),
+        )
+        .with_priority(self.priority)
+        .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,6 +1267,31 @@ mod tests {
         }
     }
 
+    struct ModalHost;
+
+    impl Render for ModalHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "modal-host".to_owned())
+                .size_full()
+                .child(
+                    modal("modal-narrow", crate::metrics::modal::NARROW, |_, _| {})
+                        .title("Narrow")
+                        .subtitle("One line")
+                        .body(div().h(px(20.)).w_full())
+                        .into_any_element(),
+                )
+                .child(
+                    modal("modal-wide", crate::metrics::modal::WIDE, |_, _| {})
+                        .title("A much longer heading")
+                        .body(div().h(px(40.)).w_full())
+                        .body(div().h(px(60.)).w_full())
+                        .actions(div().h(px(32.)).w_full())
+                        .into_any_element(),
+                )
+        }
+    }
+
     struct CompactButtonHost;
 
     impl Render for CompactButtonHost {
@@ -981,6 +1310,136 @@ mod tests {
                         .child(cx.new(|_| TextTooltip::new("Copy value"))),
                 )
         }
+    }
+
+    #[gpui::test]
+    async fn every_modal_shares_its_panel_and_close_geometry(cx: &mut TestAppContext) {
+        let (_host, cx) = cx.add_window_view(|_, _| ModalHost);
+        cx.update(|window, app| window.draw(app).clear());
+
+        let host = cx.debug_bounds("modal-host").expect("missing host bounds");
+        for (selector, width) in [
+            ("modal-narrow", crate::metrics::modal::NARROW),
+            ("modal-wide", crate::metrics::modal::WIDE),
+        ] {
+            let backdrop = cx
+                .debug_bounds(match selector {
+                    "modal-narrow" => "modal-narrow-backdrop",
+                    _ => "modal-wide-backdrop",
+                })
+                .expect("missing backdrop bounds");
+            assert_eq!(
+                backdrop.size, host.size,
+                "{selector}: the backdrop covers the window"
+            );
+
+            let panel = cx.debug_bounds(selector).expect("missing panel bounds");
+            assert_eq!(
+                panel.size.width, width,
+                "{selector}: the width token applies"
+            );
+            assert!(
+                (f32::from(panel.center().x) - f32::from(host.center().x)).abs() < 1.0,
+                "{selector}: the panel is centred horizontally"
+            );
+
+            let close = cx
+                .debug_bounds(match selector {
+                    "modal-narrow" => "modal-narrow-close",
+                    _ => "modal-wide-close",
+                })
+                .expect("missing close bounds");
+            assert_eq!(close.size.width, layout::CONTROL_COMPACT);
+            assert_eq!(close.size.height, layout::CONTROL_COMPACT);
+            assert_eq!(
+                close.origin.y - panel.origin.y,
+                space::S16,
+                "{selector}: the close sits on the title row's top edge"
+            );
+            assert_eq!(
+                panel.origin.x + panel.size.width - (close.origin.x + close.size.width),
+                space::S16,
+                "{selector}: the close sits inside the panel's right padding"
+            );
+        }
+    }
+
+    /// Structural widths come from `metrics::modal`, so a dialog cannot quietly
+    /// invent a size the geometry test above never builds. The width is read
+    /// from the source because a numeric call site never reaches the test
+    /// window; the failure names the file and line to fix.
+    #[test]
+    fn dialogs_take_their_width_from_modal_tokens() {
+        /// The second argument of every `ui::modal(...)` call in `source`.
+        fn dialog_widths(source: &str) -> Vec<(usize, String)> {
+            let mut widths = Vec::new();
+            let mut offset = 0;
+            while let Some(found) = source[offset..].find("ui::modal(") {
+                let call = offset + found + "ui::modal(".len();
+                offset = call;
+                let mut depth = 0usize;
+                let mut arguments = Vec::new();
+                let mut current = String::new();
+                for character in source[call..].chars() {
+                    match character {
+                        '(' => {
+                            depth += 1;
+                            current.push(character);
+                        }
+                        ')' if depth == 0 => break,
+                        ')' => {
+                            depth -= 1;
+                            current.push(character);
+                        }
+                        ',' if depth == 0 => arguments.push(std::mem::take(&mut current)),
+                        _ => current.push(character),
+                    }
+                }
+                arguments.push(current);
+                if let Some(width) = arguments.get(1) {
+                    widths.push((call, width.trim().to_owned()));
+                }
+            }
+            widths
+        }
+
+        fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) -> usize {
+            let mut checked = 0;
+            for entry in std::fs::read_dir(dir).expect("views directory is readable") {
+                let path = entry.expect("directory entry is readable").path();
+                if path.is_dir() {
+                    checked += scan(&path, offenders);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("view source is readable");
+                    for (offset, width) in dialog_widths(&source) {
+                        checked += 1;
+                        let line = source[..offset].matches('\n').count() + 1;
+                        let token = width.starts_with("crate::metrics::modal::")
+                            || width.starts_with("metrics::modal::")
+                            || width.starts_with("modal::");
+                        if !token {
+                            offenders.push(format!("{}:{line}: {width}", path.display()));
+                        }
+                    }
+                }
+            }
+            checked
+        }
+
+        let views = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/views");
+        assert!(views.is_dir(), "the views source directory exists");
+        let mut offenders = Vec::new();
+        let checked = scan(&views, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "dialogs must take their width from metrics::modal: {offenders:#?}"
+        );
+        // A scan that stops finding dialogs would pass forever without saying
+        // so, so the nine known dialogs keep it honest.
+        assert!(
+            checked >= 9,
+            "the scan found {checked} dialogs, fewer than the nine that exist"
+        );
     }
 
     #[gpui::test]

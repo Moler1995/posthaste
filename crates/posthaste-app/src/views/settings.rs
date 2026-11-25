@@ -6,12 +6,12 @@
 //! presents the preferences; it owns no settings state of its own.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Entity, IntoElement, deferred, div, px, relative};
+use gpui::{AnyElement, Entity, IntoElement, div, px};
 use posthaste_core::preferences::{Preferences, ThemeChoice};
 
 use crate::app::{AppState, NumberSetting, SettingsNumbers};
 use crate::i18n::{self, Key, Lang};
-use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
+use crate::metrics::{TypeStyle as _, layout, space, type_role};
 use crate::theme;
 
 use super::text_input::TextInput;
@@ -31,124 +31,59 @@ pub(crate) fn settings_modal(state: Entity<AppState>, app: &AppState) -> AnyElem
     let error = app.prefs_error().map(str::to_owned);
     let numbers = app.settings_numbers().clone();
 
-    let escape_state = state.clone();
-    let close_state = state.clone();
-    let backdrop_state = state.clone();
+    let dismiss_state = state.clone();
+    let dismiss = std::rc::Rc::new(move |window: &mut gpui::Window, cx: &mut gpui::App| {
+        dismiss_state.update(cx, |state, cx| state.close_settings(window, cx));
+    });
+    let section_state = state.clone();
 
-    let panel = div()
-        .id("settings-dialog")
-        .debug_selector(|| "settings-dialog".to_owned())
-        .track_focus(&focus)
-        .on_key_down(move |event, window, cx| {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                escape_state.update(cx, |state, cx| state.close_settings(window, cx));
-            }
-        })
-        .flex()
-        .flex_col()
-        .w(px(560.))
-        .max_w(relative(0.92))
-        .max_h(relative(0.9))
-        .rounded(radius::OVERLAY)
-        .bg(theme::surface::overlay())
-        .border_1()
-        .border_color(theme::border::default())
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(space::S12)
-                .px(space::S20)
-                .pt(space::S20)
-                .pb(space::S12)
-                .child(
-                    // The subtitle must give way to the close button rather
-                    // than widen the header past the dialog.
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_role(type_role::PANE_TITLE)
-                                .text_color(theme::text::primary())
-                                .child(i18n::t(Key::SettingsTitle)),
-                        )
-                        .child(
-                            div()
-                                .text_role(type_role::META)
-                                .text_color(theme::text::tertiary())
-                                .child(i18n::t(Key::SettingsSubtitle)),
-                        ),
-                )
-                .child(
-                    ui::close_button("settings-close")
-                        .debug_selector(|| "settings-close".to_owned())
-                        .on_click(move |_, window, cx| {
-                            cx.stop_propagation();
-                            close_state.update(cx, |state, cx| state.close_settings(window, cx));
-                        }),
-                ),
-        )
-        .child(div().h(px(1.)).bg(theme::border::subtle()))
-        .child(
-            div()
-                .id("settings-content")
-                .flex()
-                .flex_col()
-                .gap(layout::SECTION_GAP)
-                .p(space::S20)
-                .overflow_y_scroll()
-                .child(appearance_section(state.clone(), &preferences))
-                .child(language_section(state.clone(), &preferences))
-                .child(requests_section(state.clone(), &numbers))
-                .child(editing_section(state.clone(), &preferences, &numbers))
-                .child(history_section(state, &numbers)),
-        )
-        .child(div().h(px(1.)).bg(theme::border::subtle()))
-        .child(
-            div()
-                .px(space::S20)
-                .py(space::S12)
-                .min_h(px(40.))
-                .flex()
-                .items_center()
-                .child(match error {
-                    Some(message) => div()
-                        .debug_selector(|| "settings-error".to_owned())
-                        .text_role(type_role::MICRO)
-                        .text_color(theme::status::danger())
-                        .child(message),
-                    None => div()
-                        .text_role(type_role::MICRO)
-                        .text_color(theme::text::tertiary())
-                        .child(i18n::t(Key::SettingsStoredOutside)),
-                }),
-        );
-
-    deferred(
+    ui::modal(
+        "settings-dialog",
+        crate::metrics::modal::STANDARD,
+        move |window, cx| dismiss(window, cx),
+    )
+    .title(i18n::t(Key::SettingsTitle))
+    .subtitle(i18n::t(Key::SettingsSubtitle))
+    .focus(&focus)
+    .priority(SETTINGS_PRIORITY)
+    .close_selector("settings-close")
+    .body(div().h(px(1.)).bg(theme::border::subtle()))
+    .body(
         div()
-            .id("settings-backdrop")
-            .debug_selector(|| "settings-backdrop".to_owned())
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .size_full()
+            .id("settings-content")
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .gap(layout::SECTION_GAP)
+            .overflow_y_scroll()
+            .child(appearance_section(section_state.clone(), &preferences))
+            .child(language_section(section_state.clone(), &preferences))
+            .child(requests_section(section_state.clone(), &numbers))
+            .child(editing_section(
+                section_state.clone(),
+                &preferences,
+                &numbers,
+            ))
+            .child(history_section(section_state, &numbers)),
+    )
+    .body(div().h(px(1.)).bg(theme::border::subtle()))
+    .body(
+        div()
+            .min_h(px(40.))
             .flex()
             .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.45))
-            .on_click(move |_, window, cx| {
-                backdrop_state.update(cx, |state, cx| state.close_settings(window, cx));
-            })
-            .occlude()
-            .child(panel),
+            .child(match error {
+                Some(message) => div()
+                    .debug_selector(|| "settings-error".to_owned())
+                    .text_role(type_role::MICRO)
+                    .text_color(theme::status::danger())
+                    .child(message),
+                None => div()
+                    .text_role(type_role::MICRO)
+                    .text_color(theme::text::tertiary())
+                    .child(i18n::t(Key::SettingsStoredOutside)),
+            }),
     )
-    .with_priority(SETTINGS_PRIORITY)
     .into_any_element()
 }
 

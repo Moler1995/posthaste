@@ -458,6 +458,22 @@ pub mod layout {
     pub const TAB_GAP: Pixels = px(6.);
 }
 
+/// Window-level dialog geometry. Every dialog takes one width from this scale,
+/// so two dialogs never drift to arbitrary sizes.
+#[allow(dead_code)]
+pub mod modal {
+    use gpui::{Pixels, px};
+
+    /// A short confirmation or a dialog with one narrow field.
+    pub const NARROW: Pixels = px(360.);
+    /// The default dialog width.
+    pub const STANDARD: Pixels = px(480.);
+    /// A dialog holding a table or code.
+    pub const WIDE: Pixels = px(720.);
+    /// Tallest body a dialog grows to before its content scrolls.
+    pub const TALL_BODY: Pixels = px(520.);
+}
+
 /// Corner radii. The documented steps stay available as components grow.
 #[allow(dead_code)]
 pub mod radius {
@@ -729,5 +745,17 @@ mod tests {
         assert_eq!(radius::PANEL, px(8.));
         assert_eq!(radius::OVERLAY, px(10.));
         assert_eq!(radius::TAB_FLARE, px(4.));
+    }
+
+    #[test]
+    fn modal_tokens_match_the_dialog_scale() {
+        assert_eq!(modal::NARROW, px(360.));
+        assert_eq!(modal::STANDARD, px(480.));
+        assert_eq!(modal::WIDE, px(720.));
+        assert_eq!(modal::TALL_BODY, px(520.));
+        assert!(
+            modal::NARROW < modal::STANDARD && modal::STANDARD < modal::WIDE,
+            "the three dialog widths must be distinct steps"
+        );
     }
 }

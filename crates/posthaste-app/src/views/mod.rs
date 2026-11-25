@@ -46,6 +46,7 @@ use crate::Quit;
 use crate::app::{AppState, ContentView, TabId};
 use crate::i18n::{self, Key, MessageKey};
 use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
+use crate::overlay::{Layer, OverlayKind};
 use crate::theme;
 use crate::workspace::WorkspaceState;
 
@@ -419,10 +420,9 @@ impl Render for AppShell {
         let response_viewer = app.response_viewer().clone();
         let streaming = response_viewer.read(cx).streaming_meta();
         let has_response = response_viewer.read(cx).has_response();
-        // The cookie jar's dialog belongs to the active editor, but it mounts
-        // here so the dimmer and the card cover the whole window.
+        // The cookie jar's dialog and the script preview belong to the active
+        // editor, but they mount here so their dimmers cover the whole window.
         let active_editor = app.request_editor().clone();
-        let cookies_open = active_editor.read(cx).cookies_open();
 
         let save_state = self.state.clone();
         let open_settings_state = self.state.clone();
@@ -529,22 +529,11 @@ impl Render for AppShell {
                     state.focus_active_editor(window, cx);
                 });
             })
-            // Row menus, the save picker, the variables popover, the tab menu,
-            // the collections menu, the cURL panel, and the method dropdown
-            // close on the next click anywhere that is not inside them; their
-            // own contents stop propagation.
+            // Anchored menus and popovers close on the next click anywhere that
+            // is not inside them; their own contents stop propagation. Dialogs
+            // handle their own backdrop clicks, so this pass never reaches one.
             .on_click(move |_, _, cx| {
-                menu_state.update(cx, |state, cx| {
-                    state.close_row_menu(cx);
-                    state.close_move_picker(cx);
-                    state.close_save_picker(cx);
-                    state.close_variables_popover(cx);
-                    state.close_tab_menu(cx);
-                    state.close_collections_menu(cx);
-                    state.close_workspace_menu(cx);
-                    state.close_curl_import(cx);
-                    state.close_method_menu(cx);
-                });
+                menu_state.update(cx, |state, cx| state.close_anchored_overlays(cx));
             });
         // Only Windows hides the native title bar, so only Windows draws the
         // replacement bar; elsewhere it would sit under the OS caption.
@@ -653,49 +642,68 @@ impl Render for AppShell {
         // bar in one column. They are positioned out of the layout, so they
         // never shrink the panes or cover each other.
         .children(floating_notices(self.state.clone(), app, window))
-        .children(cookies_open.then(|| request_editor::cookies_modal(active_editor.clone(), cx)))
-        // Overlays paint after the panes, so they sit above everything the
-        // content row draws: the completion card follows the focused field,
-        // the environment popover opens over the request pane, and the save
-        // dialog covers the window.
+        // The focused field's completion card follows its anchor. It belongs
+        // to the field rather than to the overlay host, which holds only the
+        // docked surfaces, so it paints directly above the panes.
         .children(app.variable_overlay(window, cx))
-        .children(sidebar::variables_popover(self.state.clone(), app, window))
-        .children(
-            app.save_picker_open()
-                .then(|| request_pane::save_picker_modal(self.state.clone(), app)),
-        )
-        .child(sidebar::export_confirm_modal(self.state.clone(), app))
-        // The script preview is a dialog, so it mounts here with the other
-        // window-covering layers rather than inside the request pane. It keeps
-        // its priority-100 layer while the Cookies dialog (priority 105) floats
-        // above it, so the script stays visible behind the dialog and reappears
-        // untouched when the dialog closes.
-        .children(request_pane::script_modal(active_editor.clone(), cx))
-        // The workspace dialogs are opened from the title bar's menu. They sit
-        // at the dialog layer and never open together with each other: choosing
-        // a directory without a workspace document swaps the menu for the
-        // confirmation, and New Workspace… closes the menu.
-        .children(
-            app.new_workspace_open()
-                .then(|| new_workspace::new_workspace_modal(self.state.clone(), app))
-                .flatten(),
-        )
-        .children(workspace_init::init_confirmation_modal(
+        // Every docked overlay paints in host order: anchored menus and
+        // popovers first, then window-level dialogs above them.
+        .children(window_overlays(
             self.state.clone(),
             app,
+            window,
+            cx,
+            active_editor.clone(),
         ))
-        .children(workspace_open::open_choice_modal(self.state.clone(), app))
-        // Settings sits above the other dialogs and below the Cookies dialog;
-        // its backdrop is what makes the shell inert.
-        .children(
-            app.settings_open()
-                .then(|| settings::settings_modal(self.state.clone(), app)),
-        )
-        .children(
-            app.has_pending_close()
-                .then(|| tab_strip::close_confirmation_modal(self.state.clone(), app)),
-        )
     }
+}
+
+/// The window-level overlays, painted bottom to top in host order.
+///
+/// The host decides what is open, so this pass only maps entries to their
+/// renderers. Anchored popovers come first, then dialogs, so a dialog's
+/// backdrop always covers the menus beneath it. Within one layer, opening
+/// order decides paint order — that is what lets the Cookies dialog float
+/// above the script preview while the preview stays readable.
+fn window_overlays(
+    state: Entity<AppState>,
+    app: &AppState,
+    window: &Window,
+    cx: &gpui::App,
+    editor: Entity<request_editor::RequestEditor>,
+) -> Vec<gpui::AnyElement> {
+    let mut elements = Vec::new();
+    for layer in [Layer::Anchored, Layer::Dialog] {
+        for entry in app.overlays().iter().filter(|entry| entry.layer == layer) {
+            let element = match &entry.kind {
+                OverlayKind::Variables => sidebar::variables_popover(state.clone(), app, window),
+                OverlayKind::SavePicker(_) => {
+                    Some(request_pane::save_picker_modal(state.clone(), app))
+                }
+                OverlayKind::ExportConfirm(_) => {
+                    Some(sidebar::export_confirm_modal(state.clone(), app))
+                }
+                OverlayKind::ScriptPreview => request_pane::script_modal(editor.clone(), cx),
+                OverlayKind::Cookies => Some(request_editor::cookies_modal(editor.clone(), cx)),
+                OverlayKind::Settings => Some(settings::settings_modal(state.clone(), app)),
+                OverlayKind::CloseConfirm(_) => {
+                    Some(tab_strip::close_confirmation_modal(state.clone(), app))
+                }
+                OverlayKind::NewWorkspace => new_workspace::new_workspace_modal(state.clone(), app),
+                OverlayKind::WorkspaceInit(_) => {
+                    workspace_init::init_confirmation_modal(state.clone(), app)
+                }
+                OverlayKind::WorkspaceOpen(_) => {
+                    workspace_open::open_choice_modal(state.clone(), app)
+                }
+                // Anchored menus paint inside their own rows, not here; the
+                // host entry orders and dismisses them.
+                _ => None,
+            };
+            elements.extend(element);
+        }
+    }
+    elements
 }
 
 /// The bottom-right notice column.
@@ -1417,7 +1425,7 @@ mod tests {
         let run = gpui::TextRun {
             len: text.len(),
             font: face,
-            color: gpui::hsla(0., 0., 1., 1.),
+            color: theme::text::primary().into(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -2754,7 +2762,7 @@ mod tests {
         );
         assert_eq!(
             picker.size.width,
-            gpui::px(380.),
+            crate::metrics::modal::NARROW,
             "the dialog keeps a fixed reading width"
         );
         assert!(
@@ -4049,7 +4057,7 @@ mod tests {
         // drawn in the window, so absence cannot be asserted from them.
         click_row(cx, leaked(format!("collection-row-{}", collection.id)));
         assert!(
-            cx.update(|_, app| state.read(app).workspace().row_menu.is_none()),
+            cx.update(|_, app| state.read(app).row_menu().is_none()),
             "a click outside the menu closes it"
         );
     }
@@ -8877,7 +8885,7 @@ mod tests {
         click(cx, leaked(format!("move-{}", auth.id)));
         // The debug selector map keeps entries from earlier frames, so a closed
         // overlay is asserted through state rather than through `debug_bounds`.
-        assert!(cx.update(|_, app| state.read(app).workspace().move_picker.is_none()));
+        assert!(cx.update(|_, app| state.read(app).move_picker().is_none()));
         let moved = request_named(&state, cx, &slug, "Login");
         assert_eq!(moved.folder_id, Some(auth.id));
         assert_eq!(
@@ -9174,7 +9182,7 @@ mod tests {
             state.update(app, |state, cx| state.close_move_picker(cx));
         });
         redraw(cx);
-        assert!(cx.update(|_, app| state.read(app).workspace().move_picker.is_none()));
+        assert!(cx.update(|_, app| state.read(app).move_picker().is_none()));
 
         // The folder menu opens the inline rename.
         open_row_menu(cx, leaked(format!("row-menu-folder-{}", auth.id)));
@@ -9364,7 +9372,7 @@ mod tests {
         );
         // Auth's current parent is the root, so choosing it changes nothing.
         click(cx, "move-root");
-        assert!(cx.update(|_, app| state.read(app).workspace().move_picker.is_none()));
+        assert!(cx.update(|_, app| state.read(app).move_picker().is_none()));
         assert_eq!(
             cx.update(|_, app| state
                 .read(app)
@@ -9382,7 +9390,7 @@ mod tests {
         click(cx, leaked(format!("move-request-{slug}-{}", stable.id)));
         assert!(cx.debug_bounds("move-current").is_some());
         click(cx, "move-root");
-        assert!(cx.update(|_, app| state.read(app).workspace().move_picker.is_none()));
+        assert!(cx.update(|_, app| state.read(app).move_picker().is_none()));
         assert_eq!(request_named(&state, cx, &slug, "Stable").folder_id, None);
     }
 
@@ -9427,7 +9435,7 @@ mod tests {
         redraw(cx);
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().move_picker.is_none(),
+                state.read(app).move_picker().is_none(),
                 "Escape closes the move picker"
             )
         });
@@ -9442,7 +9450,7 @@ mod tests {
         redraw(cx);
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().move_picker.is_none(),
+                state.read(app).move_picker().is_none(),
                 "a click outside closes the move picker"
             )
         });
@@ -9460,7 +9468,7 @@ mod tests {
         open_row_menu(cx, leaked(format!("row-menu-request-{slug}-{}", login.id)));
         click(cx, leaked(format!("move-request-{slug}-{}", login.id)));
         click(cx, leaked(format!("move-{}-root", target.id)));
-        assert!(cx.update(|_, app| state.read(app).workspace().move_picker.is_none()));
+        assert!(cx.update(|_, app| state.read(app).move_picker().is_none()));
         assert!(
             cx.update(|_, app| state
                 .read(app)
@@ -10538,7 +10546,7 @@ mod tests {
                 "right-clicking a request leaves the active tab alone"
             );
             assert_eq!(
-                app.workspace().row_menu.as_ref(),
+                app.row_menu(),
                 Some(&crate::workspace::RowMenuTarget::Request {
                     slug: slug.clone(),
                     id: refresh.id,
@@ -10602,7 +10610,7 @@ mod tests {
         );
         cx.update(|_, app| {
             assert_eq!(
-                state.read(app).workspace().row_menu.as_ref(),
+                state.read(app).row_menu(),
                 Some(&crate::workspace::RowMenuTarget::Request {
                     slug: slug.clone(),
                     id: target.id,
@@ -10672,7 +10680,7 @@ mod tests {
         // missing panel cannot be asserted from them; check the state.
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().row_menu.is_none(),
+                state.read(app).row_menu().is_none(),
                 "Escape closes a menu opened from the three-dot control"
             )
         });
@@ -10707,7 +10715,7 @@ mod tests {
         // closed panel cannot be asserted from them; check the state.
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().row_menu.is_none(),
+                state.read(app).row_menu().is_none(),
                 "a right-click outside closes the row menu"
             )
         });
@@ -10720,7 +10728,7 @@ mod tests {
 
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().row_menu.is_none(),
+                state.read(app).row_menu().is_none(),
                 "a left click outside closes the row menu"
             )
         });
@@ -10788,7 +10796,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert!(app.tab_menu().is_some());
-            assert!(app.workspace().row_menu.is_none());
+            assert!(app.row_menu().is_none());
             assert_eq!(app.shell().selected_request(), None);
         });
 
@@ -10799,7 +10807,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert_eq!(
-                app.workspace().row_menu.as_ref(),
+                app.row_menu(),
                 Some(&crate::workspace::RowMenuTarget::Collection { slug: slug.clone() })
             );
             assert_eq!(app.tab_menu(), None);
@@ -10811,7 +10819,7 @@ mod tests {
         assert!(cx.debug_bounds("tab-menu").is_some());
         cx.update(|_, app| {
             let app = state.read(app);
-            assert!(app.workspace().row_menu.is_none());
+            assert!(app.row_menu().is_none());
             assert_eq!(app.tab_menu(), Some(app.active_tab_position().0));
             assert_eq!(app.tab_summaries().len(), tabs_before);
         });
@@ -10862,7 +10870,7 @@ mod tests {
         redraw(cx);
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().row_menu.is_none(),
+                state.read(app).row_menu().is_none(),
                 "activating Duplicate dismisses the request menu"
             )
         });
@@ -10887,7 +10895,7 @@ mod tests {
         redraw(cx);
         cx.update(|_, app| {
             assert!(
-                state.read(app).workspace().row_menu.is_none(),
+                state.read(app).row_menu().is_none(),
                 "activating Duplicate dismisses the folder menu"
             )
         });
@@ -12045,14 +12053,14 @@ mod tests {
         let row_menu = leaked(format!("row-menu-collection-{}", collection.id));
         redraw(cx);
         click(cx, row_menu);
-        assert!(cx.update(|_, app| state.read(app).workspace().row_menu.is_some()));
+        assert!(cx.update(|_, app| state.read(app).row_menu().is_some()));
         redraw(cx);
         click(cx, "sidebar-new-collection");
         assert!(cx.update(|_, app| state.read(app).collections_menu_open()));
         // A painted selector outlives its paint, and the focus handle is
         // created on first open and kept, so only the state tells the truth.
         assert!(
-            cx.update(|_, app| state.read(app).workspace().row_menu.is_none()),
+            cx.update(|_, app| state.read(app).row_menu().is_none()),
             "at most one context menu is visible"
         );
         // The open menu hangs under the header and covers the rows beside it,
@@ -12089,7 +12097,7 @@ mod tests {
             !cx.update(|_, app| state.read(app).collections_menu_open()),
             "a row menu closes the collections menu"
         );
-        assert!(cx.update(|_, app| state.read(app).workspace().row_menu.is_some()));
+        assert!(cx.update(|_, app| state.read(app).row_menu().is_some()));
 
         // Choosing New closes the menu and starts the inline rename.
         redraw(cx);
@@ -12682,7 +12690,7 @@ mod tests {
         // The focus handle survives closing; the workspace target is the
         // state that says whether a row menu is open.
         assert!(
-            cx.update(|_, app| state.read(app).workspace().row_menu.is_none()),
+            cx.update(|_, app| state.read(app).row_menu().is_none()),
             "the row menu closes behind the confirmation"
         );
 
@@ -12951,7 +12959,7 @@ mod tests {
         redraw(cx);
         assert!(preview_state(cx).0.is_some(), "the dialog reopens");
         let backdrop = cx
-            .debug_bounds("script-preview-backdrop")
+            .debug_bounds("script-preview-dialog-backdrop")
             .expect("the backdrop is painted");
         let outside = backdrop.origin + point(px(4.), px(4.));
         cx.simulate_click(outside, Modifiers::default());

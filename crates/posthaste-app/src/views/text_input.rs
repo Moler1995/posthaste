@@ -1703,7 +1703,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    Rgba { a: 0.14, ..accent },
+                    theme::accent::subtle_for(accent),
                 )),
                 None,
             )

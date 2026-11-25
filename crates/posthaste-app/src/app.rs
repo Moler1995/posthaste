@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::history::{HistoryState, unix_millis_now};
 use crate::i18n::{self, Key, MessageKey, counted};
 use crate::metrics;
+use crate::overlay::{OverlayHost, OverlayKind};
 use crate::theme::{self, Mode};
 use crate::views::environment_panel::EnvironmentPanel;
 use crate::views::request_editor::RequestEditor;
@@ -869,10 +870,17 @@ fn build_tab(
             }
         });
         // The shell mounts the fields' completion and assignment cards, so a
-        // card that opens, closes, or moves has to redraw the shell itself.
+        // card that opens, closes, or moves has to redraw the shell itself. The
+        // same notification mirrors method menu, preview, and jar state into
+        // the overlay host, after this update ends.
         editor.set_on_overlay_change(move |cx| {
             if let Some(state) = overlay_state.upgrade() {
-                state.update(cx, |_, cx| cx.notify());
+                cx.defer(move |cx| {
+                    state.update(cx, |state, cx| {
+                        state.sync_editor_overlays(cx);
+                        cx.notify();
+                    });
+                });
             }
         });
         // The viewer's Cookies section reports the jar at paint time, so a
@@ -894,7 +902,10 @@ fn build_tab(
         editor.set_on_script_change(move |cx| {
             if let Some(state) = script_state.upgrade() {
                 cx.defer(move |cx| {
-                    state.update(cx, |state, cx| state.refresh_script_preview(id, cx));
+                    state.update(cx, |state, cx| {
+                        state.sync_editor_overlays(cx);
+                        state.refresh_script_preview(id, cx);
+                    });
                 });
             }
         });
@@ -1565,34 +1576,25 @@ pub struct AppState {
     /// The environment loaded into [`AppState::environment_panel`], so a
     /// selection change knows when to reload it.
     environment_panel_slug: Option<String>,
-    /// Whether the settings dialog is open. It owns the keyboard while it is:
-    /// shell shortcuts must not act behind it.
-    settings_open: bool,
+    /// Every menu, popover, and dialog that floats over the shell, and the
+    /// only owner of whether one is open. It holds kinds and layers only;
+    /// focus handles and widget entities stay in the fields below.
+    overlays: OverlayHost,
     /// Focus for the open settings dialog. Created when it opens, so `Escape`
     /// reaches the panel while an editor field would otherwise own the key.
     settings_focus: Option<FocusHandle>,
     /// The dialog's editable number fields, kept alive with the shell so the
     /// dialog can render them without creating entities during paint.
     settings_numbers: SettingsNumbers,
-    /// Whether the save dialog for an untargeted draft is open.
-    save_picker_open: bool,
-    /// The tab whose draft the open save dialog will write, so confirming
-    /// cannot save another tab's content.
-    save_picker_tab: Option<TabId>,
     /// The name editor inside the save dialog, created when it opens.
     save_picker_name: Option<Entity<TextInput>>,
     /// The collection root or folder selected in the save dialog.
     save_picker_destination: Option<SaveDestination>,
     /// Why the last save attempt from the dialog was rejected.
     save_picker_error: Option<String>,
-    /// The close awaiting confirmation because it would discard an unsaved
-    /// draft with content.
-    pending_close: Option<PendingClose>,
     /// The chip the pointer is over, if any. Only that chip's close control
     /// reacts to clicks, so a concealed control cannot close its tab.
     hovered_tab: Option<TabId>,
-    /// The tab whose context menu is open, if any.
-    tab_menu: Option<TabId>,
     /// Focus for the open tab menu, so `Escape` reaches the panel while an
     /// editor field would otherwise own the key.
     tab_menu_focus: Option<FocusHandle>,
@@ -1603,16 +1605,12 @@ pub struct AppState {
     /// Focus for the open move picker, so `Escape` reaches the panel. Created
     /// lazily on the first picker open and reused afterwards.
     move_picker_focus: Option<FocusHandle>,
-    /// Whether the Collections header's menu is open.
-    collections_menu_open: bool,
     /// Focus for the open collections menu, so `Escape` reaches it while an
     /// editor field would otherwise own the key.
     collections_menu_focus: Option<FocusHandle>,
     /// Set while a chosen import file is being read and materialized, so the
     /// header control ignores further clicks.
     importing: bool,
-    /// Whether the cURL text panel is open.
-    curl_import_open: bool,
     /// The collection name editor inside the cURL panel, created when it first
     /// opens and kept afterwards so a cancelled draft survives.
     curl_import_name: Option<Entity<TextInput>>,
@@ -1622,7 +1620,9 @@ pub struct AppState {
     /// The collection the pasted commands go into. `None` creates a new one
     /// named from the panel's collection field.
     curl_import_target: Option<String>,
-    /// Whether the cURL panel's collection picker is open.
+    /// Whether the cURL panel's collection picker is open. It is a control
+    /// inside the panel rather than a peer overlay, so it stays with the panel's
+    /// own content.
     curl_import_target_menu_open: bool,
     /// The command editor inside the cURL panel, kept like the name editor.
     curl_import_text: Option<Entity<TextArea>>,
@@ -1632,8 +1632,6 @@ pub struct AppState {
     /// Whether the command editor holds non-whitespace text. The sidebar reads
     /// this without borrowing the editor.
     curl_import_has_text: bool,
-    /// The collection whose export confirmation panel is open.
-    export_target: Option<String>,
     /// The format the open export confirmation will write.
     export_format: ExportFormat,
     /// Focus for the export confirmation panel.
@@ -1672,25 +1670,15 @@ pub struct AppState {
     /// timer from clearing a newer message.
     workspace_notice: Option<String>,
     workspace_notice_generation: u64,
-    /// Whether the title bar's workspace menu is open.
-    workspace_menu_open: bool,
     /// Focus for the open workspace menu, so `Escape` reaches it while an
     /// editor field would otherwise own the key. Only Windows draws the title
     /// bar that owns this menu.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     workspace_menu_focus: Option<FocusHandle>,
-    /// A chosen directory without `workspace.json`, waiting for confirmation
-    /// before it is initialized.
-    pending_workspace_init: Option<PathBuf>,
     /// Focus for the initialize-directory confirmation.
     workspace_init_focus: Option<FocusHandle>,
-    /// A chosen, initialized directory waiting for the user to say whether it
-    /// opens here or in a new window.
-    pending_workspace_open: Option<PathBuf>,
     /// Focus for the where-to-open choice.
     workspace_open_focus: Option<FocusHandle>,
-    /// Whether the new-workspace dialog is open.
-    new_workspace_open: bool,
     /// The name field inside the new-workspace dialog, created when it opens.
     new_workspace_name: Option<Entity<TextInput>>,
     /// The parent directory the new-workspace dialog will create in.
@@ -1735,8 +1723,6 @@ pub struct AppState {
     reveal: Option<Reveal>,
     /// Whether the History list is collapsed.
     history_collapsed: bool,
-    /// Whether the Variables popover is open.
-    variables_popover_open: bool,
     runtime: Runtime,
     executor: HttpExecutor,
     /// The configuration the current executor was built from, so a preference
@@ -2097,24 +2083,18 @@ impl AppState {
             global_panel,
             environment_panel,
             environment_panel_slug,
-            settings_open: false,
+            overlays: OverlayHost::new(),
             settings_focus: None,
             settings_numbers,
-            save_picker_open: false,
-            save_picker_tab: None,
             save_picker_name: None,
             save_picker_destination: None,
             save_picker_error: None,
-            pending_close: None,
             hovered_tab: None,
-            tab_menu: None,
             tab_menu_focus: None,
             row_menu_focus: None,
             move_picker_focus: None,
-            collections_menu_open: false,
             collections_menu_focus: None,
             importing: false,
-            curl_import_open: false,
             curl_import_name: None,
             curl_import_request_name: None,
             curl_import_target: None,
@@ -2122,7 +2102,6 @@ impl AppState {
             curl_import_text: None,
             curl_import_draft: String::new(),
             curl_import_has_text: false,
-            export_target: None,
             export_format: ExportFormat::default(),
             export_focus: None,
             transfer_notice: None,
@@ -2136,13 +2115,9 @@ impl AppState {
             recents_store,
             workspace_notice: notice,
             workspace_notice_generation: 0,
-            workspace_menu_open: false,
             workspace_menu_focus: None,
-            pending_workspace_init: None,
             workspace_init_focus: None,
-            pending_workspace_open: None,
             workspace_open_focus: None,
-            new_workspace_open: false,
             new_workspace_name: None,
             new_workspace_location: new_workspace_default_location(),
             new_workspace_error: None,
@@ -2166,7 +2141,6 @@ impl AppState {
             // History lives at the bottom of the sidebar and starts collapsed
             // so the collections tree gets the space until it is opened.
             history_collapsed: true,
-            variables_popover_open: false,
             runtime,
             executor,
             http_config,
@@ -2269,17 +2243,17 @@ impl AppState {
     /// Whether the title bar's workspace menu is open.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn workspace_menu_open(&self) -> bool {
-        self.workspace_menu_open
+        self.overlays.contains(&OverlayKind::WorkspaceMenu)
     }
 
     /// The directory waiting for initialization confirmation, if any.
     pub fn pending_workspace_init(&self) -> Option<&Path> {
-        self.pending_workspace_init.as_deref()
+        self.overlays.workspace_init()
     }
 
     /// The initialized directory waiting for a where-to-open choice, if any.
     pub fn pending_workspace_open(&self) -> Option<&Path> {
-        self.pending_workspace_open.as_deref()
+        self.overlays.workspace_open()
     }
 
     /// The focus handle for the where-to-open choice, once opened.
@@ -2289,7 +2263,7 @@ impl AppState {
 
     /// Whether the new-workspace dialog is open.
     pub fn new_workspace_open(&self) -> bool {
-        self.new_workspace_open
+        self.overlays.contains(&OverlayKind::NewWorkspace)
     }
 
     /// The parent directory the new-workspace dialog will create in.
@@ -2309,7 +2283,7 @@ impl AppState {
 
     /// Whether the settings dialog is open.
     pub fn settings_open(&self) -> bool {
-        self.settings_open
+        self.overlays.contains(&OverlayKind::Settings)
     }
 
     /// Focus for the open settings dialog.
@@ -2445,17 +2419,17 @@ impl AppState {
     /// Opens the settings dialog and gives it the keyboard. Opening it changes
     /// no tab, draft, or workspace document.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_open {
+        if self.settings_open() {
             return;
         }
-        self.dismiss_row_menu();
-        self.close_save_picker(cx);
+        // Settings captures input, so the host dismisses every other capturing
+        // surface: the row menu, the move picker, and an open save dialog.
+        self.open_overlay(OverlayKind::Settings, cx);
         let focus = self
             .settings_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
         window.focus(&focus);
-        self.settings_open = true;
         self.sync_settings_numbers(cx);
         cx.notify();
     }
@@ -2463,10 +2437,9 @@ impl AppState {
     /// Closes the settings dialog, keeping every change already applied, and
     /// returns the keyboard to the active request.
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings_open {
+        if !self.overlays.close(&OverlayKind::Settings) {
             return;
         }
-        self.settings_open = false;
         self.focus_active_editor(window, cx);
         cx.notify();
     }
@@ -2518,13 +2491,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FocusHandle {
-        self.workspace_menu_open = true;
-        self.collections_menu_open = false;
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
-        self.tab_menu = None;
-        self.export_target = None;
-        self.curl_import_open = false;
+        self.open_overlay(OverlayKind::WorkspaceMenu, cx);
         let focus = self
             .workspace_menu_focus
             .get_or_insert_with(|| cx.focus_handle())
@@ -2542,7 +2509,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<FocusHandle> {
-        if self.workspace_menu_open {
+        if self.workspace_menu_open() {
             self.close_workspace_menu(cx);
             None
         } else {
@@ -2552,8 +2519,7 @@ impl AppState {
 
     /// Closes an open workspace menu. Escape and clicks outside it use this.
     pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
-        if self.workspace_menu_open {
-            self.workspace_menu_open = false;
+        if self.overlays.close(&OverlayKind::WorkspaceMenu) {
             cx.notify();
         }
     }
@@ -2633,14 +2599,14 @@ impl AppState {
             return;
         };
         if has_workspace_document(&directory) {
-            self.pending_workspace_open = Some(directory);
+            self.open_overlay(OverlayKind::WorkspaceOpen(directory), cx);
             let focus = self
                 .workspace_open_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
             window.focus(&focus);
         } else {
-            self.pending_workspace_init = Some(directory);
+            self.open_overlay(OverlayKind::WorkspaceInit(directory), cx);
             let focus = self
                 .workspace_init_focus
                 .get_or_insert_with(|| cx.focus_handle())
@@ -2678,7 +2644,7 @@ impl AppState {
         if has_workspace_document(&directory) {
             self.open_workspace(&directory, WorkspaceOpenMode::NewWindow, window, cx);
         } else {
-            self.pending_workspace_init = Some(directory);
+            self.open_overlay(OverlayKind::WorkspaceInit(directory), cx);
             let focus = self
                 .workspace_init_focus
                 .get_or_insert_with(|| cx.focus_handle())
@@ -2766,7 +2732,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(directory) = self.pending_workspace_init.take() else {
+        let Some(directory) = self.overlays.take_workspace_init() else {
             return;
         };
         let store = WorkspaceStore::at(&directory);
@@ -2789,7 +2755,7 @@ impl AppState {
     /// Dismisses the initialize-directory confirmation, leaving the directory
     /// untouched.
     pub fn cancel_workspace_init(&mut self, cx: &mut Context<Self>) {
-        if self.pending_workspace_init.take().is_some() {
+        if self.overlays.take_workspace_init().is_some() {
             cx.notify();
         }
     }
@@ -2845,7 +2811,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(directory) = self.pending_workspace_open.take() else {
+        let Some(directory) = self.overlays.take_workspace_open() else {
             return;
         };
         self.open_workspace(&directory, mode, window, cx);
@@ -2853,7 +2819,7 @@ impl AppState {
 
     /// Dismisses the where-to-open choice without opening anything.
     pub fn cancel_workspace_open(&mut self, cx: &mut Context<Self>) {
-        if self.pending_workspace_open.take().is_some() {
+        if self.overlays.take_workspace_open().is_some() {
             cx.notify();
         }
     }
@@ -2861,8 +2827,7 @@ impl AppState {
     /// Opens the new-workspace dialog and focuses its name field.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn open_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace_menu_open = false;
-        self.new_workspace_open = true;
+        self.open_overlay(OverlayKind::NewWorkspace, cx);
         self.new_workspace_error = None;
         self.new_workspace_location = new_workspace_default_location();
         let weak_submit = cx.weak_entity();
@@ -2890,8 +2855,7 @@ impl AppState {
 
     /// Closes the new-workspace dialog without creating anything.
     pub fn close_new_workspace(&mut self, cx: &mut Context<Self>) {
-        if self.new_workspace_open {
-            self.new_workspace_open = false;
+        if self.overlays.close(&OverlayKind::NewWorkspace) {
             self.new_workspace_name = None;
             self.new_workspace_error = None;
             cx.notify();
@@ -2978,10 +2942,10 @@ impl AppState {
         match create_workspace(&location, name) {
             Ok(store) => {
                 let root = store.root().to_path_buf();
-                self.new_workspace_open = false;
+                self.overlays.close(&OverlayKind::NewWorkspace);
+                self.overlays.close(&OverlayKind::WorkspaceMenu);
                 self.new_workspace_name = None;
                 self.new_workspace_error = None;
-                self.workspace_menu_open = false;
                 self.open_workspace(&root, mode, window, cx);
             }
             Err(error) => {
@@ -3466,18 +3430,20 @@ impl AppState {
     /// the panel.
     pub fn open_move_picker(&mut self, target: MoveTarget, cx: &mut Context<Self>) -> FocusHandle {
         self.flush_edits(cx);
-        self.dismiss_row_menu();
-        self.workspace.move_picker = Some(target);
-        self.tab_menu = None;
-        self.collections_menu_open = false;
-        self.export_target = None;
-        self.curl_import_open = false;
+        // The picker captures input, so opening it dismisses the row menu and
+        // every other capturing overlay.
+        self.open_overlay(OverlayKind::MovePicker(target), cx);
         let focus = self
             .move_picker_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
         cx.notify();
         focus
+    }
+
+    /// The item whose move destination is being chosen, if any.
+    pub fn move_picker(&self) -> Option<&MoveTarget> {
+        self.overlays.move_picker()
     }
 
     /// The focus handle the open move picker tracks, once one has been opened.
@@ -3487,7 +3453,10 @@ impl AppState {
 
     /// Closes the destination picker without moving anything.
     pub fn close_move_picker(&mut self, cx: &mut Context<Self>) {
-        if self.workspace.move_picker.take().is_some() {
+        if self
+            .overlays
+            .close_where(|kind| matches!(kind, OverlayKind::MovePicker(_)))
+        {
             cx.notify();
         }
     }
@@ -3500,16 +3469,21 @@ impl AppState {
     /// selection, and reveals the moved row until the filter changes. Tabs
     /// that had the moved request open follow it to its new collection.
     pub fn confirm_move(&mut self, destination: MoveDestination, cx: &mut Context<Self>) -> bool {
-        let Some(target) = self.workspace.move_picker.clone() else {
+        let Some(target) = self.overlays.move_picker().cloned() else {
             return false;
         };
+        let close_picker = |state: &mut Self| {
+            state
+                .overlays
+                .close_where(|kind| matches!(kind, OverlayKind::MovePicker(_)));
+        };
         let Some(current_parent) = self.move_target_parent(&target) else {
-            self.workspace.move_picker = None;
+            close_picker(self);
             cx.notify();
             return false;
         };
         if target.slug() == destination.slug && current_parent == destination.folder {
-            self.workspace.move_picker = None;
+            close_picker(self);
             cx.notify();
             return false;
         }
@@ -3537,7 +3511,7 @@ impl AppState {
             MoveTarget::Request { id, .. } => Reveal::request(slug.clone(), *id),
             MoveTarget::Folder { id, .. } => Reveal::folder(slug.clone(), *id),
         });
-        self.workspace.move_picker = None;
+        close_picker(self);
         self.schedule_session_write(cx);
         cx.notify();
         true
@@ -3625,7 +3599,7 @@ impl AppState {
 
     /// Whether the Variables popover launched from the environment chip is open.
     pub fn variables_popover_open(&self) -> bool {
-        self.variables_popover_open
+        self.overlays.contains(&OverlayKind::Variables)
     }
 
     pub fn toggle_collections_collapsed(&mut self, cx: &mut Context<Self>) {
@@ -3639,13 +3613,16 @@ impl AppState {
     }
 
     pub fn toggle_variables_popover(&mut self, cx: &mut Context<Self>) {
-        self.variables_popover_open = !self.variables_popover_open;
+        if self.variables_popover_open() {
+            self.overlays.close(&OverlayKind::Variables);
+        } else {
+            self.open_overlay(OverlayKind::Variables, cx);
+        }
         cx.notify();
     }
 
     pub fn close_variables_popover(&mut self, cx: &mut Context<Self>) {
-        if self.variables_popover_open {
-            self.variables_popover_open = false;
+        if self.overlays.close(&OverlayKind::Variables) {
             cx.notify();
         }
     }
@@ -3660,8 +3637,9 @@ impl AppState {
         target: RowMenuTarget,
         cx: &mut Context<Self>,
     ) -> Option<FocusHandle> {
-        if self.workspace.row_menu.as_ref() == Some(&target) {
-            self.workspace.row_menu = None;
+        if self.overlays.row_menu() == Some(&target) {
+            self.overlays
+                .close_where(|kind| matches!(kind, OverlayKind::RowMenu(_)));
             cx.notify();
             None
         } else {
@@ -3677,18 +3655,20 @@ impl AppState {
     /// menu and the collections menu: at most one context menu is visible at a
     /// time.
     pub fn open_row_menu(&mut self, target: RowMenuTarget, cx: &mut Context<Self>) -> FocusHandle {
-        self.workspace.row_menu = Some(target);
-        self.workspace.move_picker = None;
-        self.tab_menu = None;
-        self.collections_menu_open = false;
-        self.export_target = None;
-        self.curl_import_open = false;
+        // A row menu captures input, so it dismisses every other capturing
+        // overlay: another row menu, the move picker, a tab menu, or a dialog.
+        self.open_overlay(OverlayKind::RowMenu(target), cx);
         let focus = self
             .row_menu_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
         cx.notify();
         focus
+    }
+
+    /// The row whose action menu is open, if any.
+    pub fn row_menu(&self) -> Option<&RowMenuTarget> {
+        self.overlays.row_menu()
     }
 
     /// The focus handle the open row menu tracks, once one has been opened.
@@ -3698,7 +3678,10 @@ impl AppState {
 
     /// Closes an open row menu. Clicks outside the menu use this.
     pub fn close_row_menu(&mut self, cx: &mut Context<Self>) {
-        if self.workspace.row_menu.take().is_some() {
+        if self
+            .overlays
+            .close_where(|kind| matches!(kind, OverlayKind::RowMenu(_)))
+        {
             cx.notify();
         }
     }
@@ -3708,8 +3691,8 @@ impl AppState {
     /// Returns the menu's focus handle when it opened so the caller can focus
     /// it; `None` when the toggle closed it.
     pub fn toggle_collections_menu(&mut self, cx: &mut Context<Self>) -> Option<FocusHandle> {
-        if self.collections_menu_open {
-            self.collections_menu_open = false;
+        if self.collections_menu_open() {
+            self.overlays.close(&OverlayKind::CollectionsMenu);
             cx.notify();
             None
         } else {
@@ -3719,12 +3702,7 @@ impl AppState {
 
     /// Opens the collections menu, closing every other context menu.
     pub fn open_collections_menu(&mut self, cx: &mut Context<Self>) -> FocusHandle {
-        self.collections_menu_open = true;
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
-        self.tab_menu = None;
-        self.export_target = None;
-        self.curl_import_open = false;
+        self.open_overlay(OverlayKind::CollectionsMenu, cx);
         let focus = self
             .collections_menu_focus
             .get_or_insert_with(|| cx.focus_handle())
@@ -3734,7 +3712,7 @@ impl AppState {
     }
 
     pub fn collections_menu_open(&self) -> bool {
-        self.collections_menu_open
+        self.overlays.contains(&OverlayKind::CollectionsMenu)
     }
 
     /// The focus handle the open collections menu tracks, once one has been
@@ -3746,8 +3724,7 @@ impl AppState {
     /// Closes an open collections menu. Clicks outside the menu and Escape use
     /// this.
     pub fn close_collections_menu(&mut self, cx: &mut Context<Self>) {
-        if self.collections_menu_open {
-            self.collections_menu_open = false;
+        if self.overlays.close(&OverlayKind::CollectionsMenu) {
             cx.notify();
         }
     }
@@ -3759,7 +3736,7 @@ impl AppState {
 
     /// Whether the cURL text panel is open.
     pub fn curl_import_open(&self) -> bool {
-        self.curl_import_open
+        self.overlays.contains(&OverlayKind::CurlImport)
     }
 
     /// The name editor inside the cURL panel, once it has been opened.
@@ -3820,12 +3797,9 @@ impl AppState {
     /// panel without importing preserves the draft for the next open. A target
     /// collection that has since disappeared falls back to creating a new one.
     pub fn open_curl_import(&mut self, cx: &mut Context<Self>) -> FocusHandle {
-        self.collections_menu_open = false;
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
-        self.tab_menu = None;
-        self.export_target = None;
-        self.curl_import_open = true;
+        // The panel captures input, so the host dismisses every other menu and
+        // dialog. Its collection picker is a control inside the panel.
+        self.open_overlay(OverlayKind::CurlImport, cx);
         self.curl_import_target_menu_open = false;
         if self
             .curl_import_target
@@ -3902,8 +3876,7 @@ impl AppState {
 
     /// Closes the cURL panel without importing. The draft is kept.
     pub fn close_curl_import(&mut self, cx: &mut Context<Self>) {
-        if self.curl_import_open {
-            self.curl_import_open = false;
+        if self.overlays.close(&OverlayKind::CurlImport) {
             self.curl_import_target_menu_open = false;
             cx.notify();
         }
@@ -3998,7 +3971,7 @@ impl AppState {
             }
         };
 
-        self.curl_import_open = false;
+        self.overlays.close(&OverlayKind::CurlImport);
         self.curl_import_target_menu_open = false;
         text_area.update(cx, |area, cx| area.replace_content_quiet("", cx));
         request_input.update(cx, |input, _cx| input.set_content_quiet(""));
@@ -4016,7 +3989,7 @@ impl AppState {
 
     /// The collection whose export confirmation panel is open, if any.
     pub fn export_target(&self) -> Option<&str> {
-        self.export_target.as_deref()
+        self.overlays.export_target()
     }
 
     /// The format the open export confirmation will write.
@@ -4040,12 +4013,7 @@ impl AppState {
         format: ExportFormat,
         cx: &mut Context<Self>,
     ) -> FocusHandle {
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
-        self.tab_menu = None;
-        self.collections_menu_open = false;
-        self.curl_import_open = false;
-        self.export_target = Some(slug);
+        self.open_overlay(OverlayKind::ExportConfirm(slug), cx);
         self.export_format = format;
         let focus = self
             .export_focus
@@ -4057,7 +4025,7 @@ impl AppState {
 
     /// Closes the export confirmation without writing anything.
     pub fn cancel_export(&mut self, cx: &mut Context<Self>) {
-        if self.export_target.take().is_some() {
+        if self.overlays.take_export_target().is_some() {
             cx.notify();
         }
     }
@@ -4097,8 +4065,8 @@ impl AppState {
 
     /// Opens the platform open-file dialog and imports the chosen document.
     pub fn choose_import_file(&mut self, cx: &mut Context<Self>) {
-        self.collections_menu_open = false;
-        self.curl_import_open = false;
+        self.overlays.close(&OverlayKind::CollectionsMenu);
+        self.overlays.close(&OverlayKind::CurlImport);
         // The test platform has no open-file dialog; integration tests drive
         // [`Self::import_path`] and [`Self::import_bytes`] instead of the
         // platform call.
@@ -4218,7 +4186,7 @@ impl AppState {
 
     /// Opens the platform save dialog for the collection awaiting export.
     pub fn choose_export_path(&mut self, cx: &mut Context<Self>) {
-        let Some(slug) = self.export_target.take() else {
+        let Some(slug) = self.overlays.take_export_target() else {
             return;
         };
         let Some(entry) = self.workspace.collection(&slug) else {
@@ -4307,19 +4275,82 @@ impl AppState {
         self.set_transfer_notice(notice, cx);
     }
 
-    /// Closes the method dropdown. The shell calls this for clicks that land
-    /// anywhere but the dropdown's own trigger and items.
-    pub fn close_method_menu(&mut self, cx: &mut Context<Self>) {
+    /// The open overlays, in paint order.
+    pub fn overlays(&self) -> &OverlayHost {
+        &self.overlays
+    }
+
+    /// Opens a docked overlay, respecting the one-capturing-surface rule.
+    ///
+    /// The method menu and the jar dialog leave inside the editor because they
+    /// render its draft, so the host cannot dismiss them by itself. Closing
+    /// them here keeps the rule true whichever surface opens next. The script
+    /// preview does not capture input, so it stays visible.
+    fn open_overlay(&mut self, kind: OverlayKind, cx: &mut Context<Self>) {
+        if kind.captures_input() {
+            let editor = self.request_editor().clone();
+            editor.update(cx, |editor, cx| {
+                editor.close_method_menu(cx);
+                editor.close_cookies(cx);
+            });
+        }
+        self.overlays.open(kind);
+    }
+
+    /// Closes every anchored overlay: the menus, popovers, and the cURL panel.
+    ///
+    /// A click that reaches the shell lands outside all of them, so this is the
+    /// one dismissal the shared click handler needs. Dialogs dismiss through
+    /// their own backdrop.
+    pub fn close_anchored_overlays(&mut self, cx: &mut Context<Self>) {
+        let closed = self.overlays.close_layer(crate::overlay::Layer::Anchored);
         let editor = self.request_editor().clone();
         editor.update(cx, |editor, cx| editor.close_method_menu(cx));
+        if closed {
+            cx.notify();
+        }
+    }
+
+    /// Mirrors the active editor's own overlays into the host.
+    ///
+    /// The method menu, the script preview, and the Cookies dialog live inside
+    /// the editor because they render its draft. The host still needs to know
+    /// about them: they take part in mutual exclusion, and the preview is the
+    /// one non-capturing surface. This reads the active editor after its update
+    /// ends, so the host never disagrees with what is painted.
+    pub(crate) fn sync_editor_overlays(&mut self, cx: &Context<Self>) {
+        if self.content == ContentView::Welcome {
+            return;
+        }
+        let editor = self.request_editor().clone();
+        let view = editor.read(cx);
+        let method_open = view.method_menu_open();
+        let cookies_open = view.cookies_open();
+        let preview_open = view.script_preview_format().is_some();
+        if method_open {
+            self.overlays.open(OverlayKind::MethodMenu);
+        } else {
+            self.overlays.close(&OverlayKind::MethodMenu);
+        }
+        if cookies_open {
+            self.overlays.open(OverlayKind::Cookies);
+        } else {
+            self.overlays.close(&OverlayKind::Cookies);
+        }
+        if preview_open {
+            self.overlays.open(OverlayKind::ScriptPreview);
+        } else {
+            self.overlays.close(&OverlayKind::ScriptPreview);
+        }
     }
 
     /// Closes the row menu and the move picker without notifying, for callers
     /// that notify anyway. Both are sidebar overlays that any selection change
     /// makes stale.
     fn dismiss_row_menu(&mut self) {
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
+        self.overlays.close_where(|kind| {
+            matches!(kind, OverlayKind::RowMenu(_) | OverlayKind::MovePicker(_))
+        });
     }
 
     /// The completed-response viewer shown below the request pane.
@@ -4345,9 +4376,8 @@ impl AppState {
     /// Makes the tab at `index` the one the views present. The leaving tab's
     /// pending edits are committed first so its draft stays current.
     pub(crate) fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.tab_menu = None;
-        self.workspace.row_menu = None;
-        self.workspace.move_picker = None;
+        self.overlays.close_tab_menu();
+        self.dismiss_row_menu();
         if index >= self.tabs.len() || index == self.active {
             return;
         }
@@ -4357,6 +4387,9 @@ impl AppState {
         let leaving = self.tabs[self.active].editor.clone();
         leaving.update(cx, |editor, cx| editor.close_cookies(cx));
         self.active = index;
+        // The method menu, preview, and jar dialog belong to the editor that
+        // owns them, so the host follows the newly active tab.
+        self.sync_editor_overlays(cx);
         self.schedule_session_write(cx);
         cx.notify();
     }
@@ -4370,7 +4403,7 @@ impl AppState {
 
     /// The tab whose context menu is open, if any.
     pub fn tab_menu(&self) -> Option<TabId> {
-        self.tab_menu
+        self.overlays.tab_menu()
     }
 
     /// The focus handle the open tab menu tracks, once one has been opened.
@@ -4383,12 +4416,8 @@ impl AppState {
     /// focus handle so the caller can focus it and let `Escape` reach it.
     pub(crate) fn open_tab_menu(&mut self, id: TabId, cx: &mut Context<Self>) -> FocusHandle {
         self.activate_tab_id(id, cx);
-        // At most one context menu is visible at a time, in either direction.
-        self.workspace.row_menu = None;
-        self.collections_menu_open = false;
-        self.export_target = None;
-        self.curl_import_open = false;
-        self.tab_menu = Some(id);
+        // The tab menu captures input, so the host dismisses the other menus.
+        self.open_overlay(OverlayKind::TabMenu(id), cx);
         let focus = self
             .tab_menu_focus
             .get_or_insert_with(|| cx.focus_handle())
@@ -4399,7 +4428,7 @@ impl AppState {
 
     /// Closes the tab menu without changing any tab.
     pub(crate) fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
-        if self.tab_menu.take().is_some() {
+        if self.overlays.close_tab_menu() {
             cx.notify();
         }
     }
@@ -4412,7 +4441,7 @@ impl AppState {
         if self.content == ContentView::Welcome {
             return;
         }
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         let count = self.tabs.len();
         if count < 2 {
             return;
@@ -4450,7 +4479,7 @@ impl AppState {
 
     /// The single tab whose close is waiting for confirmation, if any.
     pub fn pending_close(&self) -> Option<TabId> {
-        match &self.pending_close {
+        match self.overlays.close_confirmation() {
             Some(PendingClose::Tab(id)) => Some(*id),
             _ => None,
         }
@@ -4459,7 +4488,7 @@ impl AppState {
     /// The range awaiting confirmation: how many tabs it holds and how many of
     /// them would lose unsaved drafts.
     pub fn pending_close_range(&self) -> Option<(usize, usize)> {
-        match &self.pending_close {
+        match self.overlays.close_confirmation() {
             Some(PendingClose::Range { ids, discards }) => Some((ids.len(), discards.len())),
             _ => None,
         }
@@ -4467,7 +4496,7 @@ impl AppState {
 
     /// Whether any close is awaiting confirmation.
     pub fn has_pending_close(&self) -> bool {
-        self.pending_close.is_some()
+        self.overlays.close_confirmation().is_some()
     }
 
     /// The title of the tab awaiting close confirmation, for the dialog copy.
@@ -4485,13 +4514,13 @@ impl AppState {
     /// Otherwise the tab is removed and its neighbour is activated; the last
     /// tab is replaced in place by a blank one.
     pub fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
         self.flush_tab_edits(index, cx);
         if self.close_needs_confirmation(index) {
-            self.pending_close = Some(PendingClose::Tab(id));
+            self.open_overlay(OverlayKind::CloseConfirm(PendingClose::Tab(id)), cx);
             cx.notify();
             return;
         }
@@ -4535,7 +4564,7 @@ impl AppState {
 
     /// Flushes the range and either closes it or records one confirmation.
     fn close_range(&mut self, ids: Vec<TabId>, cx: &mut Context<Self>) {
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         let mut remaining = Vec::new();
         let mut discards = Vec::new();
         for id in ids {
@@ -4553,10 +4582,13 @@ impl AppState {
             return;
         }
         if !discards.is_empty() {
-            self.pending_close = Some(PendingClose::Range {
-                ids: remaining,
-                discards,
-            });
+            self.open_overlay(
+                OverlayKind::CloseConfirm(PendingClose::Range {
+                    ids: remaining,
+                    discards,
+                }),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -4579,7 +4611,7 @@ impl AppState {
 
     /// Closes what the pending confirmation covers.
     pub fn confirm_close(&mut self, cx: &mut Context<Self>) {
-        match self.pending_close.take() {
+        match self.overlays.take_close_confirmation() {
             Some(PendingClose::Tab(id)) => {
                 let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
                     cx.notify();
@@ -4596,7 +4628,7 @@ impl AppState {
 
     /// Leaves the tab whose close is awaiting confirmation open and unchanged.
     pub fn cancel_close(&mut self, cx: &mut Context<Self>) {
-        if self.pending_close.take().is_some() {
+        if self.overlays.take_close_confirmation().is_some() {
             cx.notify();
         }
     }
@@ -4621,8 +4653,9 @@ impl AppState {
     fn finish_close(&mut self, index: usize, cx: &mut Context<Self>) {
         let tab = self.remove_tab(index);
         self.close_save_picker_for_tab(tab.id);
-        if self.pending_close == Some(PendingClose::Tab(tab.id)) {
-            self.pending_close = None;
+        if self.overlays.close_confirmation() == Some(&PendingClose::Tab(tab.id)) {
+            self.overlays
+                .close(&OverlayKind::CloseConfirm(PendingClose::Tab(tab.id)));
         }
         if self.tabs.is_empty() {
             // The blank draft is parked for the next request, and the column
@@ -4668,8 +4701,8 @@ impl AppState {
         if self.hovered_tab == Some(tab.id) {
             self.hovered_tab = None;
         }
-        if self.tab_menu == Some(tab.id) {
-            self.tab_menu = None;
+        if self.overlays.tab_menu() == Some(tab.id) {
+            self.overlays.close_tab_menu();
         }
         // A WebSocket session records its one outcome here, before the tab is
         // gone; the transport's own closing event then finds no tab.
@@ -4866,7 +4899,7 @@ impl AppState {
 
     /// Whether the save dialog for an untargeted draft is open.
     pub fn save_picker_open(&self) -> bool {
-        self.save_picker_open
+        self.overlays.contains(&OverlayKind::SavePicker(0))
     }
 
     /// The name editor inside the save dialog, when one is open.
@@ -4967,7 +5000,7 @@ impl AppState {
         // Opening anything leaves the welcome screen; this is the shared leaf
         // of the sidebar and recent-list open paths.
         self.content = ContentView::Tabs;
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         self.dismiss_row_menu();
         self.dismiss_save_picker();
         self.active_tab_mut().revert_confirmation_open = false;
@@ -5052,7 +5085,7 @@ impl AppState {
     /// Nothing is sent and no workspace file is created or changed; the
     /// previously active tab keeps its draft and save state.
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         self.flush_edits(cx);
         // The draft parked behind the welcome screen becomes the new tab, so
         // leaving the screen shows one tab rather than two.
@@ -5536,7 +5569,7 @@ impl AppState {
     /// it, so the menu writes the tab it belongs to even when another tab was
     /// focused when the menu opened.
     pub fn save_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
-        self.tab_menu = None;
+        self.overlays.close_tab_menu();
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
@@ -5557,8 +5590,8 @@ impl AppState {
         if self.content == ContentView::Welcome {
             return;
         }
-        self.tab_menu = None;
-        if self.save_picker_open {
+        self.overlays.close_tab_menu();
+        if self.save_picker_open() {
             self.submit_save_picker(cx);
             return;
         }
@@ -5589,12 +5622,11 @@ impl AppState {
     /// the first collection root is preselected so confirming needs no prior
     /// click.
     pub fn open_save_picker(&mut self, cx: &mut Context<Self>) {
-        if self.save_picker_open {
+        if self.save_picker_open() {
             return;
         }
-        self.dismiss_row_menu();
-        self.save_picker_open = true;
-        self.save_picker_tab = Some(self.active_tab().id);
+        let tab_id = self.active_tab().id;
+        self.open_overlay(OverlayKind::SavePicker(tab_id), cx);
         self.save_picker_error = None;
         self.save_picker_destination =
             self.workspace
@@ -5631,7 +5663,7 @@ impl AppState {
 
     /// Closes the save dialog without saving anything.
     pub fn close_save_picker(&mut self, cx: &mut Context<Self>) {
-        if self.save_picker_open {
+        if self.save_picker_open() {
             self.dismiss_save_picker();
             cx.notify();
         }
@@ -5640,15 +5672,14 @@ impl AppState {
     /// Closes the save dialog when the tab it targets is closing, so a later
     /// confirmation cannot write the closed tab's draft.
     fn close_save_picker_for_tab(&mut self, tab_id: TabId) {
-        if self.save_picker_tab == Some(tab_id) {
+        if self.overlays.save_picker_tab() == Some(tab_id) {
             self.dismiss_save_picker();
         }
     }
 
     /// Closes the dialog without notifying, for callers that notify anyway.
     fn dismiss_save_picker(&mut self) {
-        self.save_picker_open = false;
-        self.save_picker_tab = None;
+        self.overlays.close(&OverlayKind::SavePicker(0));
         self.save_picker_name = None;
         self.save_picker_destination = None;
         self.save_picker_error = None;
@@ -5689,7 +5720,7 @@ impl AppState {
             cx.notify();
             return;
         };
-        let Some(tab_id) = self.save_picker_tab else {
+        let Some(tab_id) = self.overlays.save_picker_tab() else {
             // A dialog without a target cannot write anything.
             self.dismiss_save_picker();
             cx.notify();
@@ -8849,14 +8880,14 @@ mod tests {
                 state.open_row_menu(target.clone(), cx);
                 state.open_row_menu(target.clone(), cx);
                 assert_eq!(
-                    state.workspace().row_menu.as_ref(),
+                    state.row_menu(),
                     Some(&target),
                     "right-clicking the open row keeps its menu open"
                 );
 
                 let focus = state.toggle_row_menu(target.clone(), cx);
                 assert!(focus.is_none(), "toggling the open row closed it");
-                assert_eq!(state.workspace().row_menu, None);
+                assert_eq!(state.row_menu(), None);
             });
         });
     }
@@ -8878,7 +8909,7 @@ mod tests {
             state.update(app, |state, cx| {
                 state.open_tab_menu(tab, cx);
                 state.open_row_menu(target.clone(), cx);
-                assert_eq!(state.workspace().row_menu.as_ref(), Some(&target));
+                assert_eq!(state.row_menu(), Some(&target));
                 assert_eq!(
                     state.tab_menu(),
                     None,
@@ -8887,7 +8918,7 @@ mod tests {
 
                 state.open_tab_menu(tab, cx);
                 assert_eq!(
-                    state.workspace().row_menu,
+                    state.row_menu(),
                     None,
                     "opening a tab menu closes the row menu"
                 );
@@ -19052,7 +19083,7 @@ mod tests {
             state.update(app, |state, cx| {
                 state.close_tab(id, cx);
                 assert!(
-                    state.pending_close.is_some(),
+                    state.has_pending_close(),
                     "the unwritten draft asks before it is discarded"
                 );
                 assert_eq!(
@@ -19209,7 +19240,7 @@ mod tests {
                 "https://example.test/unwritten"
             );
             assert_eq!(*restored.save_state(), RequestSaveState::Edited);
-            assert!(restored.pending_close.is_none(), "nothing asks to discard");
+            assert!(!restored.has_pending_close(), "nothing asks to discard");
             assert_eq!(restored.preferences().layout.window, Some(frame));
         });
     }
