@@ -375,6 +375,10 @@ pub mod layout {
     pub const CONTROL_COMPACT: Pixels = px(28.);
     /// List row height.
     pub const ROW: Pixels = px(30.);
+    /// One collection-tree list item: the 30 px row plus the 2 px gap below it.
+    /// The gap lives inside the item so a uniform list can lay items out without
+    /// external spacing.
+    pub const TREE_ROW: Pixels = px(32.);
     /// In-app title bar.
     pub const TITLE_BAR: Pixels = px(32.);
     /// Sidebar width.
@@ -723,6 +727,11 @@ mod tests {
         assert_eq!(layout::CONTROL, px(32.));
         assert_eq!(layout::CONTROL_COMPACT, px(28.));
         assert_eq!(layout::ROW, px(30.));
+        assert_eq!(
+            layout::TREE_ROW,
+            layout::ROW + space::S2,
+            "a tree item is its row plus the existing gap below it"
+        );
         assert_eq!(layout::SIDEBAR, px(272.));
         assert_eq!(layout::PANE_PADDING, px(20.));
         assert_eq!(layout::GUTTER, px(8.));

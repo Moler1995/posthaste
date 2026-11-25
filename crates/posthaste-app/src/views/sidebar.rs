@@ -7,12 +7,13 @@ use std::collections::HashSet;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, Entity, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, Window, actions, div, px, svg,
+    InteractiveElement, IntoElement, KeyBinding, ListSizingBehavior, MouseButton, ParentElement,
+    Pixels, ScrollStrategy, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
+    actions, div, list, px, svg, uniform_list,
 };
 
 use posthaste_core::history::{HistoryEntry, HistoryId};
-use posthaste_core::model::FolderId;
+use posthaste_core::model::{FolderId, RequestId};
 
 use crate::app::{AppState, ExportFormat, RequestSaveState};
 use crate::assets;
@@ -21,7 +22,7 @@ use crate::i18n::{self, Key, MessageKey, counted};
 use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
 use crate::views::environment_panel::EnvironmentPanel;
-use crate::views::navigation::{NavCollection, NavFolder, NavHistoryRow, NavRequest, NavRow};
+use crate::views::navigation::{NavFolder, NavRequest, NavigationModel, SidebarItem};
 use crate::views::response_pane::{format_duration, format_duration_exact};
 use crate::views::text_area::TextArea;
 use crate::views::text_input::TextInput;
@@ -47,14 +48,8 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 }
 
 pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
-    let shell = app.shell();
     let workspace = app.workspace();
     let history = app.history();
-    let rename_input = app.rename_input();
-    let row_menu = app.row_menu().cloned();
-    let move_picker = app.move_picker().cloned();
-    let row_menu_focus = app.row_menu_focus().cloned();
-    let move_picker_focus = app.move_picker_focus().cloned();
     let collections_menu_focus = app.collections_menu_focus().cloned();
     let collections_menu_open = app.collections_menu_open();
     let importing = app.importing();
@@ -78,15 +73,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     let show_collections = section_expanded(app.collections_collapsed(), &filter);
     let show_history = section_expanded(app.history_collapsed(), &filter);
 
-    let selected_slug = shell.selected_collection().map(str::to_owned);
     let active_environment = app.active_environment().map(str::to_owned);
-
-    let selected_request = shell.selected_request();
-    let save_state = app.save_state();
-    // A delete that removes a request open in a tab states that consequence on
-    // its confirmation. The count comes from the same tab links the delete
-    // detaches, so only the row with the pending target shows it.
-    let delete_tab_note = app.pending_delete_tab_note();
 
     // The tree, the filtered history, and every linked name come from the
     // cached model, so a repaint walks nothing. A closed section is not
@@ -96,83 +83,26 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     // collections shows a smaller number even while the section is closed.
     let collection_count = navigation.collection_count();
 
-    let tree: Vec<AnyElement> = navigation
-        .collections()
-        .iter()
-        .flat_map(|collection| {
-            let slug = collection.slug.clone();
-            let selected = collection_row_selected(
-                selected_slug.as_deref(),
-                selected_request,
-                &collection.slug,
-            );
-            let mut elements = vec![collection_row(
-                state.clone(),
-                collection,
-                selected,
-                workspace,
-                rename_input,
-                row_menu.as_ref(),
-                row_menu_focus.as_ref(),
-                delete_tab_note.as_deref(),
-            )];
-            if collection.expanded {
-                if collection.rows.is_empty() {
-                    elements.push(empty_requests_row(state.clone(), slug.clone()));
-                } else {
-                    // An expanded folder with nothing beneath it gets a
-                    // quiet child row; it is suppressed while a search is
-                    // active, where only the match itself should show.
-                    let show_empty_folders = filter.is_empty();
-                    elements.extend(collection.rows.iter().flat_map(|row| match row {
-                        NavRow::Folder(folder) => {
-                            let element = folder_row(
-                                state.clone(),
-                                &slug,
-                                folder,
-                                workspace,
-                                rename_input,
-                                row_menu.as_ref(),
-                                move_picker.as_ref(),
-                                row_menu_focus.as_ref(),
-                                move_picker_focus.as_ref(),
-                                delete_tab_note.as_deref(),
-                            );
-                            let empty_folder =
-                                (show_empty_folders && folder.expanded && !folder.has_children)
-                                    .then(|| {
-                                        empty_folder_row(
-                                            state.clone(),
-                                            &slug,
-                                            folder.id,
-                                            folder.depth + 1,
-                                        )
-                                    });
-                            std::iter::once(element).chain(empty_folder)
-                        }
-                        NavRow::Request(request) => {
-                            let element = request_row(
-                                state.clone(),
-                                &slug,
-                                request,
-                                selected_request == Some(request.id),
-                                save_state,
-                                workspace,
-                                rename_input,
-                                row_menu.as_ref(),
-                                move_picker.as_ref(),
-                                row_menu_focus.as_ref(),
-                                move_picker_focus.as_ref(),
-                                delete_tab_note.as_deref(),
-                            );
-                            std::iter::once(element).chain(None)
-                        }
-                    }));
-                }
-            }
-            elements
-        })
-        .collect();
+    // Reveal scrolls once per value: the model remembers the last reveal, so a
+    // later repaint with the same value leaves the list alone. The list is
+    // only built while its section shows, so a hidden section does not
+    // consume the scroll request.
+    if show_collections {
+        let reveal = app.sidebar_reveal();
+        if let Some(index) = navigation.take_tree_reveal(reveal.as_ref()) {
+            navigation
+                .tree_scroll()
+                .scroll_to_item(index, ScrollStrategy::Bottom);
+        }
+    }
+    if show_history {
+        if let Some(index) = navigation.take_history_reveal(app.shell().selected_history()) {
+            navigation.history_scroll().scroll_to_reveal_item(index);
+        }
+    }
+
+    // The cached flat index is shared, not copied: a repaint clones one `Rc`.
+    let tree_rows = navigation.rows().clone();
 
     // Nothing rendered under an expanded section still needs a state: the
     // create action when there are no collections, and the search result when
@@ -217,7 +147,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
         navigation.history_count(),
         !show_history,
     );
-    let history_list = show_history.then(|| history_list(state.clone(), app, navigation.history()));
+    let history_list = show_history.then(|| history_list(state.clone(), app, &navigation));
 
     let chip_state = state.clone();
     let chip_active = active_environment.is_some();
@@ -286,12 +216,76 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                     .text_color(theme::text::tertiary()),
             );
 
+    // The tree list is built only while the section shows and holds a row. A
+    // closed section builds no row elements at all; an empty one renders the
+    // empty-collections or no-match block instead of a list.
+    let tree_list = (show_collections && !tree_rows.is_empty()).then(|| {
+        let list_state = navigation.tree_scroll();
+        let built = navigation.rows_built_counter();
+        let list_rows = tree_rows.clone();
+        let row_state = state.clone();
+        uniform_list(
+            "sidebar-tree-list",
+            list_rows.len(),
+            move |range, _window, cx| {
+                // Selection, rename, menu, move, and save state are read at
+                // paint time, so the list never shows a stale snapshot beyond
+                // the ids its index carries.
+                let app = row_state.read(cx);
+                let workspace = app.workspace();
+                let selected_slug = app.shell().selected_collection();
+                let selected_request = app.shell().selected_request();
+                let save_state = app.save_state();
+                let rename_input = app.rename_input();
+                let row_menu = app.row_menu();
+                let move_picker = app.move_picker();
+                let row_menu_focus = app.row_menu_focus();
+                let move_picker_focus = app.move_picker_focus();
+                let delete_tab_note = app.pending_delete_tab_note();
+                range
+                    .filter_map(|index| {
+                        let item = list_rows.item(index)?;
+                        built.set(built.get() + 1);
+                        let row = sidebar_tree_row(
+                            row_state.clone(),
+                            item,
+                            selected_slug,
+                            selected_request,
+                            save_state,
+                            workspace,
+                            rename_input,
+                            row_menu,
+                            move_picker,
+                            row_menu_focus,
+                            move_picker_focus,
+                            delete_tab_note.as_deref(),
+                        );
+                        // The 2 px gap below the 30 px row lives inside the
+                        // uniform item, so the list needs no external spacing.
+                        Some(
+                            div()
+                                .h(layout::TREE_ROW)
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .child(row)
+                                .into_any_element(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .debug_selector(|| "sidebar-tree-list".to_owned())
+        .flex_1()
+        .min_h_0()
+        .track_scroll(list_state)
+    });
+
     let middle = div()
         .id("sidebar-scroll")
         .debug_selector(|| "sidebar-scroll".to_owned())
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
         .flex()
         .flex_col()
         .gap(space::S4)
@@ -325,14 +319,8 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                 }),
             )),
         ))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(space::S2)
-                .children(tree)
-                .children(collections_state),
-        );
+        .children(tree_list)
+        .children(collections_state);
 
     div()
         .debug_selector(|| "sidebar".to_owned())
@@ -939,43 +927,75 @@ fn history_state_row(selector: &'static str, message: &'static str) -> Div {
         )
 }
 
-/// The history rows as the cached model selected them. Each row names its
-/// index into the loaded entries, so no lookup by id runs here.
-fn history_list(state: Entity<AppState>, app: &AppState, rows: &[NavHistoryRow]) -> AnyElement {
+/// The history rows as the cached model selected them.
+///
+/// The rows are three lines tall and differ from each other, so the list is
+/// gpui's variable-height `ListState`, not the tree's uniform list. Each row
+/// names its index into the loaded entries, so a paint reads the entry
+/// directly and no lookup by id runs here. The empty and no-match blocks are
+/// not list items: they replace the list.
+fn history_list(
+    state: Entity<AppState>,
+    app: &AppState,
+    navigation: &NavigationModel,
+) -> AnyElement {
     let history = app.history();
 
-    let mut list = div()
+    let mut section = div()
         .id("history-list")
         .debug_selector(|| "history-list".to_owned())
-        .max_h(px(200.))
-        .overflow_y_scroll()
+        .w_full()
         .flex()
-        .flex_col()
-        .gap(space::S2);
+        .flex_col();
 
     if history.is_empty() {
-        list = list.child(history_state_row(
+        section = section.child(history_state_row(
             "history-empty",
             i18n::t(Key::SidebarNoHistory),
         ));
-    } else if rows.is_empty() {
-        list = list.child(history_state_row(
+    } else if navigation.history().is_empty() {
+        section = section.child(history_state_row(
             "history-no-matches",
             i18n::t(Key::CommonNoMatches),
         ));
     } else {
-        list = list.children(rows.iter().filter_map(|row| {
-            let entry = history.entries.get(row.index)?;
-            Some(history_row(
-                state.clone(),
-                entry,
-                row.linked_name.as_deref(),
-                app.shell().selected_history() == Some(entry.id),
-            ))
-        }));
+        let rows = navigation.history_rows();
+        let list_state = navigation.history_scroll();
+        let built = navigation.rows_built_counter();
+        let row_state = state.clone();
+        section = section.child(
+            list(list_state, move |index, _window, cx| {
+                let app = row_state.read(cx);
+                let history = app.history();
+                let Some(row) = rows.get(index) else {
+                    return div().into_any_element();
+                };
+                let Some(entry) = history.entries.get(row.index) else {
+                    return div().into_any_element();
+                };
+                built.set(built.get() + 1);
+                // The 2 px separation lives inside each measured item, since
+                // the list has no row gap of its own.
+                div()
+                    .w_full()
+                    .pb(space::S2)
+                    .child(history_row(
+                        row_state.clone(),
+                        entry,
+                        row.linked_name.as_deref(),
+                        app.shell().selected_history() == Some(entry.id),
+                    ))
+                    .into_any_element()
+            })
+            .w_full()
+            // The history band grows with its rows up to a bounded height and
+            // scrolls past it, so it never pushes the footer out of view.
+            .max_h(px(200.))
+            .with_sizing_behavior(ListSizingBehavior::Infer),
+        );
     }
 
-    list.into_any_element()
+    section.into_any_element()
 }
 
 fn history_row(
@@ -1041,6 +1061,7 @@ fn history_row(
         .id(SharedString::from(id))
         .debug_selector(move || selector.clone())
         .group(group.clone())
+        .w_full()
         .flex()
         .flex_col()
         .gap(space::S2)
@@ -2228,10 +2249,83 @@ fn rename_error_panel(message: String) -> AnyElement {
     )
 }
 
+/// Builds one indexed collection-tree row.
+///
+/// The index carries every display field; only selection, rename, menu, move,
+/// and save state are resolved from the live application here, so the list
+/// closure stays free of tree lookups.
+#[allow(clippy::too_many_arguments)]
+fn sidebar_tree_row(
+    state: Entity<AppState>,
+    item: &SidebarItem,
+    selected_slug: Option<&str>,
+    selected_request: Option<RequestId>,
+    save_state: &RequestSaveState,
+    workspace: &WorkspaceState,
+    rename_input: Option<&Entity<TextInput>>,
+    row_menu: Option<&RowMenuTarget>,
+    move_picker: Option<&MoveTarget>,
+    row_menu_focus: Option<&FocusHandle>,
+    move_picker_focus: Option<&FocusHandle>,
+    delete_tab_note: Option<&str>,
+) -> AnyElement {
+    match item {
+        SidebarItem::Collection {
+            slug,
+            name,
+            request_count,
+            expanded,
+        } => collection_row(
+            state,
+            slug,
+            name,
+            *request_count,
+            *expanded,
+            collection_row_selected(selected_slug, selected_request, slug),
+            workspace,
+            rename_input,
+            row_menu,
+            row_menu_focus,
+            delete_tab_note,
+        ),
+        SidebarItem::Folder { slug, folder } => folder_row(
+            state,
+            slug,
+            folder,
+            workspace,
+            rename_input,
+            row_menu,
+            move_picker,
+            row_menu_focus,
+            move_picker_focus,
+            delete_tab_note,
+        ),
+        SidebarItem::Request { slug, request } => request_row(
+            state,
+            slug,
+            request,
+            selected_request == Some(request.id),
+            save_state,
+            workspace,
+            rename_input,
+            row_menu,
+            move_picker,
+            row_menu_focus,
+            move_picker_focus,
+            delete_tab_note,
+        ),
+        SidebarItem::EmptyRequests { slug } => empty_requests_row(state, slug.clone()),
+        SidebarItem::EmptyFolder { slug, id, depth } => empty_folder_row(state, slug, *id, *depth),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collection_row(
     state: Entity<AppState>,
-    collection: &NavCollection,
+    collection_slug: &str,
+    collection_name: &str,
+    request_count: usize,
+    expanded: bool,
     selected: bool,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
@@ -2239,9 +2333,8 @@ fn collection_row(
     row_menu_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
 ) -> AnyElement {
-    let slug = collection.slug.clone();
-    let name = collection.name.clone();
-    let expanded = collection.expanded;
+    let slug = collection_slug.to_owned();
+    let name = collection_name.to_owned();
     let renaming = workspace.rename_target == Some(RenameTarget::Collection { slug: slug.clone() });
     let deleting = workspace.delete_target == Some(DeleteTarget::Collection { slug: slug.clone() });
     let rename_error = renaming.then(|| workspace.rename_error.clone()).flatten();
@@ -2289,7 +2382,7 @@ fn collection_row(
                     .text_color(theme::text::primary())
                     .child(name.clone()),
             )
-            .child(super::ui::meta_count(collection.request_count))
+            .child(super::ui::meta_count(request_count))
             .into_any_element()
     };
 
@@ -2765,12 +2858,16 @@ fn create_folder_action(
 }
 
 /// Branch guide rails for a row at `depth`. Each rail marks one ancestor
-/// branch. Segments reach into the 2 px row gap so a branch reads as one
-/// continuous line, and levels past the indent cap share the deepest rail.
-/// `color` lets a popover overlay pick a rail that stays visible on its own
-/// background instead of the sidebar's.
+/// branch. Segments reach into the 2 px gap above the row, which lives inside
+/// the uniform list item, so a branch reads as one continuous line. Levels
+/// past the indent cap share the deepest rail. `color` lets a popover overlay
+/// pick a rail that stays visible on its own background instead of the
+/// sidebar's.
 fn tree_rails(row_selector: &str, depth: usize, color: gpui::Rgba) -> Vec<AnyElement> {
     let levels = depth.min(6);
+    // The item is one row plus the gap below it, and the next row's rail
+    // covers that gap above itself.
+    let gap = layout::TREE_ROW - layout::ROW;
     (1..=levels)
         .map(|level| {
             let selector = format!("{row_selector}-rail-{level}");
@@ -2778,9 +2875,9 @@ fn tree_rails(row_selector: &str, depth: usize, color: gpui::Rgba) -> Vec<AnyEle
                 .debug_selector(move || selector.clone())
                 .absolute()
                 .left(layout::tree_rail(level))
-                .top(px(-2.))
+                .top(-gap)
                 .w(px(1.))
-                .h(layout::ROW + px(2.))
+                .h(layout::TREE_ROW)
                 .bg(color)
                 .into_any_element()
         })
