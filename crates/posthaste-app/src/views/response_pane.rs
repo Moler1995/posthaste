@@ -1,5 +1,6 @@
 //! Response pane: loading, success, failure, and cancellation states.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gpui::{
@@ -22,6 +23,27 @@ use crate::theme;
 
 /// Maximum body bytes rendered in the pane.
 pub const PREVIEW_LIMIT: usize = 5 * 1024 * 1024;
+
+/// Debug-only evidence that a repaint does not build a body preview. The
+/// counters are read by the response-pane visual tests.
+static PREVIEW_BUILDS: AtomicU64 = AtomicU64::new(0);
+static BODY_BYTES_COPIED: AtomicU64 = AtomicU64::new(0);
+
+fn count_preview(copied: usize) {
+    if cfg!(debug_assertions) {
+        PREVIEW_BUILDS.fetch_add(1, Ordering::Relaxed);
+        BODY_BYTES_COPIED.fetch_add(copied as u64, Ordering::Relaxed);
+    }
+}
+
+/// The number of previews built and body bytes copied so far.
+#[cfg(test)]
+pub(crate) fn preview_counters() -> (u64, u64) {
+    (
+        PREVIEW_BUILDS.load(Ordering::Relaxed),
+        BODY_BYTES_COPIED.load(Ordering::Relaxed),
+    )
+}
 
 /// The text shown for a response body, plus whether it was shortened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +95,7 @@ pub fn preview_body(response: &ResponseRecord) -> BodyPreview {
     } else {
         String::from_utf8_lossy(&response.body[..end]).into_owned()
     };
+    count_preview(text.len());
     BodyPreview {
         text,
         size: response.body.len(),
@@ -87,6 +110,7 @@ pub fn preview_body(response: &ResponseRecord) -> BodyPreview {
 /// prefix, so the live `limited` flag does not apply. Binary entries keep
 /// metadata only, which is why their `body_stored` is false.
 pub fn preview_stored_body(stored: &StoredResponse) -> BodyPreview {
+    count_preview(stored.body.len());
     BodyPreview {
         text: stored.body.clone(),
         size: stored.body_bytes as usize,
@@ -110,7 +134,9 @@ pub enum HistoryOutcomeView {
         /// Retained body size in bytes, as recorded with the stored response.
         size: usize,
         headers: Vec<(String, String)>,
-        body: BodyPreview,
+        /// Filled only by the test description; rendering reads the viewer's
+        /// preview instead of rebuilding it.
+        body: Option<BodyPreview>,
     },
     /// A WebSocket session: the stored handshake is shown in the viewer, and
     /// the header carries the frame totals the entry recorded.
@@ -151,7 +177,9 @@ pub enum ResponseView {
         /// Retained body size in bytes.
         size: usize,
         headers: Vec<(String, String)>,
-        body: BodyPreview,
+        /// Filled only by the test description; the render path uses the
+        /// preview the viewer built at presentation.
+        body: Option<BodyPreview>,
     },
     Failed {
         request: RequestId,
@@ -167,10 +195,32 @@ pub enum ResponseView {
     },
 }
 
+/// The description the render path uses. It never builds a body preview: the
+/// viewer already holds the one built when the response was presented.
+pub fn presentation(
+    state: &ShellState,
+    history: Option<&HistoryEntry>,
+    streaming: Option<&StreamingMeta>,
+) -> ResponseView {
+    describe(state, history, streaming, false)
+}
+
+/// A testable description of what the response pane renders, including the
+/// body the viewer would present.
+#[cfg(test)]
 pub fn view(
     state: &ShellState,
     history: Option<&HistoryEntry>,
     streaming: Option<&StreamingMeta>,
+) -> ResponseView {
+    describe(state, history, streaming, true)
+}
+
+fn describe(
+    state: &ShellState,
+    history: Option<&HistoryEntry>,
+    streaming: Option<&StreamingMeta>,
+    build_body: bool,
 ) -> ResponseView {
     if let Some(entry) = history {
         let outcome = match &entry.outcome {
@@ -181,7 +231,7 @@ pub fn view(
                 // when only a prefix of it was written to history.
                 size: response.body_bytes as usize,
                 headers: response.headers.clone(),
-                body: preview_stored_body(response),
+                body: build_body.then(|| preview_stored_body(response)),
             },
             HistoryOutcome::Session(session) => {
                 let (status, headers) = session
@@ -226,7 +276,7 @@ pub fn view(
             duration: response.duration,
             size: response.body.len(),
             headers: response.headers.clone(),
-            body: preview_body(response),
+            body: build_body.then(|| preview_body(response)),
         },
         ExecutionState::Failed { request, message } => ResponseView::Failed {
             request: *request,
@@ -273,7 +323,7 @@ pub fn render(
     streaming: Option<&StreamingMeta>,
     has_previous: bool,
 ) -> impl IntoElement {
-    let view = view(shell, history, streaming);
+    let view = presentation(shell, history, streaming);
     let header = response_header(&view);
     let accent = theme::http_method(shell.draft().method);
     let content: AnyElement = match view {
@@ -698,14 +748,14 @@ mod tests {
                     duration: Duration::from_millis(42),
                     size: 5,
                     headers: Vec::new(),
-                    body: BodyPreview {
+                    body: Some(BodyPreview {
                         text: "plain".to_owned(),
                         size: 5,
                         limited: false,
                         truncated: false,
                         history_limited: false,
                         binary: None,
-                    },
+                    }),
                 },
             }
         }
@@ -753,14 +803,14 @@ mod tests {
                 duration: Duration::from_millis(12),
                 size: 11,
                 headers: Vec::new(),
-                body: BodyPreview {
+                body: Some(BodyPreview {
                     text: "{\"ok\":true}".to_owned(),
                     size: 11,
                     limited: false,
                     truncated: false,
                     history_limited: false,
                     binary: None,
-                },
+                }),
             },
         };
         let (_host, cx) = header_window(cx, view);
@@ -967,14 +1017,14 @@ mod tests {
                 duration: Duration::from_millis(42),
                 size: 7,
                 headers: vec![("content-type".into(), "text/plain".into())],
-                body: BodyPreview {
+                body: Some(BodyPreview {
                     text: "missing".into(),
                     size: 7,
                     limited: false,
                     truncated: false,
                     history_limited: false,
                     binary: None,
-                },
+                }),
             }
         );
     }
@@ -1028,14 +1078,14 @@ mod tests {
                     duration: Duration::from_millis(42),
                     size: 11,
                     headers: vec![("content-type".into(), "application/json".into())],
-                    body: BodyPreview {
+                    body: Some(BodyPreview {
                         text: "{\"ok\":true}".into(),
                         size: 11,
                         limited: false,
                         truncated: false,
                         history_limited: false,
                         binary: None,
-                    },
+                    }),
                 },
             }
         );

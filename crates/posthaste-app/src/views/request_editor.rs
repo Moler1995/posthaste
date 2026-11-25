@@ -19,7 +19,9 @@ use posthaste_core::cookies::{
     CookieInfo, CookieJar, PersistenceState, cookie_url, draft_url, has_manual_cookie_header,
 };
 use posthaste_core::error::PosthasteError;
-use posthaste_core::http::{GeneratedHeader, file_media_type, generated_headers, validate_request};
+use posthaste_core::http::{
+    GeneratedHeader, file_media_type, generated_headers_with_file_length, validate_request,
+};
 use posthaste_core::model::{
     ApiKeyLocation, HttpMethod, KeyValue, MultipartPart, RequestAuth, RequestBody, RequestProtocol,
     RequestSpec,
@@ -324,6 +326,27 @@ type CookiesChangedHandler = Box<dyn Fn(&mut App) + 'static>;
 /// owns the variables and therefore the rendered text.
 type ScriptChangeHandler = Box<dyn Fn(&mut App) + 'static>;
 
+/// What a metadata read learned about the File body's chosen file.
+///
+/// The status line under the path and the generated `Content-Length` both
+/// describe the file, and both are painted every frame. Caching the facts
+/// keeps a repaint free of filesystem calls; the cache is refreshed when a
+/// draft loads, when a file is chosen, and when the window regains focus,
+/// where a file changed by another program becomes visible again.
+#[derive(Clone, Debug, Default)]
+struct FileFacts {
+    /// The recorded path, as the draft stores it, these facts describe.
+    recorded: String,
+    /// When the file was last modified. A metadata read reports it, so it is
+    /// cached with the rest of the facts; nothing is painted from it.
+    #[allow(dead_code)]
+    modified: Option<std::time::SystemTime>,
+    /// The file's length in bytes. Zero while it does not exist.
+    len: u64,
+    /// Whether the resolved path is a regular file.
+    exists: bool,
+}
+
 /// Editable state for the request pane.
 pub struct RequestEditor {
     spec: RequestSpec,
@@ -349,6 +372,15 @@ pub struct RequestEditor {
     /// The muted note under the File mode's path, such as an import failure.
     /// It is never a validation error: only Send rejects a missing file.
     file_notice: Option<String>,
+    /// The File mode's chosen file, as the last metadata read found it.
+    file_facts: FileFacts,
+    /// Keeps the window-activation observer that refreshes `file_facts` alive.
+    /// Registered on the first render, because construction has no window.
+    activation: Option<gpui::Subscription>,
+    /// Metadata reads the file cache has performed. Test-only, so a repaint
+    /// can prove it checked no file.
+    #[cfg(test)]
+    metadata_reads: usize,
     auth_kind: AuthKind,
     auth_location: ApiKeyLocation,
     auth_text: AuthText,
@@ -632,6 +664,10 @@ impl RequestEditor {
             file_path: String::new(),
             workspace: None,
             file_notice: None,
+            file_facts: FileFacts::default(),
+            activation: None,
+            #[cfg(test)]
+            metadata_reads: 0,
             auth_kind: AuthKind::None,
             auth_location: ApiKeyLocation::Header,
             auth_text: AuthText::default(),
@@ -685,6 +721,9 @@ impl RequestEditor {
     /// so one editor never sees two stores.
     pub fn set_workspace(&mut self, workspace: Option<WorkspaceStore>, cx: &mut Context<Self>) {
         self.workspace = workspace;
+        // The draft may have loaded before the store was known, so a relative
+        // upload path only resolves now.
+        self.refresh_file_facts();
         cx.notify();
     }
 
@@ -1110,6 +1149,7 @@ impl RequestEditor {
             self.reset_cookie_form(cx);
         }
         self.sync_accents(cx);
+        self.refresh_file_facts();
         self.loading.set(false);
         self.refresh_validation();
         cx.notify();
@@ -1633,6 +1673,7 @@ impl RequestEditor {
         };
         self.body_input
             .update(cx, |input, cx| input.set_syntax(Syntax::Plain, cx));
+        self.refresh_file_facts();
         self.refresh_validation();
         self.emit_change(window, cx);
         cx.notify();
@@ -2609,6 +2650,9 @@ fn field_cell(
 
 impl Render for RequestEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The first frame is where the editor first has a window, so the
+        // activation observer that refreshes the file facts is installed here.
+        self.observe_activation(window, cx);
         let editor = cx.entity();
         let content: gpui::AnyElement = match self.tab {
             // The body tab keeps its mode row fixed and scrolls only the
@@ -2891,11 +2935,77 @@ impl RequestEditor {
             .into_any_element()
     }
 
-    /// The generated header rows the Headers tab shows, computed against this
-    /// editor's workspace so a file body's size and type resolve.
+    /// The generated header rows the Headers tab shows.
+    ///
+    /// The upload file's length comes from the cached facts, so painting the
+    /// tab checks no file; a path the facts do not describe supplies no length
+    /// rather than a fresh metadata call.
     fn generated_headers(&self) -> Vec<GeneratedHeader> {
-        let assets_root = self.workspace.as_ref().map(WorkspaceStore::root);
-        generated_headers(&self.spec, assets_root)
+        generated_headers_with_file_length(&self.spec, self.upload_file_length())
+    }
+
+    /// The cached length of the body's upload file, when the facts describe
+    /// that exact file.
+    fn upload_file_length(&self) -> Option<u64> {
+        let RequestBody::File { path } = &self.spec.body else {
+            return None;
+        };
+        (self.file_facts.recorded == path.trim() && self.file_facts.exists)
+            .then_some(self.file_facts.len)
+    }
+
+    /// Answers what the recorded upload path resolves to.
+    fn resolve_file(&self, path: &str) -> Option<PathBuf> {
+        if Path::new(path).is_absolute() {
+            Some(PathBuf::from(path))
+        } else {
+            self.workspace
+                .as_ref()
+                .and_then(|store| store.resolve_asset(path))
+        }
+    }
+
+    /// Reads the chosen file's facts once. Called when a draft loads, when a
+    /// file is chosen, and when the window regains focus; never from render.
+    fn refresh_file_facts(&mut self) {
+        #[cfg(test)]
+        {
+            self.metadata_reads += 1;
+        }
+        let recorded = self.file_path.trim().to_owned();
+        let mut facts = FileFacts {
+            recorded,
+            ..FileFacts::default()
+        };
+        if let Some(resolved) = self.resolve_file(&facts.recorded)
+            && let Ok(metadata) = std::fs::metadata(&resolved)
+            && metadata.is_file()
+        {
+            facts.exists = true;
+            facts.len = metadata.len();
+            facts.modified = metadata.modified().ok();
+        }
+        self.file_facts = facts;
+    }
+
+    /// Refreshes the file facts when the window is brought forward, since a
+    /// file may have changed while the application was in the background.
+    fn observe_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activation.is_some() {
+            return;
+        }
+        self.activation = Some(cx.observe_window_activation(window, |editor, window, cx| {
+            if window.is_window_active() {
+                editor.refresh_file_facts();
+                cx.notify();
+            }
+        }));
+    }
+
+    /// Metadata reads the file cache has performed. Test-only.
+    #[cfg(test)]
+    pub(crate) fn metadata_reads(&self) -> usize {
+        self.metadata_reads
     }
 
     /// The headers the client adds on its own, shown above the editable rows.
@@ -3144,7 +3254,7 @@ impl RequestEditor {
 
     /// The muted line under the File mode's path: an import failure, the
     /// resolved file's size and inferred type, or the missing-file hint. `None`
-    /// while no file is chosen.
+    /// while no file is chosen. It reads the cached facts, never the file.
     fn file_status(&self) -> Option<String> {
         if let Some(notice) = &self.file_notice {
             return Some(notice.clone());
@@ -3153,24 +3263,14 @@ impl RequestEditor {
         if path.is_empty() {
             return None;
         }
-        let resolved = if Path::new(path).is_absolute() {
-            Some(PathBuf::from(path))
-        } else {
-            self.workspace
-                .as_ref()
-                .and_then(|store| store.resolve_asset(path))
-        };
-        let Some(resolved) = resolved else {
-            return Some(i18n::t(Key::EditorMissingFile).to_owned());
-        };
-        match std::fs::metadata(&resolved) {
-            Ok(metadata) if metadata.is_file() => Some(format!(
+        if self.file_facts.recorded == path && self.file_facts.exists {
+            return Some(format!(
                 "{} · {}",
-                format_bytes(metadata.len() as usize),
+                format_bytes(self.file_facts.len as usize),
                 file_media_type(path)
-            )),
-            _ => Some(i18n::t(Key::EditorMissingFile).to_owned()),
+            ));
         }
+        Some(i18n::t(Key::EditorMissingFile).to_owned())
     }
 
     fn render_auth(&self, editor: &Entity<RequestEditor>) -> gpui::AnyElement {
@@ -4683,6 +4783,94 @@ mod tests {
         assert!(
             cx.debug_bounds("request-body-error").is_none(),
             "no red line appears until Send"
+        );
+    }
+
+    /// Repainting never stats the upload file: the facts are learned when the
+    /// draft loads or a file is chosen, and again only when the window becomes
+    /// active again.
+    #[gpui::test]
+    async fn a_repaint_reads_cached_file_facts(cx: &mut gpui::TestAppContext) {
+        let (editor, cx) = editor_view(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        let source = dir.path().join("report.pdf");
+        std::fs::write(&source, b"%PDF-1.7").expect("write the picked file");
+        cx.update(|window, app| {
+            editor.update(app, |editor, cx| {
+                editor.set_workspace(Some(WorkspaceStore::at(dir.path())), cx);
+                editor.set_body_mode(BodyMode::File, window, cx);
+                editor.set_tab(RequestTab::Body, cx);
+            });
+        });
+        draw(cx);
+        cx.update(|window, app| {
+            editor.update(app, |editor, cx| editor.import_upload(&source, window, cx));
+        });
+        draw(cx);
+        let reads = cx.update(|_, app| editor.read(app).metadata_reads());
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).file_status())
+                .as_deref(),
+            Some("8 B · application/pdf"),
+            "choosing a file records its size and type"
+        );
+
+        draw(cx);
+        draw(cx);
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).metadata_reads()),
+            reads,
+            "a repaint stats nothing"
+        );
+
+        let url = cx.update(|_, app| editor.read(app).url_input());
+        cx.update(|window, app| {
+            url.update(app, |input, cx| {
+                input.set_content("https://api.example.com/upload", window, cx)
+            });
+        });
+        draw(cx);
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).metadata_reads()),
+            reads,
+            "typing in another field stats nothing"
+        );
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).file_status())
+                .as_deref(),
+            Some("8 B · application/pdf"),
+            "the status keeps the recorded facts"
+        );
+
+        // A file that changes on disk is not noticed by a repaint, so the
+        // status stays on the recorded size until the window is active again.
+        std::fs::write(&source, vec![0u8; 4096]).expect("grow the file");
+        draw(cx);
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).file_status())
+                .as_deref(),
+            Some("8 B · application/pdf"),
+            "a repaint keeps the recorded facts even after the file changed"
+        );
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).metadata_reads()),
+            reads,
+            "the changed file is not noticed without focus"
+        );
+
+        cx.deactivate_window();
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        draw(cx);
+        assert!(
+            cx.update(|_, app| editor.read(app).metadata_reads()) > reads,
+            "becoming active again re-reads the file"
+        );
+        assert_eq!(
+            cx.update(|_, app| editor.read(app).file_status())
+                .as_deref(),
+            Some("4.0 KiB · application/pdf"),
+            "the status line catches up with the new size"
         );
     }
 

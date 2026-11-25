@@ -22,6 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 pub const TRANSCRIPT_MAX_ROWS: usize = 5_000;
 /// The largest retained payload the transcript keeps, in bytes.
 pub const TRANSCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// The most payload bytes one row's display text presents.
+pub const PAYLOAD_DISPLAY_LIMIT: usize = 16 * 1024;
 
 /// One data frame as the frame log presents it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,78 @@ pub struct FrameRow {
     /// written. The transport reports the wall clock; the session converts it
     /// when it appends the row.
     pub at_ms: u64,
+    /// The bounded display text, prepared once when the frame is recorded so a
+    /// repaint never converts the payload again.
+    pub text: String,
+    /// The collapsed row's one-line summary, also prepared once. Empty when
+    /// the payload is empty; the pane supplies its localized placeholder.
+    pub preview: String,
+}
+
+impl FrameRow {
+    /// Builds a row and its display text in one step.
+    pub fn new(
+        direction: WsDirection,
+        binary: bool,
+        payload: Bytes,
+        size: usize,
+        truncated: bool,
+        at_ms: u64,
+    ) -> Self {
+        let text = payload_text(binary, &payload, truncated);
+        let preview = preview_text(&text);
+        Self {
+            direction,
+            binary,
+            payload,
+            size,
+            truncated,
+            at_ms,
+            text,
+            preview,
+        }
+    }
+}
+
+/// The retained payload as presented: UTF-8 text, or hex for a binary frame.
+/// The prefix is capped so one huge frame cannot build an unbounded string.
+pub(crate) fn payload_text(binary: bool, payload: &[u8], truncated: bool) -> String {
+    let retained = payload.len().min(PAYLOAD_DISPLAY_LIMIT);
+    let bytes = &payload[..retained];
+    let mut text = if binary {
+        hex(bytes)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    if (retained < payload.len() || truncated) && !text.is_empty() {
+        text.push('…');
+    }
+    text
+}
+
+/// One line of the collapsed row: the payload's first line, capped by chars.
+pub(crate) fn preview_text(payload: &str) -> String {
+    if payload.is_empty() {
+        return String::new();
+    }
+    let first = payload.lines().next().unwrap_or_default();
+    let mut preview: String = first.chars().take(120).collect();
+    if preview.len() < first.len() || payload.lines().count() > 1 {
+        preview.push('…');
+    }
+    preview
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len().saturating_mul(3));
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 /// The frame log. Rows stop being appended at either cap.
@@ -345,14 +419,9 @@ impl WsSessionState {
             Some(attempt) => at_ms.saturating_sub(attempt.started_ms),
             None => at_ms,
         };
-        self.transcript.push(FrameRow {
-            direction,
-            binary,
-            payload,
-            size,
-            truncated,
-            at_ms: elapsed,
-        })
+        self.transcript.push(FrameRow::new(
+            direction, binary, payload, size, truncated, elapsed,
+        ))
     }
 
     /// Ends the attempt carrying `generation`. A cancelled attempt returns to

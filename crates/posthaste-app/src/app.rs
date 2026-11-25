@@ -1,5 +1,7 @@
 //! Application state shared by every shell view.
 
+use std::cell::Cell;
+
 use async_channel::Sender;
 use bytes::Bytes;
 use gpui::{
@@ -40,8 +42,9 @@ use posthaste_core::storage::{
 };
 use posthaste_core::variables::{resolve_request, resolve_request_lossy};
 use posthaste_core::ws::{
-    WsCloseBy, WsCommand, WsEvent, WsHandshake, prepare_handshake, run_session,
+    WsCloseBy, WsCommand, WsDirection, WsEvent, WsHandshake, prepare_handshake, run_session,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,6 +58,7 @@ use crate::metrics;
 use crate::overlay::{OverlayHost, OverlayKind};
 use crate::theme::{self, Mode};
 use crate::views::environment_panel::EnvironmentPanel;
+use crate::views::navigation::NavigationModel;
 use crate::views::request_editor::RequestEditor;
 use crate::views::response_pane::{preview_body, preview_stored_body};
 use crate::views::response_viewer::ResponseViewer;
@@ -522,6 +526,10 @@ pub struct RequestTab {
     /// point for revert.
     opened_baseline: Option<RequestSpec>,
     revert_confirmation_open: bool,
+    /// Whether the draft can currently be restored to `opened_baseline`.
+    /// Cached so a repaint never compares the draft with the restore point;
+    /// every event that can change the answer recomputes it.
+    revert_available: bool,
     /// Whether the draft changed since the tab loaded it.
     edited_since_open: bool,
     /// The saved request this tab opened, kept for its chip title and for
@@ -923,6 +931,7 @@ fn build_tab(
         save_state: RequestSaveState::NoTarget,
         opened_baseline: None,
         revert_confirmation_open: false,
+        revert_available: false,
         edited_since_open: false,
         opened_request: None,
         in_flight: None,
@@ -973,6 +982,9 @@ fn restore_session_tabs(
         tab.opened_request = opened_request;
         tab.opened_baseline = baseline;
         tab.save_state = save_state;
+        // The recorded draft differs from the restore point it was attached
+        // to; an unattached tab has no restore point at all.
+        tab.revert_available = edited && tab.opened_baseline.is_some();
         tab.edited_since_open = edited;
         tab.blank_number = recorded.blank_number;
         tab.recorded_response = recorded.recorded_response;
@@ -1748,6 +1760,9 @@ pub struct AppState {
     reveal: Option<Reveal>,
     /// Whether the History list is collapsed.
     history_collapsed: bool,
+    /// The sidebar's owned navigation rows, cached under the inputs that can
+    /// change them. The render path reads it through [`AppState::navigation`].
+    navigation: RefCell<NavigationModel>,
     runtime: Runtime,
     executor: HttpExecutor,
     /// The configuration the current executor was built from, so a preference
@@ -1756,6 +1771,18 @@ pub struct AppState {
     http_config: HttpConfig,
     /// The session jar the transport fills and every tab's dialog reads.
     cookies: Arc<CookieJar>,
+    /// The jar's cookie count and the revision it was counted at. A repaint
+    /// reads this; a write, from this thread or the transport's, moves the
+    /// revision and forces the next read to count again.
+    cookie_count: Cell<Option<(u64, usize)>>,
+    /// Jar snapshots the cookie count has taken. Test-only, so a repaint can
+    /// prove it read the cache.
+    #[cfg(test)]
+    cookie_count_reads: Cell<usize>,
+    /// Draft-to-restore-point comparisons the revert cache has made.
+    /// Test-only, so a repaint can prove it read the cached answer.
+    #[cfg(test)]
+    revert_comparisons: Cell<u64>,
     events: Sender<TransportEvent>,
     /// When streaming body bytes last repainted. `None` until headers arrive,
     /// and reset on completion so the next stream starts unthrottled.
@@ -2169,10 +2196,16 @@ impl AppState {
             // History lives at the bottom of the sidebar and starts collapsed
             // so the collections tree gets the space until it is opened.
             history_collapsed: true,
+            navigation: RefCell::new(NavigationModel::default()),
             runtime,
             executor,
             http_config,
             cookies: cookie_jar,
+            cookie_count: Cell::new(None),
+            #[cfg(test)]
+            cookie_count_reads: Cell::new(0),
+            #[cfg(test)]
+            revert_comparisons: Cell::new(0),
             events,
             stream_flush: None,
             stream_flush_task: None,
@@ -3280,6 +3313,8 @@ impl AppState {
             }
         }
         self.history.set_cap(self.preferences.history.entries());
+        // Lowering the cap trims the history list the sidebar shows.
+        self.touch_navigation();
 
         let wrap = self.preferences.appearance.wrap_long_lines;
         for tab in &self.tabs {
@@ -3481,8 +3516,41 @@ impl AppState {
     /// Number of cookies in the session jar, shown in the status bar. The jar
     /// is shared by every tab and by the transport, so this is one count, not
     /// one per open request.
+    ///
+    /// The count is cached against the jar's revision. Every write moves the
+    /// revision, so the next read after a write counts again and a repaint
+    /// without one reads the cache.
     pub fn cookie_count(&self) -> usize {
-        self.cookies.snapshot().len()
+        let revision = self.cookies.revision();
+        if let Some((cached_revision, count)) = self.cookie_count.get()
+            && cached_revision == revision
+        {
+            return count;
+        }
+        let count = self.cookies.snapshot().len();
+        #[cfg(test)]
+        self.cookie_count_reads
+            .set(self.cookie_count_reads.get() + 1);
+        self.cookie_count.set(Some((revision, count)));
+        count
+    }
+
+    /// Jar snapshots the cookie count has taken. Test-only.
+    #[cfg(test)]
+    pub(crate) fn cookie_count_reads(&self) -> usize {
+        self.cookie_count_reads.get()
+    }
+
+    /// The session jar, for tests that write a cookie directly.
+    #[cfg(test)]
+    pub(crate) fn test_cookie_jar(&self) -> Arc<CookieJar> {
+        self.cookies.clone()
+    }
+
+    /// Draft-to-restore-point comparisons made. Test-only.
+    #[cfg(test)]
+    pub(crate) fn revert_comparisons(&self) -> u64 {
+        self.revert_comparisons.get()
     }
 
     /// The assisted field's floating card for the active request, mounted by
@@ -3522,6 +3590,65 @@ impl AppState {
     /// The current sidebar filter, exactly as typed.
     pub fn sidebar_filter(&self) -> &str {
         &self.sidebar_filter
+    }
+
+    /// The sidebar's navigation rows for this frame.
+    ///
+    /// The model rebuilds only when its key moved: the workspace generation,
+    /// the active environment, the filter, the disclosure, the reveal, or
+    /// which sections are open. A repaint otherwise reads the cached rows.
+    pub(crate) fn navigation(
+        &self,
+        show_collections: bool,
+        show_history: bool,
+    ) -> std::cell::Ref<'_, NavigationModel> {
+        self.navigation.borrow_mut().refresh(
+            self,
+            show_collections,
+            show_history,
+            self.expansion_signature(),
+        );
+        self.navigation.borrow()
+    }
+
+    /// A fingerprint of which collections and folders are open, so the
+    /// navigation cache notices a disclosure without cloning the sets.
+    fn expansion_signature(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut collections: Vec<&String> = self.expanded_collections.iter().collect();
+        collections.sort();
+        collections.hash(&mut hasher);
+        let mut folders: Vec<FolderId> = self.expanded_folders.iter().copied().collect();
+        folders.sort();
+        folders.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Collection-tree walks the navigation cache has performed. Test-only, so
+    /// a collapsed section can prove it walks nothing.
+    #[cfg(test)]
+    pub(crate) fn navigation_walks(&self) -> u64 {
+        self.navigation.borrow().walks()
+    }
+
+    /// The history entries the cached model shows, in display order.
+    /// Test-only, so a search can be compared with the rows the sidebar paints.
+    #[cfg(test)]
+    pub(crate) fn navigation_history_ids(&self) -> Vec<HistoryId> {
+        self.navigation
+            .borrow()
+            .history()
+            .iter()
+            .filter_map(|row| self.history.entries.get(row.index).map(|entry| entry.id))
+            .collect()
+    }
+
+    /// Marks the sidebar's cached rows stale for a change the workspace's
+    /// mutation funnel does not see: history, environment selection, and
+    /// variable edits.
+    fn touch_navigation(&mut self) {
+        self.workspace.touch_navigation();
     }
 
     /// Whether the Collections tree is collapsed.
@@ -3585,6 +3712,21 @@ impl AppState {
     /// The row a move just revealed, if any.
     pub fn reveal(&self) -> Option<&Reveal> {
         self.reveal.as_ref()
+    }
+
+    /// The row the sidebar tree must keep visible: the last revealed item, or
+    /// the row being renamed, so an open rename survives an active search.
+    pub(crate) fn sidebar_reveal(&self) -> Option<Reveal> {
+        self.reveal
+            .clone()
+            .or_else(|| match self.workspace.rename_target.as_ref() {
+                Some(RenameTarget::Collection { slug }) => Some(Reveal::collection(slug.clone())),
+                Some(RenameTarget::Folder { slug, id }) => Some(Reveal::folder(slug.clone(), *id)),
+                Some(RenameTarget::Request { slug, id }) => {
+                    Some(Reveal::request(slug.clone(), *id))
+                }
+                Some(RenameTarget::Environment { .. }) | None => None,
+            })
     }
 
     /// Opens the destination picker for a request or folder and returns the
@@ -3737,6 +3879,10 @@ impl AppState {
                 baseline.folder_id = folder;
             }
         }
+        // A move changes the folder only, which revert does not compare, so
+        // the cached answers hold; refresh the shown tab anyway so the flag
+        // follows the draft it was computed from.
+        self.refresh_revert_available();
     }
 
     /// The current parent of a move picker's item, or `None` when the item no
@@ -4556,6 +4702,8 @@ impl AppState {
         leaving.update(cx, |editor, cx| editor.close_cookies(cx));
         self.close_inspector_for_tab_switch();
         self.active = index;
+        // The cached revert answer describes the tab that is now shown.
+        self.refresh_revert_available();
         // The method menu, preview, and jar dialog belong to the editor that
         // owns them, so the host follows the newly active tab.
         self.sync_editor_overlays(cx);
@@ -4854,6 +5002,9 @@ impl AppState {
             self.ensure_blank_number_unique(0);
             self.refresh_variable_catalog(cx);
         }
+        // Removing the active tab activates a neighbour; the cached revert
+        // answer belongs to whichever tab is now shown.
+        self.refresh_revert_available();
         self.schedule_session_write(cx);
         cx.notify();
     }
@@ -5109,17 +5260,38 @@ impl AppState {
 
     /// Whether the draft can be restored to the version that was opened with
     /// the selected saved request.
+    ///
+    /// This reads the tab's cached answer; the events that can change it call
+    /// [`Self::refresh_revert_available`] instead of every repaint comparing
+    /// the whole draft.
     pub fn can_revert(&self) -> bool {
-        let Some(baseline) = self.active_tab().opened_baseline.as_ref() else {
-            return false;
+        self.active_tab().revert_available
+    }
+
+    /// Recomputes the active tab's cached revert answer.
+    fn refresh_revert_available(&mut self) {
+        self.refresh_tab_revert_available(self.active);
+    }
+
+    /// Recomputes one tab's cached revert answer. Called by every event that
+    /// can change the draft, its restore point, or whether its target still
+    /// exists.
+    fn refresh_tab_revert_available(&mut self, index: usize) {
+        let available = {
+            let tab = &self.tabs[index];
+            match (tab.shell.selected_request(), tab.opened_baseline.as_ref()) {
+                (Some(id), Some(baseline))
+                    if baseline.id == id && self.workspace.find_request(id).is_some() =>
+                {
+                    #[cfg(test)]
+                    self.revert_comparisons
+                        .set(self.revert_comparisons.get().wrapping_add(1));
+                    Self::differs_from_baseline(tab.shell.draft(), baseline)
+                }
+                _ => false,
+            }
         };
-        let Some(id) = self.shell().selected_request() else {
-            return false;
-        };
-        if baseline.id != id || self.workspace.find_request(id).is_none() {
-            return false;
-        }
-        Self::differs_from_baseline(self.shell().draft(), baseline)
+        self.tabs[index].revert_available = available;
     }
 
     /// Whether the save-state line is asking the user to confirm a revert.
@@ -5234,6 +5406,7 @@ impl AppState {
                 self.ensure_blank_number_unique(self.active);
             }
         }
+        self.refresh_revert_available();
         self.load_editor(cx);
         self.schedule_session_write(cx);
         cx.notify();
@@ -5363,6 +5536,7 @@ impl AppState {
     /// Removes every stored history entry and its files.
     pub fn clear_history(&mut self, cx: &mut Context<Self>) {
         self.history.clear();
+        self.touch_navigation();
         for tab in &mut self.tabs {
             tab.shell.select_history(None);
             tab.recorded_response = None;
@@ -5375,6 +5549,7 @@ impl AppState {
     /// the removed entry stops presenting it.
     pub fn delete_history(&mut self, id: HistoryId, cx: &mut Context<Self>) {
         self.history.delete(id);
+        self.touch_navigation();
         for tab in &mut self.tabs {
             if tab.shell.selected_history() == Some(id) {
                 tab.shell.select_history(None);
@@ -5482,6 +5657,7 @@ impl AppState {
             tab.opened_baseline = None;
             tab.opened_request = None;
             tab.revert_confirmation_open = false;
+            tab.revert_available = false;
             tab.edited_since_open = false;
             tab.recorded_response = None;
             tab.save_state = RequestSaveState::NoTarget;
@@ -5509,6 +5685,7 @@ impl AppState {
         let previous = self.tabs[index].shell.draft();
         let accent_changed = previous.method != spec.method || previous.protocol != spec.protocol;
         self.tabs[index].shell.set_draft(spec.clone());
+        self.refresh_tab_revert_available(index);
         // An edit that restores every default value makes the tab blank again,
         // where its old number may already belong to another tab.
         self.ensure_blank_number_unique(index);
@@ -5607,6 +5784,9 @@ impl AppState {
         self.pending_variables.insert(target);
         self.variable_generation = self.variable_generation.wrapping_add(1);
         self.variable_error = None;
+        // A variable edit can change whether a history entry's saved request
+        // still resolves, and so whether its row shows a linked name.
+        self.touch_navigation();
         self.schedule_variable_save(cx, self.variable_generation);
         self.refresh_variable_catalog(cx);
         cx.notify();
@@ -6020,6 +6200,8 @@ impl AppState {
             tab.opened_baseline = Some(draft.clone());
             tab.opened_request = Some(draft.id);
             tab.save_state = RequestSaveState::Clean;
+            // The draft and its restore point are the same version.
+            tab.revert_available = false;
             tab.edited_since_open = false;
             tab.revert_confirmation_open = false;
             tab.pending_save = None;
@@ -6097,6 +6279,7 @@ impl AppState {
             tab.edited_since_open = false;
         }
         self.shell_mut().set_draft(restored.clone());
+        self.refresh_revert_available();
         // Reloading clears every field's undo history, so Ctrl+Z cannot bring
         // the discarded edits back.
         self.load_editor(cx);
@@ -6533,6 +6716,9 @@ impl AppState {
         self.variable_error = None;
         if self.active_environment != slug {
             self.active_environment = slug;
+            // Which variables resolve decides whether a history entry still
+            // links to its saved request.
+            self.touch_navigation();
             self.schedule_session_write(cx);
         }
         true
@@ -6767,6 +6953,8 @@ impl AppState {
             if let Some(baseline) = tab.opened_baseline.as_mut() {
                 baseline.name = name.clone();
             }
+            // A rename changes no restore field: revert keeps the name. The
+            // cached answer therefore still describes this draft and baseline.
         }
         for editor in editors {
             editor.update(cx, |editor, _| editor.rename(&name));
@@ -6897,6 +7085,7 @@ impl AppState {
             tab.opened_request = None;
             tab.opened_baseline = None;
             tab.revert_confirmation_open = false;
+            tab.revert_available = false;
             tab.edited_since_open = false;
             // A scheduled write still targets the deleted request.
             tab.edit_generation = tab.edit_generation.wrapping_add(1);
@@ -7246,7 +7435,7 @@ impl AppState {
         }
         if self.tabs[index].shell.cancel_request() {
             if let Some(flight) = self.tabs[index].in_flight.take() {
-                self.history.record(
+                self.record_history(
                     HistoryEntry::cancelled(
                         flight.started_ms,
                         elapsed_millis(flight.started),
@@ -7381,12 +7570,20 @@ impl AppState {
         }
     }
 
+    /// Records one finished attempt and marks the sidebar's history list stale.
+    /// Every history write goes through here.
+    fn record_history(&mut self, entry: HistoryEntry) -> HistoryId {
+        let id = self.history.record(entry);
+        self.touch_navigation();
+        id
+    }
+
     /// Records one history entry for a finished WebSocket attempt. The entry
     /// carries the handshake when one arrived, the close information, and the
     /// frame totals, never a payload.
     fn record_ws_outcome(&mut self, index: usize, end: WsEnd) {
         if let Some(entry) = Self::ws_history_entry(&self.tabs[index], &end) {
-            self.history.record(entry);
+            self.record_history(entry);
         }
     }
 
@@ -7395,7 +7592,7 @@ impl AppState {
     /// from the removal path instead.
     fn record_ws_outcome_for(&mut self, tab: &RequestTab, end: WsEnd) {
         if let Some(entry) = Self::ws_history_entry(tab, &end) {
-            self.history.record(entry);
+            self.record_history(entry);
         }
     }
 
@@ -7571,7 +7768,7 @@ impl AppState {
         match outcome {
             Ok(response) => {
                 if let Some(flight) = flight {
-                    let recorded = self.history.record(
+                    let recorded = self.record_history(
                         HistoryEntry::completed(flight.started_ms, &flight.spec, &response)
                             .with_source(flight.source_request_id),
                     );
@@ -7591,7 +7788,7 @@ impl AppState {
             }
             Err(PosthasteError::Cancelled) => {
                 if let Some(flight) = flight {
-                    self.history.record(
+                    self.record_history(
                         HistoryEntry::cancelled(
                             flight.started_ms,
                             elapsed_millis(flight.started),
@@ -7608,7 +7805,7 @@ impl AppState {
             Err(error) => {
                 let message = error.to_string();
                 if let Some(flight) = flight {
-                    self.history.record(
+                    self.record_history(
                         HistoryEntry::failed(
                             flight.started_ms,
                             elapsed_millis(flight.started),
@@ -7907,7 +8104,7 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn record_test_history(&mut self, entry: HistoryEntry) {
-        self.history.record(entry);
+        self.record_history(entry);
     }
 
     /// Starts a request on the active tab without reaching the network, for
@@ -7922,6 +8119,68 @@ impl AppState {
         self.active_tab_mut().failed_flash = None;
         cx.notify();
         request
+    }
+
+    /// Switches the active draft to WebSocket so the shell presents its pane.
+    #[cfg(test)]
+    pub(crate) fn make_test_websocket_draft(&mut self, url: &str) {
+        let mut draft = self.shell().draft().clone();
+        draft.protocol = RequestProtocol::WebSocket;
+        draft.url = url.to_owned();
+        self.shell_mut().set_draft(draft);
+    }
+
+    /// Starts a connected WebSocket attempt without a transport. The caller
+    /// pushes frames directly.
+    #[cfg(test)]
+    pub(crate) fn begin_test_websocket(&mut self) -> u64 {
+        let spec = self.shell().draft().clone();
+        let source = self.shell().selected_request();
+        let (commands, _commands_rx) = mpsc::unbounded_channel();
+        let (cancel, _cancel_rx) = oneshot::channel();
+        let generation = self.active_tab_mut().ws.begin_connect(
+            spec,
+            source,
+            Instant::now(),
+            unix_millis_now(),
+            commands,
+            cancel,
+        );
+        self.active_tab_mut().ws.set_connected(
+            generation,
+            WsHandshake {
+                status: 101,
+                headers: Vec::new(),
+                protocol: None,
+                cookies: Vec::new(),
+            },
+            Instant::now(),
+        );
+        generation
+    }
+
+    /// Appends `count` incoming text frames to the running test session.
+    #[cfg(test)]
+    pub(crate) fn push_test_websocket_frames(
+        &mut self,
+        generation: u64,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        for index in 0..count {
+            let payload = Bytes::from(format!("frame {index}"));
+            let size = payload.len();
+            self.active_tab_mut().ws.push_frame(
+                generation,
+                WsDirection::Incoming,
+                false,
+                payload,
+                size,
+                false,
+                index as u64,
+            );
+        }
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -11011,14 +11270,14 @@ mod tests {
                     duration: std::time::Duration::from_millis(12),
                     size: 8,
                     headers: vec![("content-type".into(), "text/plain".into())],
-                    body: crate::views::response_pane::BodyPreview {
+                    body: Some(crate::views::response_pane::BodyPreview {
                         text: "{\"id\":1}".into(),
                         size: 8,
                         limited: false,
                         truncated: false,
                         history_limited: false,
                         binary: None,
-                    },
+                    }),
                 },
             }
         );
@@ -11073,13 +11332,13 @@ mod tests {
                     duration: std::time::Duration::from_millis(12),
                     size: 11,
                     headers: vec![("content-type".into(), "application/json".into())],
-                    body: crate::views::response_pane::preview_body(
+                    body: Some(crate::views::response_pane::preview_body(
                         state
                             .read(app)
                             .shell()
                             .current_response()
                             .expect("response")
-                    ),
+                    )),
                 }
             );
         });
@@ -11416,13 +11675,13 @@ mod tests {
                     duration: std::time::Duration::from_millis(12),
                     size: 11,
                     headers: vec![("content-type".into(), "application/json".into())],
-                    body: crate::views::response_pane::preview_body(
+                    body: Some(crate::views::response_pane::preview_body(
                         state
                             .read(app)
                             .shell()
                             .current_response()
                             .expect("response")
-                    ),
+                    )),
                 }
             );
         });
@@ -12806,7 +13065,11 @@ mod tests {
             let presented = crate::views::response_pane::view(state.shell(), Some(&entry), None);
             let crate::views::response_pane::ResponseView::History {
                 outcome:
-                    crate::views::response_pane::HistoryOutcomeView::Response { size, body, .. },
+                    crate::views::response_pane::HistoryOutcomeView::Response {
+                        size,
+                        body: Some(body),
+                        ..
+                    },
                 ..
             } = presented
             else {
@@ -15106,6 +15369,76 @@ mod tests {
         cx.update(|app| state.update(app, |state, cx| state.select_request(cx, None)));
         assert!(cx.update(|app| state.read(app).active_tab().opened_baseline.is_none()));
         assert!(!cx.update(|app| state.read(app).can_revert()));
+    }
+
+    /// Revert availability is a cached flag: reading it, saving, and repainting
+    /// never compare the draft with the restore point again.
+    #[gpui::test]
+    async fn revert_availability_is_cached_between_draft_changes(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let mut request = store
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        request.url = "https://example.test/opened".into();
+        store
+            .save_request(&collection.id, &request)
+            .expect("save request");
+        let state = cx.update(|cx| cx.new(|cx| AppState::new_with_store(cx, store.clone())));
+
+        cx.update(|app| {
+            state.update(app, |state, cx| state.select_request(cx, Some(request.id)));
+        });
+
+        let opened = cx.update(|app| state.read(app).revert_comparisons());
+        for _ in 0..8 {
+            assert!(!cx.update(|app| state.read(app).can_revert()));
+        }
+        assert_eq!(
+            cx.update(|app| state.read(app).revert_comparisons()),
+            opened,
+            "reading the flag compares nothing"
+        );
+
+        let mut edited = request.clone();
+        edited.url = "https://example.test/edited".into();
+        cx.update(|app| {
+            state.update(app, |state, cx| state.edit_active_draft(edited.clone(), cx));
+        });
+        let edited_once = cx.update(|app| state.read(app).revert_comparisons());
+        assert_eq!(edited_once, opened + 1, "one edit recomputes the flag once");
+        assert!(cx.update(|app| state.read(app).can_revert()));
+
+        cx.executor().advance_clock(AUTOSAVE_DELAY);
+        cx.run_until_parked();
+        assert!(cx.update(|app| state.read(app).can_revert()));
+        assert_eq!(
+            cx.update(|app| state.read(app).revert_comparisons()),
+            edited_once,
+            "autosave leaves the flag alone"
+        );
+
+        cx.update(|app| {
+            state.update(app, |state, cx| {
+                state.begin_revert(cx);
+                state.confirm_revert(cx);
+            });
+        });
+        assert_eq!(
+            cx.update(|app| state.read(app).revert_comparisons()),
+            edited_once + 1,
+            "restoring the draft recomputes the flag once"
+        );
+        assert!(!cx.update(|app| state.read(app).can_revert()));
+        assert_eq!(
+            cx.update(|app| state.read(app).shell().draft().url.clone()),
+            request.url,
+            "the restored draft is the version that was opened"
+        );
     }
 
     #[gpui::test]

@@ -5,6 +5,7 @@ mod cookie_selection;
 pub(crate) mod environment_panel;
 mod event_stream;
 mod json_syntax;
+pub(crate) mod navigation;
 mod new_workspace;
 pub(crate) mod request_editor;
 pub(crate) mod request_pane;
@@ -4993,6 +4994,68 @@ mod tests {
         );
     }
 
+    /// The status bar's count is cached against the jar's revision: a repaint
+    /// reuses it, and every jar write shows on the next frame.
+    #[gpui::test]
+    async fn the_status_bar_cookie_count_is_cached_against_the_jar_revision(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, view, cx, _store, collection, request) = seeded_shell(cx, "Demo", "Ping");
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        click_row(cx, leaked(format!("request-row-{}", request.id)));
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        assert!(cx.debug_bounds("status-cookies-0").is_some());
+        let reads = cx.update(|_, app| state.read(app).cookie_count_reads());
+
+        redraw(cx);
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).cookie_count_reads()),
+            reads,
+            "a repaint reuses the count for the same jar revision"
+        );
+
+        let jar = cx.update(|_, app| state.read(app).test_cookie_jar());
+        let target =
+            posthaste_core::cookies::draft_url("https://api.example.com/").expect("cookie URL");
+        jar.add(&target, "session", "abc").expect("store cookie");
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("status-cookies-1").is_some(),
+            "a new cookie shows on the next frame"
+        );
+        assert_eq!(
+            cx.update(|_, app| state.read(app).cookie_count_reads()),
+            reads + 1
+        );
+
+        jar.add(&target, "theme", "dark").expect("store cookie");
+        redraw(cx);
+        assert!(cx.debug_bounds("status-cookies-2").is_some());
+        assert_eq!(
+            cx.update(|_, app| state.read(app).cookie_count_reads()),
+            reads + 2
+        );
+
+        jar.clear();
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("status-cookies-0").is_some(),
+            "clearing the jar empties the count on the next frame"
+        );
+        assert_eq!(
+            cx.update(|_, app| state.read(app).cookie_count_reads()),
+            reads + 3
+        );
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).cookie_count_reads()),
+            reads + 3,
+            "the emptied count is cached too"
+        );
+    }
+
     #[gpui::test]
     async fn a_history_run_starts_with_an_unstored_tab_dot(cx: &mut TestAppContext) {
         use posthaste_core::history::{HistoryEntry, HistoryStore};
@@ -7381,6 +7444,416 @@ mod tests {
             cx.debug_bounds("response-viewport").is_some(),
             "the previous response's body is still painted"
         );
+    }
+
+    #[gpui::test]
+    async fn repainting_a_large_response_does_not_build_a_preview(cx: &mut TestAppContext) {
+        use bytes::Bytes;
+        use posthaste_core::model::ResponseRecord;
+
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        redraw(cx);
+        let before = response_pane::preview_counters();
+
+        let request =
+            cx.update(|_, app| state.update(app, |state, cx| state.begin_test_request(cx)));
+        let body = vec![b'a'; response_pane::PREVIEW_LIMIT + 16];
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.apply_synthetic_event(
+                    request,
+                    Ok(ResponseRecord {
+                        status: 200,
+                        headers: vec![("content-type".into(), "text/plain".into())],
+                        body: Bytes::from(body),
+                        duration: Duration::from_millis(12),
+                        truncated: false,
+                        cookies: Vec::new(),
+                    }),
+                    cx,
+                );
+            });
+        });
+        redraw(cx);
+
+        let presented = response_pane::preview_counters();
+        assert_eq!(
+            presented.0,
+            before.0 + 1,
+            "presenting a response builds its preview exactly once"
+        );
+        assert_eq!(
+            presented.1,
+            before.1 + response_pane::PREVIEW_LIMIT as u64,
+            "the preview copies at most the preview limit"
+        );
+
+        // Dragging the split and typing repaint the shell without presenting a
+        // new response; neither may rebuild the preview.
+        let divider = cx
+            .debug_bounds("request-response-divider")
+            .expect("divider");
+        let region = cx
+            .debug_bounds("request-response-split")
+            .expect("split region");
+        let y = divider.center().y;
+        cx.simulate_mouse_down(divider.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            point(region.origin.x + px(1.), y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(region.origin.x - px(40.), y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        cx.simulate_mouse_up(
+            point(region.origin.x - px(40.), y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        set_url(&state, cx, "https://example.com/typing".into());
+        for _ in 0..3 {
+            redraw(cx);
+        }
+        assert_eq!(
+            response_pane::preview_counters(),
+            presented,
+            "repainting the pane must not build or copy the body again"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_large_web_socket_transcript_builds_only_visible_rows(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        let generation = cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.make_test_websocket_draft("ws://socket.test/live");
+                let generation = state.begin_test_websocket();
+                state.push_test_websocket_frames(generation, 5_000, cx);
+                generation
+            })
+        });
+        redraw(cx);
+        let panel = cx.update(|_, app| state.read(app).ws_panel());
+
+        // The inline expansion still opens, and copying still yields the text
+        // prepared when the frame arrived.
+        click(cx, "ws-frame-0");
+        assert!(
+            cx.debug_bounds("ws-frame-payload-0").is_some(),
+            "the first row opens its payload block"
+        );
+        click(cx, "ws-copy-0");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert_eq!(copied, "frame 0");
+        click(cx, "ws-frame-0");
+        redraw(cx);
+
+        // One repaint after the log filled constructs only the rows the list
+        // measures: the viewport plus its overdraw, not all 5,000.
+        cx.update(|_, app| panel.update(app, |panel, _| panel.reset_rows_built()));
+        redraw(cx);
+        let built = cx.update(|_, app| panel.read(app).rows_built());
+        assert!(built > 0, "the visible rows are built");
+        assert!(
+            built < 100,
+            "only the viewport and overdraw are constructed (built {built})"
+        );
+
+        // Scrolling moves the window; it does not rebuild the transcript.
+        let scroll_area = cx
+            .debug_bounds("ws-frame-scroll")
+            .expect("the frame list is laid out");
+        cx.simulate_mouse_move(scroll_area.center(), None, Modifiers::default());
+        cx.update(|_, app| panel.update(app, |panel, _| panel.reset_rows_built()));
+        cx.simulate_event(ScrollWheelEvent {
+            position: scroll_area.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        redraw(cx);
+        let scrolled = cx.update(|_, app| panel.read(app).rows_built());
+        assert!(
+            scrolled < 100,
+            "scrolling builds only the rows it enters (built {scrolled})"
+        );
+
+        // Streaming keeps appending rows; a repaint still builds the same
+        // bounded window.
+        cx.update(|_, app| {
+            panel.update(app, |panel, _| panel.reset_rows_built());
+            state.update(app, |state, cx| {
+                state.push_test_websocket_frames(generation, 10, cx);
+            });
+        });
+        redraw(cx);
+        let streamed = cx.update(|_, app| panel.read(app).rows_built());
+        assert!(
+            streamed < 100,
+            "streaming frames builds only the visible rows (built {streamed})"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_collapsed_collections_section_walks_no_tree(cx: &mut TestAppContext) {
+        use posthaste_core::model::RequestSpec;
+        use posthaste_core::storage::RequestEntry;
+
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("API", 0).expect("collection");
+        let mut loaded = store.load().expect("reload");
+        {
+            let entry = loaded
+                .collections
+                .iter_mut()
+                .find(|entry| entry.collection.id == collection.id)
+                .expect("collection");
+            entry.requests = (0..1_000)
+                .map(|index| {
+                    let mut spec = RequestSpec::new(format!("Request {index:04}"));
+                    spec.url = format!("https://api.test/{index}");
+                    RequestEntry::Loaded(Box::new(spec))
+                })
+                .collect();
+        }
+        assert!(store.save_collections(&loaded.collections).is_success());
+
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        redraw(cx);
+
+        // The open section builds its tree for the paint.
+        let open = cx.update(|_, app| state.read(app).navigation_walks());
+        assert!(open > 0, "an open section walks the tree (walked {open})");
+
+        // A closed section paints only its count, so further frames do no
+        // tree work at all, even with 1,000 requests behind it.
+        cx.update(|_, app| state.update(app, |state, cx| state.toggle_collections_collapsed(cx)));
+        redraw(cx);
+        let collapsed = cx.update(|_, app| state.read(app).navigation_walks());
+        redraw(cx);
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| state.read(app).navigation_walks()),
+            collapsed,
+            "a closed section walks no tree"
+        );
+
+        // Reopening builds it once more, and the requests are back.
+        cx.update(|_, app| state.update(app, |state, cx| state.toggle_collections_collapsed(cx)));
+        redraw(cx);
+        assert!(
+            cx.update(|_, app| state.read(app).navigation_walks()) > collapsed,
+            "reopening walks the tree once"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("collection-row-{}", collection.id)))
+                .is_some(),
+            "the collection row is painted after reopening"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_collection_mutation_reaches_the_sidebar_in_one_frame(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        redraw(cx);
+
+        let added = cx
+            .update(|_, app| state.update(app, |state, cx| state.create_collection(cx, "Added")))
+            .expect("collection");
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(leaked(format!("collection-row-{}", added.id)))
+                .is_some(),
+            "a created collection paints on the next frame"
+        );
+
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.request_delete(
+                    crate::workspace::DeleteTarget::Collection {
+                        slug: added.id.clone(),
+                    },
+                    cx,
+                );
+                assert!(state.confirm_delete(cx));
+            });
+        });
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(leaked(format!("collection-row-{}", added.id)))
+                .is_none(),
+            "a deleted collection is gone on the next frame"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_history_link_follows_a_rename_a_delete_and_a_filter(cx: &mut TestAppContext) {
+        use posthaste_core::history::{HistoryEntry, HistoryStore};
+
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let request = store
+            .create_request(&collection.id, "Sales")
+            .expect("request");
+        let mut saved = request.clone();
+        saved.url = "https://example.test/users".to_owned();
+        store.save_request(&collection.id, &saved).expect("save");
+
+        let response = posthaste_core::model::ResponseRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::from_static(b"{}"),
+            duration: Duration::from_millis(5),
+            truncated: false,
+            cookies: Vec::new(),
+        };
+        let history = HistoryStore::at(dir.path().join("history"));
+        let linked = HistoryEntry::completed(2, &saved, &response).with_source(Some(request.id));
+        let linked_id = linked.id;
+        history.append(&linked).expect("append");
+
+        let shell_store = store.clone();
+        let shell_history = history.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            AppShell::new_with_store_and_history(window, cx, shell_store, shell_history)
+        });
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| state.update(app, |state, cx| state.toggle_history_collapsed(cx)));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(leaked(format!("history-linked-name-{linked_id}")))
+                .is_some(),
+            "a linked run shows its saved request's name"
+        );
+
+        // The rename is a workspace save; the cached link shows the new name
+        // on the next frame, so the search finds the row by it.
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.begin_rename(
+                    crate::workspace::RenameTarget::Request {
+                        slug: collection.id.clone(),
+                        id: request.id,
+                    },
+                    cx,
+                );
+                assert!(state.commit_rename("Renamed", cx));
+            });
+        });
+        redraw(cx);
+        set_sidebar_search(&state, cx, "renamed");
+        assert!(
+            cx.debug_bounds(leaked(format!("history-row-{linked_id}")))
+                .is_some(),
+            "the cached link follows a rename"
+        );
+
+        // Deleting the saved request drops the link in the same frame; the
+        // entry itself stays and paints once the filter is cleared.
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.request_delete(
+                    crate::workspace::DeleteTarget::Request {
+                        slug: collection.id.clone(),
+                        id: request.id,
+                    },
+                    cx,
+                );
+                assert!(state.confirm_delete(cx));
+            });
+        });
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(leaked(format!("history-row-{linked_id}")))
+                .is_none(),
+            "an unlinked run no longer matches the old name"
+        );
+        set_sidebar_search(&state, cx, "");
+        assert!(
+            cx.debug_bounds(leaked(format!("history-row-{linked_id}")))
+                .is_some(),
+            "the run itself is still listed"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("history-linked-name-{linked_id}")))
+                .is_none(),
+            "the deleted request's name is no longer linked"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_navigation_model_lists_history_like_the_sidebar_always_has(
+        cx: &mut TestAppContext,
+    ) {
+        use posthaste_core::history::{HistoryEntry, HistoryStore};
+        use posthaste_core::model::RequestSpec;
+
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+
+        let response = posthaste_core::model::ResponseRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::from_static(b"{}"),
+            duration: Duration::from_millis(5),
+            truncated: false,
+            cookies: Vec::new(),
+        };
+        let history = HistoryStore::at(dir.path().join("history"));
+        let mut appended = Vec::new();
+        for index in 0..500u64 {
+            let mut spec = RequestSpec::new(format!("Run {index}"));
+            spec.url = format!("https://example.test/run-{index}");
+            let entry = HistoryEntry::completed(index + 1, &spec, &response);
+            appended.push((entry.id, spec.url.clone()));
+            history.append(&entry).expect("append");
+        }
+        // The list paints newest first.
+        appended.reverse();
+
+        let shell_store = store.clone();
+        let shell_history = history.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            AppShell::new_with_store_and_history(window, cx, shell_store, shell_history)
+        });
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| state.update(app, |state, cx| state.toggle_history_collapsed(cx)));
+        redraw(cx);
+
+        let shown = cx.update(|_, app| state.read(app).navigation_history_ids());
+        let expected: Vec<_> = appended.iter().map(|(id, _)| *id).collect();
+        assert_eq!(shown, expected, "the model lists every run, newest first");
+
+        set_sidebar_search(&state, cx, "run-4");
+        let shown = cx.update(|_, app| state.read(app).navigation_history_ids());
+        let expected: Vec<_> = appended
+            .iter()
+            .filter(|(_, url)| url.contains("run-4"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(!expected.is_empty(), "the filter matches some runs");
+        assert_eq!(shown, expected, "the model applies the same search");
     }
 
     #[gpui::test]

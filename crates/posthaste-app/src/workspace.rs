@@ -20,6 +20,17 @@ use posthaste_core::variables::{VariableCatalog, Variables};
 
 use crate::i18n::{self, Key, MessageKey, counted};
 
+/// Source of navigation generations.
+///
+/// One global counter keeps every value unique for the process, so a state
+/// that starts receiving changes cannot reuse a generation an earlier cache
+/// key already holds.
+static NAVIGATION_GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_navigation_generation() -> u64 {
+    NAVIGATION_GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Outcome of the most recent autosave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveStatus {
@@ -165,6 +176,9 @@ pub struct WorkspaceState {
     save_issue_paths: Vec<PathBuf>,
     /// The preserved damaged document whose deletion is awaiting confirmation.
     pending_issue_delete: Option<StorageIssue>,
+    /// Changes with every mutation the sidebar's tree and history can see.
+    /// The navigation cache compares it instead of walking the workspace.
+    navigation_generation: u64,
 }
 
 impl WorkspaceState {
@@ -214,6 +228,7 @@ impl WorkspaceState {
             delete_target: None,
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
+            navigation_generation: next_navigation_generation(),
         }
     }
 
@@ -239,7 +254,21 @@ impl WorkspaceState {
             delete_target: None,
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
+            navigation_generation: next_navigation_generation(),
         }
+    }
+
+    /// The value the sidebar cache compares. It changes whenever the tree or
+    /// the sidebar's linked-state could have changed.
+    pub fn navigation_generation(&self) -> u64 {
+        self.navigation_generation
+    }
+
+    /// Marks the sidebar cache stale. Every mutation funnels through
+    /// [`Self::record_save`], and the changes made outside a workspace write
+    /// (history, environment selection, variable edits) call this directly.
+    pub(crate) fn touch_navigation(&mut self) {
+        self.navigation_generation = next_navigation_generation();
     }
 
     pub fn collection(&self, slug: &str) -> Option<&LoadedCollection> {
@@ -323,6 +352,9 @@ impl WorkspaceState {
                     *request = RequestEntry::Loaded(Box::new(spec));
                     sort_requests(&mut entry.requests);
                 }
+                // A spec load turns a cached summary into a full document and
+                // resorts the siblings, so the tree is stale.
+                self.touch_navigation();
                 Ok(())
             }
             Err(error) => {
@@ -350,6 +382,8 @@ impl WorkspaceState {
         if let Some(entry) = self.collection_mut(slug) {
             entry.requests.retain(|request| request.id() != id);
         }
+        // The failed request was dropped from the tree.
+        self.touch_navigation();
         if let Some(store) = self.store.clone()
             && let Some(entry) = self.collection(slug)
         {
@@ -2103,6 +2137,8 @@ impl WorkspaceState {
     /// save, so the next save that succeeds clears them; issues from loading
     /// are never touched.
     fn record_save(&mut self, result: Result<SaveReport, StorageError>) {
+        // Every mutation ends here, so this one bump covers them all.
+        self.touch_navigation();
         self.clear_save_issues();
         match result {
             Ok(report) => {

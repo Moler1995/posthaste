@@ -353,6 +353,19 @@ pub fn validate_request(spec: &RequestSpec) -> Result<(), PosthasteError> {
 /// the generated one, matching how [`compose_request`] and the transport layer
 /// treat an existing header.
 pub fn generated_headers(spec: &RequestSpec, assets_root: Option<&Path>) -> Vec<GeneratedHeader> {
+    generated_headers_with_file_length(spec, body_length(&spec.body, assets_root))
+}
+
+/// The same headers, with the upload file's length supplied by a caller that
+/// has already learned it.
+///
+/// A file body's `Content-Length` otherwise needs a metadata call, so an
+/// editor that caches the file's facts passes them here instead of checking
+/// the file again on every repaint. Any other body is measured directly.
+pub fn generated_headers_with_file_length(
+    spec: &RequestSpec,
+    file_length: Option<u64>,
+) -> Vec<GeneratedHeader> {
     let user_supplies = |name: &str| {
         spec.headers
             .iter()
@@ -376,7 +389,11 @@ pub fn generated_headers(spec: &RequestSpec, assets_root: Option<&Path>) -> Vec<
         });
     }
 
-    if let Some(length) = body_length(&spec.body, assets_root)
+    let length = match &spec.body {
+        RequestBody::File { .. } => file_length,
+        body => body_bytes(body).map(|bytes| bytes.len() as u64),
+    };
+    if let Some(length) = length
         && !user_supplies("content-length")
     {
         headers.push(GeneratedHeader {

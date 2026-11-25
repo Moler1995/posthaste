@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use posthaste_core::history::{HistoryEntry, HistoryId};
-use posthaste_core::model::{Folder, FolderId};
+use posthaste_core::model::FolderId;
 
 use crate::app::{AppState, ExportFormat, RequestSaveState};
 use crate::assets;
@@ -21,10 +21,10 @@ use crate::i18n::{self, Key, MessageKey, counted};
 use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
 use crate::views::environment_panel::EnvironmentPanel;
+use crate::views::navigation::{NavCollection, NavFolder, NavHistoryRow, NavRequest, NavRow};
 use crate::views::response_pane::{format_duration, format_duration_exact};
 use crate::views::text_area::TextArea;
 use crate::views::text_input::TextInput;
-use crate::views::tree::{self, Reveal, RowRef};
 use crate::views::ui::{
     accent_button, menu_action, menu_action_disabled, menu_separator, overlay_button,
 };
@@ -88,115 +88,91 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     // detaches, so only the row with the pending target shows it.
     let delete_tab_note = app.pending_delete_tab_note();
 
-    // An open rename and a just-completed move both keep their row visible
-    // while a search is active. Whichever is present is handed to the tree so
-    // filtering can include it and its ancestor chain.
-    let reveal: Option<Reveal> =
-        app.reveal()
-            .cloned()
-            .or_else(|| match workspace.rename_target.as_ref() {
-                Some(RenameTarget::Collection { slug }) => Some(Reveal::collection(slug.clone())),
-                Some(RenameTarget::Folder { slug, id }) => Some(Reveal::folder(slug.clone(), *id)),
-                Some(RenameTarget::Request { slug, id }) => {
-                    Some(Reveal::request(slug.clone(), *id))
-                }
-                Some(RenameTarget::Environment { .. }) | None => None,
-            });
-
-    let visible = tree::visible_collections(
-        &workspace.collections,
-        &filter,
-        |slug| app.collection_expanded(slug),
-        |id| app.folder_expanded(id),
-        reveal.as_ref(),
-    );
+    // The tree, the filtered history, and every linked name come from the
+    // cached model, so a repaint walks nothing. A closed section is not
+    // walked at all and contributes only its count.
+    let navigation = app.navigation(show_collections, show_history);
     // The count reports what the section holds, so a search that hides
     // collections shows a smaller number even while the section is closed.
-    let collection_count = visible.len();
+    let collection_count = navigation.collection_count();
 
-    let tree: Vec<AnyElement> = if show_collections {
-        visible
-            .into_iter()
-            .flat_map(|visible| {
-                let entry = visible.entry;
-                let slug = entry.collection.id.clone();
-                let selected = collection_row_selected(
-                    selected_slug.as_deref(),
-                    selected_request,
-                    &entry.collection.id,
-                );
-                let mut elements = vec![collection_row(
-                    state.clone(),
-                    entry,
-                    selected,
-                    visible.expanded,
-                    workspace,
-                    rename_input,
-                    row_menu.as_ref(),
-                    row_menu_focus.as_ref(),
-                    delete_tab_note.as_deref(),
-                )];
-                if visible.expanded {
-                    if visible.rows.is_empty() {
-                        elements.push(empty_requests_row(state.clone(), slug.clone()));
-                    } else {
-                        // An expanded folder with nothing beneath it gets a
-                        // quiet child row; it is suppressed while a search is
-                        // active, where only the match itself should show.
-                        let show_empty_folders = filter.is_empty();
-                        elements.extend(visible.rows.into_iter().flat_map(|row| {
-                            let depth = row.depth;
-                            let (folder_id, element) = match row.row {
-                                RowRef::Folder(folder) => (
-                                    Some(folder.id),
-                                    folder_row(
-                                        state.clone(),
-                                        &slug,
-                                        folder,
-                                        depth,
-                                        row.expanded,
-                                        row.request_count,
-                                        workspace,
-                                        rename_input,
-                                        row_menu.as_ref(),
-                                        move_picker.as_ref(),
-                                        row_menu_focus.as_ref(),
-                                        move_picker_focus.as_ref(),
-                                        delete_tab_note.as_deref(),
-                                    ),
-                                ),
-                                RowRef::Request(request) => (
-                                    None,
-                                    request_row(
-                                        state.clone(),
-                                        &slug,
-                                        request,
-                                        selected_request == Some(request.id()),
-                                        depth,
-                                        save_state,
-                                        workspace,
-                                        rename_input,
-                                        row_menu.as_ref(),
-                                        move_picker.as_ref(),
-                                        row_menu_focus.as_ref(),
-                                        move_picker_focus.as_ref(),
-                                        delete_tab_note.as_deref(),
-                                    ),
-                                ),
-                            };
-                            let empty_folder = folder_id
-                                .filter(|_| show_empty_folders && row.expanded && !row.has_children)
-                                .map(|id| empty_folder_row(state.clone(), &slug, id, depth + 1));
+    let tree: Vec<AnyElement> = navigation
+        .collections()
+        .iter()
+        .flat_map(|collection| {
+            let slug = collection.slug.clone();
+            let selected = collection_row_selected(
+                selected_slug.as_deref(),
+                selected_request,
+                &collection.slug,
+            );
+            let mut elements = vec![collection_row(
+                state.clone(),
+                collection,
+                selected,
+                workspace,
+                rename_input,
+                row_menu.as_ref(),
+                row_menu_focus.as_ref(),
+                delete_tab_note.as_deref(),
+            )];
+            if collection.expanded {
+                if collection.rows.is_empty() {
+                    elements.push(empty_requests_row(state.clone(), slug.clone()));
+                } else {
+                    // An expanded folder with nothing beneath it gets a
+                    // quiet child row; it is suppressed while a search is
+                    // active, where only the match itself should show.
+                    let show_empty_folders = filter.is_empty();
+                    elements.extend(collection.rows.iter().flat_map(|row| match row {
+                        NavRow::Folder(folder) => {
+                            let element = folder_row(
+                                state.clone(),
+                                &slug,
+                                folder,
+                                workspace,
+                                rename_input,
+                                row_menu.as_ref(),
+                                move_picker.as_ref(),
+                                row_menu_focus.as_ref(),
+                                move_picker_focus.as_ref(),
+                                delete_tab_note.as_deref(),
+                            );
+                            let empty_folder =
+                                (show_empty_folders && folder.expanded && !folder.has_children)
+                                    .then(|| {
+                                        empty_folder_row(
+                                            state.clone(),
+                                            &slug,
+                                            folder.id,
+                                            folder.depth + 1,
+                                        )
+                                    });
                             std::iter::once(element).chain(empty_folder)
-                        }));
-                    }
+                        }
+                        NavRow::Request(request) => {
+                            let element = request_row(
+                                state.clone(),
+                                &slug,
+                                request,
+                                selected_request == Some(request.id),
+                                save_state,
+                                workspace,
+                                rename_input,
+                                row_menu.as_ref(),
+                                move_picker.as_ref(),
+                                row_menu_focus.as_ref(),
+                                move_picker_focus.as_ref(),
+                                delete_tab_note.as_deref(),
+                            );
+                            std::iter::once(element).chain(None)
+                        }
+                    }));
                 }
-                elements
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+            }
+            elements
+        })
+        .collect();
 
     // Nothing rendered under an expanded section still needs a state: the
     // create action when there are no collections, and the search result when
@@ -233,16 +209,15 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
             .into_any_element()
     });
 
-    // The header count and the rows come from one filtered list, so the
-    // number always matches what the list shows.
-    let matching_history = matching_history(app, &filter);
+    // The header count and the rows come from one cached list, so the number
+    // always matches what the list shows.
     let history_header = history_header(
         state.clone(),
         history,
-        matching_history.len(),
+        navigation.history_count(),
         !show_history,
     );
-    let history_list = show_history.then(|| history_list(state.clone(), app, &matching_history));
+    let history_list = show_history.then(|| history_list(state.clone(), app, navigation.history()));
 
     let chip_state = state.clone();
     let chip_active = active_environment.is_some();
@@ -945,31 +920,6 @@ fn history_button(
         .into_any_element()
 }
 
-/// Whether a history entry matches the sidebar search. The linked request's
-/// name is shown on the row, so it is searchable too.
-fn history_entry_matches(app: &AppState, entry: &HistoryEntry, filter: &str) -> bool {
-    filter.is_empty()
-        || entry.request.url.to_lowercase().contains(filter)
-        || entry
-            .request
-            .method
-            .as_str()
-            .to_lowercase()
-            .contains(filter)
-        || app
-            .linked_history_request(entry)
-            .is_some_and(|request| request.name.to_lowercase().contains(filter))
-}
-
-/// The history entries the sidebar shows for `filter`, in stored order.
-fn matching_history<'a>(app: &'a AppState, filter: &str) -> Vec<&'a HistoryEntry> {
-    app.history()
-        .entries
-        .iter()
-        .filter(|entry| history_entry_matches(app, entry, filter))
-        .collect()
-}
-
 /// One quiet line for a history section with nothing to list. Neither the
 /// empty nor the no-match state offers an action.
 fn history_state_row(selector: &'static str, message: &'static str) -> Div {
@@ -989,7 +939,9 @@ fn history_state_row(selector: &'static str, message: &'static str) -> Div {
         )
 }
 
-fn history_list(state: Entity<AppState>, app: &AppState, matching: &[&HistoryEntry]) -> AnyElement {
+/// The history rows as the cached model selected them. Each row names its
+/// index into the loaded entries, so no lookup by id runs here.
+fn history_list(state: Entity<AppState>, app: &AppState, rows: &[NavHistoryRow]) -> AnyElement {
     let history = app.history();
 
     let mut list = div()
@@ -1006,19 +958,20 @@ fn history_list(state: Entity<AppState>, app: &AppState, matching: &[&HistoryEnt
             "history-empty",
             i18n::t(Key::SidebarNoHistory),
         ));
-    } else if matching.is_empty() {
+    } else if rows.is_empty() {
         list = list.child(history_state_row(
             "history-no-matches",
             i18n::t(Key::CommonNoMatches),
         ));
     } else {
-        list = list.children(matching.iter().copied().map(|entry| {
-            history_row(
+        list = list.children(rows.iter().filter_map(|row| {
+            let entry = history.entries.get(row.index)?;
+            Some(history_row(
                 state.clone(),
-                app,
                 entry,
+                row.linked_name.as_deref(),
                 app.shell().selected_history() == Some(entry.id),
-            )
+            ))
         }));
     }
 
@@ -1027,8 +980,8 @@ fn history_list(state: Entity<AppState>, app: &AppState, matching: &[&HistoryEnt
 
 fn history_row(
     state: Entity<AppState>,
-    app: &AppState,
     entry: &HistoryEntry,
+    linked_name: Option<&str>,
     selected: bool,
 ) -> AnyElement {
     use posthaste_core::history::HistoryOutcome;
@@ -1077,9 +1030,7 @@ fn history_row(
     // name, so a rename after the send is reflected here. The name stays quiet
     // beside the timestamp: a run is identified by its request, not by which
     // saved file happened to produce it.
-    let linked_name = app
-        .linked_history_request(entry)
-        .map(|request| request.name.clone());
+    let linked_name = linked_name.map(str::to_owned);
     let duration = format_duration(entry.duration());
     let duration_exact = format_duration_exact(entry.duration());
     let timestamp = format_timestamp_ms(entry.timestamp_ms);
@@ -2280,17 +2231,17 @@ fn rename_error_panel(message: String) -> AnyElement {
 #[allow(clippy::too_many_arguments)]
 fn collection_row(
     state: Entity<AppState>,
-    entry: &posthaste_core::storage::LoadedCollection,
+    collection: &NavCollection,
     selected: bool,
-    expanded: bool,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
     row_menu: Option<&RowMenuTarget>,
     row_menu_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
 ) -> AnyElement {
-    let slug = entry.collection.id.clone();
-    let name = entry.collection.name.clone();
+    let slug = collection.slug.clone();
+    let name = collection.name.clone();
+    let expanded = collection.expanded;
     let renaming = workspace.rename_target == Some(RenameTarget::Collection { slug: slug.clone() });
     let deleting = workspace.delete_target == Some(DeleteTarget::Collection { slug: slug.clone() });
     let rename_error = renaming.then(|| workspace.rename_error.clone()).flatten();
@@ -2338,7 +2289,7 @@ fn collection_row(
                     .text_color(theme::text::primary())
                     .child(name.clone()),
             )
-            .child(super::ui::meta_count(entry.requests.len()))
+            .child(super::ui::meta_count(collection.request_count))
             .into_any_element()
     };
 
@@ -2501,10 +2452,7 @@ fn collection_row(
 fn folder_row(
     state: Entity<AppState>,
     slug: &str,
-    folder: &Folder,
-    depth: usize,
-    expanded: bool,
-    request_count: Option<usize>,
+    folder: &NavFolder,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
     row_menu: Option<&RowMenuTarget>,
@@ -2515,6 +2463,8 @@ fn folder_row(
 ) -> AnyElement {
     let id = folder.id;
     let name = folder.name.clone();
+    let depth = folder.depth;
+    let expanded = folder.expanded;
     let renaming = workspace.rename_target
         == Some(RenameTarget::Folder {
             slug: slug.to_owned(),
@@ -2568,7 +2518,7 @@ fn folder_row(
                     .text_color(theme::text::primary())
                     .child(name.clone()),
             )
-            .children(request_count.map(super::ui::meta_count))
+            .children(folder.request_count.map(super::ui::meta_count))
             .into_any_element()
     };
 
@@ -2990,9 +2940,8 @@ fn empty_folder_row(state: Entity<AppState>, slug: &str, id: FolderId, depth: us
 fn request_row(
     state: Entity<AppState>,
     slug: &str,
-    request: &posthaste_core::storage::RequestEntry,
+    request: &NavRequest,
     selected: bool,
-    depth: usize,
     save_state: &RequestSaveState,
     workspace: &WorkspaceState,
     rename_input: Option<&Entity<TextInput>>,
@@ -3002,8 +2951,9 @@ fn request_row(
     move_picker_focus: Option<&FocusHandle>,
     delete_tab_note: Option<&str>,
 ) -> AnyElement {
-    let id = request.id();
-    let name = request.name().to_owned();
+    let id = request.id;
+    let name = request.name.clone();
+    let depth = request.depth;
     let renaming = workspace.rename_target
         == Some(RenameTarget::Request {
             slug: slug.to_owned(),
@@ -3051,7 +3001,7 @@ fn request_row(
     let marker_color = if selected {
         match save_state {
             RequestSaveState::Edited => {
-                Some(theme::protocol_accent(request.protocol(), request.method()))
+                Some(theme::protocol_accent(request.protocol, request.method))
             }
             RequestSaveState::Failed(_) => Some(theme::status::danger()),
             RequestSaveState::NoTarget | RequestSaveState::Clean => None,
@@ -3181,7 +3131,7 @@ fn request_row(
 
     super::ui::row_shell_for(
         selected,
-        theme::protocol_accent(request.protocol(), request.method()),
+        theme::protocol_accent(request.protocol, request.method),
     )
     .id(SharedString::from(format!("request-row-{id}")))
     .debug_selector(move || selector.clone())
@@ -3211,7 +3161,7 @@ fn request_row(
             .pl(layout::tree_indent(depth))
             .children(selected.then(|| selection_marker(format!("request-selected-{id}"))))
             .child(
-                super::ui::protocol_label(request.protocol(), request.method())
+                super::ui::protocol_label(request.protocol, request.method)
                     .debug_selector(move || method_selector.clone())
                     .text_role(type_role::MICRO)
                     .font_weight(FontWeight::SEMIBOLD),

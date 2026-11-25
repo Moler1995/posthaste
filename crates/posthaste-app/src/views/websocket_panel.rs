@@ -12,6 +12,7 @@
 //! read-only code view, so its text is selected and copied exactly like a
 //! response body.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::ops::Range;
@@ -20,9 +21,9 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyBinding, MouseMoveEvent, MouseUpEvent, ParentElement, Point, Render, Rgba,
-    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, WeakEntity, Window,
-    actions, div, px,
+    IntoElement, KeyBinding, ListAlignment, ListState, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Point, Render, Rgba, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    WeakEntity, Window, actions, div, list, px,
 };
 use posthaste_core::model::{HttpMethod, RequestProtocol, ResponseCookie};
 use posthaste_core::ws::{
@@ -90,8 +91,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// The largest payload prefix a single expanded row paints.
-const PAYLOAD_DISPLAY_LIMIT: usize = 16 * 1024;
+/// Extra space above and below the viewport that the list may measure.
+const FRAME_LIST_OVERDRAW: gpui::Pixels = px(240.);
 
 /// Which composer mode is selected. Text sends the field verbatim; Base64
 /// decodes it into a binary frame first.
@@ -140,6 +141,20 @@ pub struct WebSocketPanel {
     error: Option<String>,
     /// Expanded frame rows, by transcript index.
     expanded: HashSet<usize>,
+    /// The retained frames, snapshotted when the transcript changes so a
+    /// repaint does not clone it.
+    rows: Rc<[FrameRow]>,
+    /// How many rows the snapshot and the list state describe.
+    row_count: usize,
+    /// Whether the list has been initialized from a transcript.
+    synced: bool,
+    /// The variable-height list that presents the rows.
+    list: ListState,
+    /// Display lines for expanded rows, built once per row and generation.
+    payload_lines: HashMap<usize, Rc<CodeLines>>,
+    /// Rows the list constructed, for the render-budget test. Shared with the
+    /// item closure, which cannot borrow the pane.
+    rows_built: Rc<Cell<u64>>,
     /// The generation the expanded set describes. A new session starts a new
     /// transcript, so the old expansions would point at unrelated rows.
     generation: u64,
@@ -178,6 +193,12 @@ impl WebSocketPanel {
             mode: ComposerMode::Text,
             error: None,
             expanded: HashSet::new(),
+            rows: Rc::from(Vec::new()),
+            row_count: 0,
+            synced: false,
+            list: ListState::new(0, ListAlignment::Top, FRAME_LIST_OVERDRAW),
+            payload_lines: HashMap::new(),
+            rows_built: Rc::new(Cell::new(0)),
             generation: 0,
             payload_selection: None,
             payload_scrolls: HashMap::new(),
@@ -201,6 +222,17 @@ impl WebSocketPanel {
     #[cfg(test)]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Rows the list constructed so far. Tests read the delta across a repaint.
+    #[cfg(test)]
+    pub fn rows_built(&self) -> u64 {
+        self.rows_built.get()
+    }
+
+    #[cfg(test)]
+    pub fn reset_rows_built(&self) {
+        self.rows_built.set(0);
     }
 
     /// Switches the composer mode. A decode error belongs to the mode that
@@ -274,14 +306,22 @@ impl WebSocketPanel {
     }
 
     fn toggle_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.row_count {
+            return;
+        }
         if !self.expanded.remove(&index) {
             self.expanded.insert(index);
+            // The row's lines are built on the next render, and the list
+            // remeasures just this item so the taller block fits.
+            self.payload_lines.remove(&index);
+            self.list.splice(index..index + 1, 1);
             cx.notify();
             return;
         }
         // A collapsed payload takes its view state with it: the scroll handle
         // and any selection it held no longer name anything on screen.
         self.payload_scrolls.remove(&index);
+        self.payload_lines.remove(&index);
         if self
             .payload_selection
             .as_ref()
@@ -289,6 +329,7 @@ impl WebSocketPanel {
         {
             self.payload_selection = None;
         }
+        self.list.splice(index..index + 1, 1);
         cx.notify();
     }
 
@@ -299,7 +340,47 @@ impl WebSocketPanel {
         self.expanded.clear();
         self.payload_selection = None;
         self.payload_scrolls.clear();
+        self.payload_lines.clear();
+        self.rows = Rc::from(Vec::new());
+        self.row_count = 0;
+        self.list.reset(0);
         cx.notify();
+    }
+
+    /// Refreshes the row snapshot and the list's item count when the
+    /// transcript changed. Rows are append-only within a session, so equal
+    /// counts under the same generation mean the same rows.
+    fn sync_rows(&mut self, rows: &[FrameRow], generation: u64) {
+        if self.synced && generation == self.generation && rows.len() == self.row_count {
+            return;
+        }
+        if !self.synced || generation != self.generation {
+            self.generation = generation;
+            self.expanded.clear();
+            self.payload_selection = None;
+            self.payload_scrolls.clear();
+            self.payload_lines.clear();
+            self.section = WsSection::Frames;
+            self.rows = Rc::from(rows);
+            self.row_count = rows.len();
+            self.list.reset(rows.len());
+            self.synced = true;
+            return;
+        }
+        let previous = self.row_count;
+        self.rows = Rc::from(rows);
+        self.row_count = rows.len();
+        if rows.len() > previous {
+            self.list.splice(previous..previous, rows.len() - previous);
+        } else {
+            // The log was cleared; the set of expanded indices no longer
+            // describes any row.
+            self.expanded.clear();
+            self.payload_selection = None;
+            self.payload_scrolls.clear();
+            self.payload_lines.clear();
+            self.list.reset(rows.len());
+        }
     }
 
     /// Focuses the payload and starts a selection at `offset`. Replacing the
@@ -450,7 +531,6 @@ impl Render for WebSocketPanel {
         let generation = app.ws_generation();
         let accent = theme::protocol_accent(app.draft_protocol(), app.draft_method());
         let handshake = app.ws_handshake().cloned();
-        let rows = app.ws_rows().to_vec();
         let truncated = app.ws_truncated();
         let counts = app.ws_counts();
 
@@ -458,13 +538,7 @@ impl Render for WebSocketPanel {
         // previous attempt no longer names the row the user opened. It also
         // reopens on the messages: the traffic is what a session is watched
         // for, and the handshake it began with is the exception.
-        if generation != self.generation {
-            self.generation = generation;
-            self.expanded.clear();
-            self.payload_selection = None;
-            self.payload_scrolls.clear();
-            self.section = WsSection::Frames;
-        }
+        self.sync_rows(app.ws_rows(), generation);
 
         let panel = cx.entity();
         let body: AnyElement = match phase {
@@ -485,7 +559,7 @@ impl Render for WebSocketPanel {
             WsPhase::Failed { message } => failed_session(state.clone(), accent, message.clone()),
             WsPhase::Connected | WsPhase::Closed { .. } => {
                 let closed = matches!(phase, WsPhase::Closed { .. });
-                let rows_empty = rows.is_empty();
+                let rows_empty = self.rows.is_empty();
                 let content: AnyElement = match self.section {
                     WsSection::Frames => {
                         let mut frames = div()
@@ -498,6 +572,7 @@ impl Render for WebSocketPanel {
                         if let WsPhase::Closed { end } = phase {
                             frames = frames.child(closed_summary(end));
                         }
+                        let rows = self.rows.clone();
                         frames
                             .child(self.frame_log(rows, truncated, panel.clone()))
                             .child(self.composer_row(accent, panel.clone(), closed))
@@ -643,11 +718,11 @@ impl WebSocketPanel {
 
     fn frame_log(
         &mut self,
-        rows: Vec<FrameRow>,
+        rows: Rc<[FrameRow]>,
         truncated: bool,
         panel: Entity<Self>,
     ) -> AnyElement {
-        let list: AnyElement = if rows.is_empty() {
+        let frame_list: AnyElement = if rows.is_empty() {
             div()
                 .text_role(type_role::META)
                 .text_color(theme::text::tertiary())
@@ -655,14 +730,66 @@ impl WebSocketPanel {
                 .child(i18n::t(Key::WsFramesEmpty))
                 .into_any_element()
         } else {
+            // Build the display lines for expanded rows once per row and
+            // generation; collapsing or a new session drops them. The item
+            // closure only clones the small per-row preview and the already
+            // built line set.
+            self.payload_lines
+                .retain(|index, _| self.expanded.contains(index) && *index < rows.len());
+            for &index in &self.expanded {
+                if let Some(row) = rows.get(index) {
+                    self.payload_lines
+                        .entry(index)
+                        .or_insert_with(|| Rc::new(CodeLines::new(row.text.as_str())));
+                }
+                self.payload_scrolls.entry(index).or_default();
+            }
+            self.payload_scrolls
+                .retain(|index, _| self.expanded.contains(index));
+
+            let expanded = self.expanded.clone();
+            let lines = self.payload_lines.clone();
+            let scrolls = self.payload_scrolls.clone();
+            let selection = self.payload_selection.as_ref().map(|selection| {
+                (
+                    selection.index,
+                    selection.selection.clone(),
+                    selection.anchor,
+                )
+            });
+            let focus = self.focus.clone();
+            let built = self.rows_built.clone();
+            let render_rows = rows.clone();
+            let render_panel = panel.clone();
+
             div()
-                .id("ws-frame-rows")
-                .flex()
-                .flex_col()
-                .children(
-                    rows.iter()
-                        .enumerate()
-                        .map(|(index, row)| self.frame_row(index, row, panel.clone())),
+                .id("ws-frame-scroll")
+                .debug_selector(|| "ws-frame-scroll".to_owned())
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .rounded(radius::ROW)
+                .bg(theme::surface::input())
+                .child(
+                    list(self.list.clone(), move |index, _window, _cx| {
+                        built.set(built.get() + 1);
+                        let selection = selection
+                            .as_ref()
+                            .filter(|(at, _, _)| *at == index)
+                            .map(|(_, range, anchor)| (range.clone(), *anchor));
+                        WebSocketPanel::frame_row(
+                            index,
+                            render_rows.clone(),
+                            expanded.contains(&index),
+                            lines.get(&index).cloned(),
+                            scrolls.get(&index).cloned(),
+                            selection,
+                            focus.clone(),
+                            render_panel.clone(),
+                        )
+                    })
+                    .w_full()
+                    .h_full(),
                 )
                 .into_any_element()
         };
@@ -681,25 +808,27 @@ impl WebSocketPanel {
                     .child(i18n::t(Key::WsTruncated)),
             );
         }
-        // The scroll region clips natively; no custom Element paints here, so
-        // nothing can draw past the pane's content bounds.
-        log.child(
-            div()
-                .id("ws-frame-scroll")
-                .debug_selector(|| "ws-frame-scroll".to_owned())
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .overflow_hidden()
-                .rounded(radius::ROW)
-                .bg(theme::surface::input())
-                .child(list),
-        )
-        .into_any_element()
+        log.child(frame_list).into_any_element()
     }
 
-    fn frame_row(&mut self, index: usize, row: &FrameRow, panel: Entity<Self>) -> AnyElement {
-        let expanded = self.expanded.contains(&index);
+    /// One frame row. The list asks only for rows in or near the viewport, so
+    /// this builds the head from the text prepared at append time and reuses
+    /// the cached lines of an expanded row.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_row(
+        index: usize,
+        rows: Rc<[FrameRow]>,
+        expanded: bool,
+        lines: Option<Rc<CodeLines>>,
+        scroll: Option<UniformListScrollHandle>,
+        selection: Option<(Option<Range<usize>>, Option<usize>)>,
+        focus: FocusHandle,
+        panel: Entity<Self>,
+    ) -> AnyElement {
+        let row = &rows[index];
+        // An expanded row always has its lines and scroll handle; falling back
+        // to the collapsed look is safer than panicking in a layout pass.
+        let expanded = expanded && lines.is_some() && scroll.is_some();
         let (direction, color) = match row.direction {
             WsDirection::Incoming => (
                 i18n::t(Key::WsDirectionIncoming),
@@ -711,9 +840,12 @@ impl WebSocketPanel {
             WsDirection::Incoming => "↓",
             WsDirection::Outgoing => "↑",
         };
-        let payload = payload_text(row);
-        let preview = preview_text(&payload);
-        let copy_text = payload.clone();
+        let preview = if row.preview.is_empty() {
+            i18n::t(Key::WsEmptyPayload).to_owned()
+        } else {
+            row.preview.clone()
+        };
+        let copy_rows = rows.clone();
         let toggle_panel = panel.clone();
 
         let head = div()
@@ -784,7 +916,9 @@ impl WebSocketPanel {
                 // not to the row that holds it.
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    if let Some(row) = copy_rows.get(index) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(row.text.clone()));
+                    }
                 }),
             )
             // The row opens a payload block, so it states that with a caret
@@ -801,33 +935,28 @@ impl WebSocketPanel {
         let mut body = div().flex().flex_col().child(head);
         if expanded {
             let accent = theme::protocol_accent(RequestProtocol::WebSocket, HttpMethod::Get);
-            let lines = Rc::new(CodeLines::new(payload));
-            // The handle outlives the render so a scrolled payload stays put
-            // and a drag can map the pointer back through its offset.
-            let scroll = self.payload_scrolls.entry(index).or_default().clone();
-            let selection = self
-                .payload_selection
+            let lines = lines.expect("an expanded row has lines");
+            let scroll = scroll.expect("an expanded row has a scroll handle");
+            let paint = selection
                 .as_ref()
-                .filter(|selection| selection.index == index);
-            let paint = selection.and_then(|selection| {
-                selection
-                    .selection
-                    .clone()
-                    .map(|range| (range, theme::accent::subtle_for(accent)))
-            });
+                .and_then(|(range, _)| range.clone())
+                .map(|range| (range, theme::accent::subtle_for(accent)));
             // A press without a drag paints no wash; the caret shows where a
             // later Shift-click will extend from.
-            let caret = selection
-                .filter(|selection| selection.selection.is_none())
-                .and_then(|selection| selection.anchor)
-                .map(|anchor| (anchor, accent));
+            let caret = selection.as_ref().and_then(|(range, anchor)| {
+                if range.is_none() {
+                    anchor.map(|anchor| (anchor, accent))
+                } else {
+                    None
+                }
+            });
 
             let press_panel = panel.clone();
             let move_panel = panel.clone();
             let up_panel = panel.clone();
             let press_lines = lines.clone();
             let interaction = CodeInteraction {
-                focus: self.focus.clone(),
+                focus,
                 selection: paint,
                 caret,
                 on_press: Rc::new(move |offset, click_count, shift, window, cx| {
@@ -1563,84 +1692,52 @@ fn format_at(at_ms: u64) -> String {
     }
 }
 
-/// The retained payload as presented: UTF-8 text, or hex for a binary frame.
-/// The prefix is capped so one huge frame cannot build an unbounded string.
-pub(crate) fn payload_text(row: &FrameRow) -> String {
-    let retained = row.payload.len().min(PAYLOAD_DISPLAY_LIMIT);
-    let bytes = &row.payload[..retained];
-    let mut text = if row.binary {
-        hex(bytes)
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    if (retained < row.payload.len() || row.truncated) && !text.is_empty() {
-        text.push('…');
-    }
-    text
-}
-
-/// One line of the collapsed row: the payload's first line, capped by chars.
-fn preview_text(payload: &str) -> String {
-    if payload.is_empty() {
-        return i18n::t(Key::WsEmptyPayload).to_owned();
-    }
-    let first = payload.lines().next().unwrap_or_default();
-    let mut preview: String = first.chars().take(120).collect();
-    if preview.len() < first.len() || payload.lines().count() > 1 {
-        preview.push('…');
-    }
-    preview
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(bytes.len().saturating_mul(3));
-    for (index, byte) in bytes.iter().enumerate() {
-        if index > 0 {
-            text.push(' ');
-        }
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::ws_session::PAYLOAD_DISPLAY_LIMIT;
 
     fn row(binary: bool, payload: &[u8], size: usize, truncated: bool) -> FrameRow {
-        FrameRow {
-            direction: WsDirection::Incoming,
+        FrameRow::new(
+            WsDirection::Incoming,
             binary,
-            payload: Bytes::copy_from_slice(payload),
+            Bytes::copy_from_slice(payload),
             size,
             truncated,
-            at_ms: 1_500,
-        }
+            1_500,
+        )
     }
 
     #[test]
     fn text_payloads_stay_readable_and_binary_payloads_render_as_hex() {
-        assert_eq!(payload_text(&row(false, b"hello", 5, false)), "hello");
-        assert_eq!(
-            payload_text(&row(true, &[0x00, 0xff, 0x10], 3, false)),
-            "00 ff 10"
-        );
+        assert_eq!(row(false, b"hello", 5, false).text, "hello");
+        assert_eq!(row(true, &[0x00, 0xff, 0x10], 3, false).text, "00 ff 10");
     }
 
     #[test]
     fn a_truncated_frame_marks_its_prefix() {
-        let text = payload_text(&row(false, b"abc", 10, true));
+        let text = row(false, b"abc", 10, true).text;
         assert!(text.starts_with("abc"));
         assert!(text.ends_with('…'));
     }
 
     #[test]
     fn the_preview_names_the_first_line_only() {
-        let frame = row(false, b"first\nsecond", 12, false);
-        assert_eq!(preview_text(&payload_text(&frame)), "first…");
+        assert_eq!(row(false, b"first\nsecond", 12, false).preview, "first…");
+    }
+
+    #[test]
+    fn a_row_bounds_its_text_to_the_display_limit() {
+        let payload = vec![b'a'; PAYLOAD_DISPLAY_LIMIT + 10];
+        let frame = row(false, &payload, payload.len(), false);
+        assert_eq!(
+            frame.text.len(),
+            PAYLOAD_DISPLAY_LIMIT + '…'.len_utf8(),
+            "the display text is the capped prefix plus the truncation mark"
+        );
+        assert!(frame.text.ends_with('…'));
     }
 
     #[test]
