@@ -14,6 +14,7 @@ use posthaste_core::http::{
     CanonicalBody, HttpConfig, HttpExecutor, ResponseEvent, compose_canonical_lenient,
     validate_request, validate_upload_files,
 };
+use posthaste_core::inspection::{Inspection, InspectionInput};
 use posthaste_core::interchange::{
     ImportBundle, ImportCollection, ImportFormat, ImportWarning, parse, parse_curl_requests, sniff,
 };
@@ -1533,6 +1534,22 @@ fn spawn_workspace_instance(path: &Path) -> std::io::Result<()> {
 
 /// gpui entity owning the shell state. Views observe it and re-render on
 /// [`Context::notify`].
+/// The open resolved-request inspector.
+///
+/// The description is built on the background executor when the dialog opens,
+/// so the dialog paints an updating state until the result arrives. A result
+/// is applied only when its generation, tab, and jar revision still describe
+/// the open dialog.
+struct InspectorState {
+    /// The tab the inspector was opened from.
+    tab: TabId,
+    /// The built description, once the background job finished.
+    result: Option<Inspection>,
+    /// The jar's revision when the job snapshotted its input. A result for a
+    /// jar that has moved since is discarded and rebuilt.
+    jar_revision: u64,
+}
+
 pub struct AppState {
     /// Open request tabs, in strip order. Never empty.
     tabs: Vec<RequestTab>,
@@ -1583,6 +1600,14 @@ pub struct AppState {
     /// Focus for the open settings dialog. Created when it opens, so `Escape`
     /// reaches the panel while an editor field would otherwise own the key.
     settings_focus: Option<FocusHandle>,
+    /// The open resolved-request inspector, if any.
+    inspector: Option<InspectorState>,
+    /// Focus for the open inspector, created when it first opens, so `Escape`
+    /// reaches the panel while an editor field would otherwise own the key.
+    inspector_focus: Option<FocusHandle>,
+    /// Incremented on every inspection start, close, and dismissal, so a
+    /// background result from an earlier open is dropped.
+    inspector_generation: u64,
     /// The dialog's editable number fields, kept alive with the shell so the
     /// dialog can render them without creating entities during paint.
     settings_numbers: SettingsNumbers,
@@ -2086,6 +2111,9 @@ impl AppState {
             overlays: OverlayHost::new(),
             settings_focus: None,
             settings_numbers,
+            inspector: None,
+            inspector_focus: None,
+            inspector_generation: 0,
             save_picker_name: None,
             save_picker_destination: None,
             save_picker_error: None,
@@ -2441,6 +2469,140 @@ impl AppState {
             return;
         }
         self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Opens the resolved-request inspector for the active tab and gives it the
+    /// keyboard. Opening it changes no draft, sends nothing, and writes no
+    /// cookie; the description is built from a snapshot off the UI thread.
+    pub fn open_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The welcome screen has no draft and no command bar.
+        if self.content == ContentView::Welcome {
+            return;
+        }
+        let tab_id = self.active_tab().id;
+        // The inspector captures input, so the host dismisses every other
+        // capturing surface.
+        self.open_overlay(OverlayKind::Inspector(tab_id), cx);
+        let focus = self
+            .inspector_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        window.focus(&focus);
+        self.begin_inspection(tab_id, cx);
+    }
+
+    /// Closes the inspector and returns the keyboard to the active request.
+    pub fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = self
+            .overlays
+            .close_where(|kind| matches!(kind, OverlayKind::Inspector(_)));
+        self.forget_inspection();
+        if !closed {
+            return;
+        }
+        self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// The tab the open inspector describes.
+    #[cfg(test)]
+    pub(crate) fn inspector_tab(&self) -> Option<TabId> {
+        self.overlays.inspector_tab()
+    }
+
+    /// The inspector's built description; `None` while it is still building.
+    pub(crate) fn inspector_result(&self) -> Option<&Inspection> {
+        self.inspector
+            .as_ref()
+            .and_then(|inspector| inspector.result.as_ref())
+    }
+
+    /// The focus handle the open inspector tracks, once one has been opened.
+    pub fn inspector_focus(&self) -> Option<&FocusHandle> {
+        self.inspector_focus.as_ref()
+    }
+
+    /// Drops an inspection's result and invalidates its background job without
+    /// touching focus or the overlay host.
+    fn forget_inspection(&mut self) {
+        self.inspector = None;
+        self.inspector_generation = self.inspector_generation.wrapping_add(1);
+    }
+
+    /// Snapshots the draft, the variables Send would use, and the jar, and
+    /// starts the background build.
+    ///
+    /// File existence and size are read inside the job, so a slow upload path
+    /// blocks only that worker and the dialog keeps its updating state.
+    fn begin_inspection(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let input = InspectionInput {
+            spec: tab.shell.draft().clone(),
+            vars: self.workspace.variables_for(self.active_environment()),
+            jar: self.cookies.clone(),
+            assets_root: self.workspace_root().map(Path::to_path_buf),
+        };
+        self.inspector_generation = self.inspector_generation.wrapping_add(1);
+        let generation = self.inspector_generation;
+        self.inspector = Some(InspectorState {
+            tab: tab_id,
+            result: None,
+            jar_revision: self.cookies.revision(),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { Inspection::build(input) })
+                .await;
+            this.update(cx, |state, cx| {
+                state.apply_inspection(tab_id, generation, result, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies a finished build when it still describes the open dialog and
+    /// the jar it read has not moved since.
+    fn apply_inspection(
+        &mut self,
+        tab_id: TabId,
+        generation: u64,
+        result: Inspection,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.inspector_generation {
+            return;
+        }
+        let Some((inspector_tab, jar_revision)) = self
+            .inspector
+            .as_ref()
+            .map(|inspector| (inspector.tab, inspector.jar_revision))
+        else {
+            return;
+        };
+        if inspector_tab != tab_id {
+            return;
+        }
+        if !self.overlays.contains(&OverlayKind::Inspector(tab_id)) {
+            // The dialog was dismissed while the build ran; nothing will read
+            // the result.
+            self.forget_inspection();
+            return;
+        }
+        if self.cookies.revision() != jar_revision {
+            // A cookie write raced the build, so the snapshot no longer
+            // describes the jar. Build again from the current one.
+            self.begin_inspection(tab_id, cx);
+            return;
+        }
+        if let Some(inspector) = self.inspector.as_mut() {
+            inspector.result = Some(result);
+        }
         cx.notify();
     }
 
@@ -4287,6 +4449,11 @@ impl AppState {
     /// them here keeps the rule true whichever surface opens next. The script
     /// preview does not capture input, so it stays visible.
     fn open_overlay(&mut self, kind: OverlayKind, cx: &mut Context<Self>) {
+        // Any other surface replaces the inspector, whose build then has no
+        // reader.
+        if !matches!(kind, OverlayKind::Inspector(_)) {
+            self.forget_inspection();
+        }
         if kind.captures_input() {
             let editor = self.request_editor().clone();
             editor.update(cx, |editor, cx| {
@@ -4383,15 +4550,28 @@ impl AppState {
         }
         self.flush_edits(cx);
         // The jar's dialog describes the request it was opened from, so it
-        // does not follow the user to another tab.
+        // does not follow the user to another tab. The inspector describes a
+        // request the same way.
         let leaving = self.tabs[self.active].editor.clone();
         leaving.update(cx, |editor, cx| editor.close_cookies(cx));
+        self.close_inspector_for_tab_switch();
         self.active = index;
         // The method menu, preview, and jar dialog belong to the editor that
         // owns them, so the host follows the newly active tab.
         self.sync_editor_overlays(cx);
         self.schedule_session_write(cx);
         cx.notify();
+    }
+
+    /// Closes the inspector when the presented tab changes. The caller
+    /// notifies, and the new tab's editor takes focus on its next render.
+    fn close_inspector_for_tab_switch(&mut self) {
+        if self.inspector.is_none() {
+            return;
+        }
+        self.overlays
+            .close_where(|kind| matches!(kind, OverlayKind::Inspector(_)));
+        self.forget_inspection();
     }
 
     /// Makes the tab with `id` active. A missing tab is ignored.
@@ -4703,6 +4883,16 @@ impl AppState {
         }
         if self.overlays.tab_menu() == Some(tab.id) {
             self.overlays.close_tab_menu();
+        }
+        // The inspector would describe a tab that no longer exists.
+        if self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.tab == tab.id)
+        {
+            self.overlays
+                .close_where(|kind| matches!(kind, OverlayKind::Inspector(_)));
+            self.forget_inspection();
         }
         // A WebSocket session records its one outcome here, before the tab is
         // gone; the transport's own closing event then finds no tab.

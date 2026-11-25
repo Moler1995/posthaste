@@ -776,6 +776,22 @@ fn command_bar(
             script_editor.update(cx, |editor, cx| editor.toggle_script_preview(cx));
         });
 
+    // Read-only access to what Send would actually do, beside the URL field so
+    // it is reachable from the draft it describes without leaving the row. For
+    // a handshake draft it sits just before Connect, the only action a
+    // WebSocket request has.
+    let inspect_state = state.clone();
+    let inspect_control = super::ui::icon_button("request-inspect", "ⓘ")
+        .debug_selector(|| "request-inspect".to_owned())
+        .text_role(type_role::MICRO)
+        .tooltip(|_, cx| {
+            cx.new(|_| super::ui::TextTooltip::new(i18n::t(Key::RequestInspect)))
+                .into()
+        })
+        .on_click(move |_, window, cx| {
+            inspect_state.update(cx, |state, cx| state.open_inspector(window, cx));
+        });
+
     // One leading control carries both the transport and the method: the HTTP
     // draft shows its method, the handshake draft shows WS, and the one menu
     // offers both. A second protocol dropdown crowded the URL field.
@@ -803,7 +819,8 @@ fn command_bar(
             .min_w(px(0.))
             .h(layout::CONTROL)
             .child(url_input)
-            .children((!websocket).then_some(script_control)),
+            .children((!websocket).then_some(script_control))
+            .child(inspect_control),
     )
     .child({
         // The primary action follows the protocol. Connect and Disconnect are

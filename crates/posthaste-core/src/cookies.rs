@@ -15,7 +15,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
@@ -173,6 +173,9 @@ pub struct CookieJar {
     state: RwLock<PersistenceState>,
     /// Set when a change has not been written yet. `save_if_dirty` clears it.
     dirty: AtomicBool,
+    /// Bumped on every jar write, so a reader can tell whether the jar it read
+    /// is still current.
+    revision: AtomicU64,
 }
 
 impl Default for CookieJar {
@@ -191,6 +194,7 @@ impl CookieJar {
                 reason: reason.into(),
             }),
             dirty: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -217,6 +221,7 @@ impl CookieJar {
             persistence: Some(persistence),
             state: RwLock::new(PersistenceState::Saved),
             dirty: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
         };
         if let Err(reason) = jar.read_persisted() {
             *jar.state() = PersistenceState::SessionOnly { reason };
@@ -240,6 +245,16 @@ impl CookieJar {
 
     fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::SeqCst);
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A counter that changes on every jar write.
+    ///
+    /// A reader snapshots it before reading and compares afterwards, so a
+    /// displayed result never claims to describe a jar that moved while the
+    /// read ran.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
     }
 
     fn read_persisted(&self) -> Result<(), String> {
@@ -265,6 +280,7 @@ impl CookieJar {
         let store = CookieStore::from_cookies(file.cookies.into_iter().map(Ok::<_, String>), false)
             .map_err(|error| format!("could not restore the cookie file: {error}"))?;
         *self.write() = store;
+        self.revision.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -347,6 +363,27 @@ impl CookieJar {
         Some(self.matching(&draft_url(raw)?))
     }
 
+    /// The names of the cookies [`Self::matching_text`] would report, sorted
+    /// and deduplicated.
+    ///
+    /// The resolved-request inspector never shows a cookie value, so it reads
+    /// this instead of [`Self::matching`]. An unparseable URL attaches no
+    /// cookies, matching what the transport would do.
+    pub fn matching_names(&self, raw: &str) -> Vec<String> {
+        let Some(url) = draft_url(raw) else {
+            return Vec::new();
+        };
+        let store = self.read();
+        let mut names: Vec<String> = store
+            .matches(&url)
+            .into_iter()
+            .map(|cookie| cookie.name().to_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Stores a host-only session cookie for `url`'s host and path.
     ///
     /// The value is parsed as a `Set-Cookie` string so the store applies the
@@ -389,6 +426,7 @@ impl CookieJar {
     pub fn clear(&self) {
         self.write().clear();
         self.dirty.store(false, Ordering::SeqCst);
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.delete_persisted();
     }
 }
@@ -1330,5 +1368,69 @@ mod tests {
         let entry = std::fs::read_to_string(history.entry_file(entry.id)).expect("history entry");
         assert!(!entry.contains("manual=user-value"));
         assert!(entry.contains(REDACTED_VALUE));
+    }
+
+    #[test]
+    fn matching_names_reports_names_without_values() {
+        let jar = CookieJar::default();
+        let target = url("https://api.example.com/");
+        jar.add(&target, "theme", "dark").expect("store theme");
+        jar.add(&target, "sid", "secret").expect("store sid");
+        jar.store_set_cookie("secure=1; Secure; Path=/", &target);
+
+        assert_eq!(
+            jar.matching_names(target.as_str()),
+            ["secure", "sid", "theme"],
+            "names are sorted and carry no value"
+        );
+        assert_eq!(
+            jar.matching_names("http://api.example.com/"),
+            ["sid", "theme"],
+            "the secure cookie does not match a plain connection"
+        );
+        assert!(jar.matching_names("").is_empty());
+        assert!(jar.matching_names("https://{{host}}/").is_empty());
+        assert!(
+            jar.matching_names("https://other.example.com/").is_empty(),
+            "a different host shares no cookie"
+        );
+    }
+
+    #[test]
+    fn every_jar_write_bumps_the_revision() {
+        let jar = CookieJar::default();
+        let target = url("https://api.example.com/");
+
+        let bump = |before: u64, after: u64, what: &str| {
+            assert!(
+                after > before,
+                "{what} must bump the revision ({before} -> {after})"
+            );
+        };
+
+        let mut revision = jar.revision();
+        jar.add(&target, "one", "1").expect("store one");
+        bump(revision, jar.revision(), "add");
+        revision = jar.revision();
+
+        jar.store_set_cookie("two=2; Path=/", &target);
+        bump(revision, jar.revision(), "a response cookie");
+        revision = jar.revision();
+
+        // A read of any kind leaves the revision alone, including the reads the
+        // inspector performs.
+        assert_eq!(jar.matching_names(target.as_str()), ["one", "two"]);
+        assert_eq!(jar.matching(&target).len(), 2);
+        assert!(jar.matching_text(target.as_str()).is_some());
+        assert!(!jar.snapshot().is_empty());
+        assert_eq!(jar.revision(), revision, "reads never write");
+
+        jar.remove("api.example.com", "/", "one");
+        bump(revision, jar.revision(), "remove");
+        revision = jar.revision();
+
+        jar.clear();
+        bump(revision, jar.revision(), "clear");
+        assert_eq!(jar.matching_names(target.as_str()), Vec::<String>::new());
     }
 }

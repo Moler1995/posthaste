@@ -8,6 +8,7 @@ mod json_syntax;
 mod new_workspace;
 pub(crate) mod request_editor;
 pub(crate) mod request_pane;
+mod resolved_request;
 pub(crate) mod response_pane;
 pub(crate) mod response_viewer;
 pub(crate) mod script_preview;
@@ -685,6 +686,7 @@ fn window_overlays(
                 }
                 OverlayKind::ScriptPreview => request_pane::script_modal(editor.clone(), cx),
                 OverlayKind::Cookies => Some(request_editor::cookies_modal(editor.clone(), cx)),
+                OverlayKind::Inspector(_) => resolved_request::inspector_modal(state.clone(), app),
                 OverlayKind::Settings => Some(settings::settings_modal(state.clone(), app)),
                 OverlayKind::CloseConfirm(_) => {
                     Some(tab_strip::close_confirmation_modal(state.clone(), app))
@@ -13061,6 +13063,221 @@ mod tests {
             preview_state(cx),
             before_view,
             "the returned preview keeps the text it captured at open"
+        );
+    }
+
+    /// Opens the inspector through the command-bar control and paints it.
+    fn open_inspector(cx: &mut VisualTestContext) {
+        click(cx, "request-inspect");
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    async fn the_inspector_opens_from_the_command_bar_without_side_effects(
+        cx: &mut TestAppContext,
+    ) {
+        let server = LocalServer::spawn(Duration::ZERO);
+        let (_dir, view, cx) = shell_window(cx);
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        let url = format!("{}?expand=1", server.url());
+        set_url(&state, cx, url.clone());
+
+        let jar = cx.update(|_, app| state.read(app).request_editor().read(app).cookies().clone());
+        let origin = posthaste_core::cookies::draft_url(&server.url()).expect("cookie URL");
+        jar.add(&origin, "sid", "cookie-secret")
+            .expect("store cookie");
+        redraw(cx);
+
+        let tab = cx.update(|_, app| state.read(app).active_tab_position().0);
+        let history_before = cx.update(|_, app| state.read(app).history().entries.len());
+        let snapshot_before = jar.snapshot();
+        let revision_before = jar.revision();
+        let draft_before = cx.update(|_, app| state.read(app).shell().draft().clone());
+
+        open_inspector(cx);
+
+        assert!(cx.debug_bounds("inspector-content").is_some());
+        assert_eq!(
+            cx.update(|_, app| state.read(app).inspector_tab()),
+            Some(tab),
+            "the dialog describes the active tab"
+        );
+        let inspection = cx
+            .update(|_, app| state.read(app).inspector_result().cloned())
+            .expect("the background build lands");
+        assert_eq!(inspection.method, "GET");
+        assert_eq!(inspection.display_url, url);
+        assert!(inspection.can_send, "{:?}", inspection.problems);
+        assert_eq!(
+            inspection.jar,
+            posthaste_core::inspection::JarRole::Attached {
+                names: vec!["sid".to_owned()]
+            }
+        );
+        assert!(
+            cx.debug_bounds("inspector-headers").is_some(),
+            "the header rows are painted"
+        );
+        assert!(cx.debug_bounds("inspector-cookies").is_some());
+
+        // The modal is capturing: typing reaches it, not the URL behind it.
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+
+        cx.update(|_, app| {
+            assert_eq!(
+                state.read(app).history().entries.len(),
+                history_before,
+                "opening records no history"
+            );
+            assert_eq!(
+                state.read(app).shell().draft(),
+                &draft_before,
+                "opening changes no draft"
+            );
+        });
+        assert_eq!(server.request_count(), 0, "opening sends nothing");
+        assert_eq!(jar.snapshot(), snapshot_before, "opening writes no cookie");
+        assert_eq!(jar.revision(), revision_before, "the jar is untouched");
+    }
+
+    #[gpui::test]
+    async fn the_inspector_shows_an_updating_state_until_the_build_lands(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        set_url(
+            &state,
+            cx,
+            "https://api.example.com/items?expand=1".to_owned(),
+        );
+
+        // Open and paint once without running the background executor, so the
+        // dialog is observed between its first frame and the result.
+        cx.update(|window, app| {
+            state.update(app, |state, cx| state.open_inspector(window, cx));
+        });
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("inspector-preparing").is_some(),
+            "the dialog shows its updating state, not a partial result"
+        );
+        assert!(cx.update(|_, app| state.read(app).inspector_result().is_none()));
+
+        cx.run_until_parked();
+        redraw(cx);
+        assert!(cx.debug_bounds("inspector-content").is_some());
+        assert!(cx.debug_bounds("inspector-preparing").is_none());
+        assert!(cx.update(|_, app| state.read(app).inspector_result().is_some()));
+    }
+
+    #[gpui::test]
+    async fn every_inspector_dismissal_returns_focus_to_the_editor(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        // A wide window keeps the backdrop clickable well beside the card.
+        cx.simulate_resize(gpui::size(px(1920.), px(1600.)));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        set_url(&state, cx, "https://api.example.com/items".to_owned());
+
+        let editor_url_focus = |cx: &mut VisualTestContext| {
+            cx.update(|_, app| {
+                state
+                    .read(app)
+                    .request_editor()
+                    .read(app)
+                    .url_input()
+                    .read(app)
+                    .focus_handle()
+                    .clone()
+            })
+        };
+        let closed = |cx: &mut VisualTestContext| {
+            cx.update(|_, app| state.read(app).inspector_tab().is_none())
+        };
+
+        // Escape closes and returns the keyboard to the URL field.
+        open_inspector(cx);
+        cx.run_until_parked();
+        redraw(cx);
+        let inspector_focus = cx
+            .update(|_, app| state.read(app).inspector_focus().cloned())
+            .expect("the dialog holds a focus handle");
+        assert!(cx.update(|window, _| inspector_focus.is_focused(window)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        redraw(cx);
+        assert!(closed(cx), "Escape closes the dialog");
+        let url_focus = editor_url_focus(cx);
+        assert!(
+            cx.update(|window, _| url_focus.is_focused(window)),
+            "Escape returns focus to the editor"
+        );
+
+        // The corner close does the same.
+        open_inspector(cx);
+        cx.run_until_parked();
+        redraw(cx);
+        click(cx, "inspector-close");
+        redraw(cx);
+        assert!(closed(cx), "the close control closes the dialog");
+        assert!(cx.update(|window, _| url_focus.is_focused(window)));
+
+        // So does a click on the backdrop, away from the card.
+        open_inspector(cx);
+        cx.run_until_parked();
+        redraw(cx);
+        let bounds = cx
+            .debug_bounds("resolved-request-dialog-backdrop")
+            .expect("the backdrop covers the window");
+        cx.simulate_click(
+            point(bounds.left() + bounds.size.width * 0.1, bounds.center().y),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        redraw(cx);
+        assert!(closed(cx), "a backdrop click closes the dialog");
+        assert!(cx.update(|window, _| url_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    async fn copying_the_inspector_never_copies_a_secret(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        redraw(cx);
+        let state = shell_state(&view, cx);
+        set_url(&state, cx, "https://api.example.com/items".to_owned());
+
+        let jar = cx.update(|_, app| state.read(app).request_editor().read(app).cookies().clone());
+        let origin =
+            posthaste_core::cookies::draft_url("https://api.example.com/").expect("cookie URL");
+        jar.add(&origin, "sid", "cookie-secret")
+            .expect("store cookie");
+        redraw(cx);
+
+        open_inspector(cx);
+        cx.run_until_parked();
+        redraw(cx);
+        click(cx, "inspector-copy");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+
+        assert!(!copied.is_empty(), "the copy action copies the description");
+        assert!(
+            copied.contains("https://api.example.com/items"),
+            "the URL is copied: {copied}"
+        );
+        assert!(
+            copied.contains("sid"),
+            "the cookie name is copied: {copied}"
+        );
+        assert!(
+            !copied.contains("cookie-secret"),
+            "the cookie value is never copied: {copied}"
         );
     }
 

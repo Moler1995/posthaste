@@ -43,6 +43,8 @@ pub enum OverlayKind {
     WorkspaceMenu,
     ScriptPreview,
     Cookies,
+    /// The resolved-request inspector, for the tab it was opened from.
+    Inspector(TabId),
     Settings,
     SavePicker(TabId),
     ExportConfirm(String),
@@ -66,6 +68,7 @@ impl OverlayKind {
             | Self::WorkspaceMenu => Layer::Anchored,
             Self::ScriptPreview
             | Self::Cookies
+            | Self::Inspector(_)
             | Self::Settings
             | Self::SavePicker(_)
             | Self::ExportConfirm(_)
@@ -254,6 +257,15 @@ impl OverlayHost {
     pub fn tab_menu(&self) -> Option<TabId> {
         self.entries.iter().find_map(|entry| match &entry.kind {
             OverlayKind::TabMenu(id) => Some(*id),
+            _ => None,
+        })
+    }
+
+    /// The tab whose resolved request the inspector describes.
+    #[cfg(test)]
+    pub fn inspector_tab(&self) -> Option<TabId> {
+        self.entries.iter().find_map(|entry| match &entry.kind {
+            OverlayKind::Inspector(id) => Some(*id),
             _ => None,
         })
     }

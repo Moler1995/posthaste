@@ -84,6 +84,25 @@ pub struct GeneratedHeader {
     pub value: String,
 }
 
+/// Where one composed header came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum HeaderOrigin {
+    /// An enabled header row written on the request.
+    User,
+    /// The request's active credential.
+    Auth,
+    /// A default the composer or the transport supplies.
+    Generated,
+}
+
+/// One header in an inspected composition, with the place it came from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ComposedHeader {
+    pub name: String,
+    pub value: String,
+    pub origin: HeaderOrigin,
+}
+
 /// Limits applied to every request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpConfig {
@@ -477,18 +496,114 @@ pub fn compose_canonical_with_schemes(
     spec: &RequestSpec,
     schemes: &[&str],
 ) -> Result<CanonicalRequest, PosthasteError> {
+    compose_with_schemes_and_origins(spec, schemes).map(|(request, _)| request)
+}
+
+/// [`compose_canonical_with_schemes`] plus each header's origin and the
+/// transport defaults the editor already presents.
+///
+/// The composed rows are identical to [`compose_canonical_with_schemes`]; the
+/// transport defaults reported by [`generated_headers`] are appended only when
+/// no composed row already carries the name, so the result is the full set the
+/// request would carry.
+pub fn compose_canonical_inspected_with_schemes(
+    spec: &RequestSpec,
+    schemes: &[&str],
+    assets_root: Option<&Path>,
+) -> Result<(CanonicalRequest, Vec<ComposedHeader>), PosthasteError> {
+    let (mut request, mut composed) = compose_with_schemes_and_origins(spec, schemes)?;
+    append_transport_defaults(spec, assets_root, &mut request.headers, &mut composed);
+    Ok((request, composed))
+}
+
+/// [`compose_canonical_inspected_with_schemes`] for HTTP requests.
+pub fn compose_canonical_inspected(
+    spec: &RequestSpec,
+    assets_root: Option<&Path>,
+) -> Result<(CanonicalRequest, Vec<ComposedHeader>), PosthasteError> {
+    compose_canonical_inspected_with_schemes(spec, HTTP_SCHEMES, assets_root)
+}
+
+fn compose_with_schemes_and_origins(
+    spec: &RequestSpec,
+    schemes: &[&str],
+) -> Result<(CanonicalRequest, Vec<ComposedHeader>), PosthasteError> {
     let mut url = UrlComposition::strict_with(spec, schemes)?;
     append_query_rows(&mut url, spec);
-    let mut headers = header_rows(spec);
-    apply_auth(spec, &mut url, &mut headers);
-    push_default_content_type(spec, &mut headers);
+    let (headers, composed) = compose_headers(spec, &mut url);
 
-    Ok(CanonicalRequest {
-        method: spec.method.as_str().to_owned(),
-        url: url.finish(),
-        headers,
-        body: canonical_body(&spec.body),
-    })
+    Ok((
+        CanonicalRequest {
+            method: spec.method.as_str().to_owned(),
+            url: url.finish(),
+            headers,
+            body: canonical_body(&spec.body),
+        },
+        composed,
+    ))
+}
+
+/// Composes the header rows and records where each one came from.
+///
+/// The composer only ever appends rows — user rows first, then the credential,
+/// then the default content type — so the origin list stays in step with the
+/// header list without matching names after the fact.
+fn compose_headers(
+    spec: &RequestSpec,
+    url: &mut UrlComposition,
+) -> (Vec<(String, String)>, Vec<ComposedHeader>) {
+    let mut headers = header_rows(spec);
+    let mut composed: Vec<ComposedHeader> = headers
+        .iter()
+        .map(|(name, value)| ComposedHeader {
+            name: name.clone(),
+            value: value.clone(),
+            origin: HeaderOrigin::User,
+        })
+        .collect();
+
+    let before = headers.len();
+    apply_auth(spec, url, &mut headers);
+    push_origins(&mut composed, &headers[before..], HeaderOrigin::Auth);
+
+    let before = headers.len();
+    push_default_content_type(spec, &mut headers);
+    push_origins(&mut composed, &headers[before..], HeaderOrigin::Generated);
+
+    (headers, composed)
+}
+
+fn push_origins(
+    composed: &mut Vec<ComposedHeader>,
+    added: &[(String, String)],
+    origin: HeaderOrigin,
+) {
+    composed.extend(added.iter().map(|(name, value)| ComposedHeader {
+        name: name.clone(),
+        value: value.clone(),
+        origin,
+    }));
+}
+
+/// Appends the transport's own rows when no composed row already carries the
+/// name. [`generated_headers`] reports them in wire order.
+fn append_transport_defaults(
+    spec: &RequestSpec,
+    assets_root: Option<&Path>,
+    headers: &mut Vec<(String, String)>,
+    composed: &mut Vec<ComposedHeader>,
+) {
+    for generated in generated_headers(spec, assets_root) {
+        if has_header(headers, &generated.name) {
+            continue;
+        }
+        headers.push((generated.name.clone(), generated.value.clone()));
+        composed.push(ComposedHeader {
+            name: generated.name,
+            value: generated.value,
+            origin: HeaderOrigin::Generated,
+        });
+    }
 }
 
 /// Composes a request for the script preview, tolerating a draft that cannot
@@ -500,12 +615,38 @@ pub fn compose_canonical_with_schemes(
 /// written, so an invalid one does not hide the rest of the preview. The
 /// returned notice names the first reason the preview is not a valid request.
 pub fn compose_canonical_lenient(spec: &RequestSpec) -> (CanonicalRequest, Option<String>) {
-    let mut url = UrlComposition::preview(spec);
+    let (request, _, notice) = compose_lenient_inner(spec, HTTP_SCHEMES);
+    (request, notice)
+}
+
+/// [`compose_canonical_lenient`] plus header origins and the transport
+/// defaults, for a draft that may not be sendable yet.
+pub fn compose_canonical_lenient_inspected_with_schemes(
+    spec: &RequestSpec,
+    schemes: &[&str],
+    assets_root: Option<&Path>,
+) -> (CanonicalRequest, Vec<ComposedHeader>, Option<String>) {
+    let (mut request, mut composed, notice) = compose_lenient_inner(spec, schemes);
+    append_transport_defaults(spec, assets_root, &mut request.headers, &mut composed);
+    (request, composed, notice)
+}
+
+/// [`compose_canonical_lenient_inspected_with_schemes`] for HTTP requests.
+pub fn compose_canonical_lenient_inspected(
+    spec: &RequestSpec,
+    assets_root: Option<&Path>,
+) -> (CanonicalRequest, Vec<ComposedHeader>, Option<String>) {
+    compose_canonical_lenient_inspected_with_schemes(spec, HTTP_SCHEMES, assets_root)
+}
+
+fn compose_lenient_inner(
+    spec: &RequestSpec,
+    schemes: &[&str],
+) -> (CanonicalRequest, Vec<ComposedHeader>, Option<String>) {
+    let mut url = UrlComposition::preview_with(spec, schemes);
     let textual = matches!(url, UrlComposition::Textual(_));
     append_query_rows(&mut url, spec);
-    let mut headers = header_rows(spec);
-    apply_auth(spec, &mut url, &mut headers);
-    push_default_content_type(spec, &mut headers);
+    let (headers, composed) = compose_headers(spec, &mut url);
 
     let mut notice = None;
     if textual {
@@ -531,6 +672,7 @@ pub fn compose_canonical_lenient(spec: &RequestSpec) -> (CanonicalRequest, Optio
             headers,
             body: canonical_body(&spec.body),
         },
+        composed,
         notice,
     )
 }
@@ -550,13 +692,13 @@ impl UrlComposition {
         Ok(Self::Parsed(parse_url_with_schemes(&spec.url, schemes)?))
     }
 
-    fn preview(spec: &RequestSpec) -> Self {
+    fn preview_with(spec: &RequestSpec, schemes: &[&str]) -> Self {
         // A brace means an unresolved placeholder; parsing would percent-encode
         // it and the preview would no longer show what the user wrote.
         if spec.url.contains("{{") {
             Self::Textual(spec.url.trim().to_owned())
         } else {
-            match parse_url(&spec.url) {
+            match parse_url_with_schemes(&spec.url, schemes) {
                 Ok(url) => Self::Parsed(url),
                 Err(_) => Self::Textual(spec.url.trim().to_owned()),
             }
@@ -907,7 +1049,7 @@ fn check_upload_file(
 }
 
 /// The message an invalid header produces, shared by Send and the preview.
-fn validate_header(name: &str, value: &str) -> Result<(), PosthasteError> {
+pub(crate) fn validate_header(name: &str, value: &str) -> Result<(), PosthasteError> {
     HeaderName::from_bytes(name.as_bytes())
         .map_err(|error| PosthasteError::InvalidHeader(format!("{name} ({error})")))?;
     HeaderValue::from_str(value)
@@ -999,7 +1141,7 @@ fn body_bytes(body: &RequestBody) -> Option<Bytes> {
 /// The encoded body length when it can be known before sending, for the
 /// generated-header preview. A file's length comes from its metadata; a
 /// multipart body's framing is unknown until reqwest builds it.
-fn body_length(body: &RequestBody, assets_root: Option<&Path>) -> Option<u64> {
+pub(crate) fn body_length(body: &RequestBody, assets_root: Option<&Path>) -> Option<u64> {
     match body {
         RequestBody::File { path } => {
             let resolved = resolve_upload_path(path, assets_root).ok()?;
@@ -1013,7 +1155,10 @@ fn body_length(body: &RequestBody, assets_root: Option<&Path>) -> Option<u64> {
 
 /// Resolves a recorded upload path: a legacy absolute path as given, a
 /// workspace-relative one inside `assets_root` only.
-fn resolve_upload_path(path: &str, assets_root: Option<&Path>) -> Result<PathBuf, PosthasteError> {
+pub(crate) fn resolve_upload_path(
+    path: &str,
+    assets_root: Option<&Path>,
+) -> Result<PathBuf, PosthasteError> {
     if path.trim().is_empty() {
         return Err(PosthasteError::InvalidBody("no file chosen".to_owned()));
     }
@@ -1030,7 +1175,7 @@ fn resolve_upload_path(path: &str, assets_root: Option<&Path>) -> Result<PathBuf
 
 /// Rejects a JSON body that is present but malformed. An empty body is allowed
 /// so a request can be sent before its JSON content is filled in.
-fn validate_json_body(body: &str) -> Result<(), PosthasteError> {
+pub(crate) fn validate_json_body(body: &str) -> Result<(), PosthasteError> {
     if body.trim().is_empty() {
         return Ok(());
     }
@@ -1998,6 +2143,133 @@ mod tests {
         let headers = generated_headers(&spec, None);
         let names: Vec<_> = headers.iter().map(|header| header.name.as_str()).collect();
         assert_eq!(names, ["Accept-Encoding"], "no host without a URL");
+    }
+
+    #[test]
+    fn inspected_composition_extends_the_canonical_request() {
+        fn fixtures() -> Vec<RequestSpec> {
+            let mut url_and_query = RequestSpec::new("url");
+            url_and_query.method = HttpMethod::Post;
+            url_and_query.url = "https://example.com:8443/api?page=1".into();
+            url_and_query.query = vec![
+                KeyValue::new("q", "posthaste bird"),
+                KeyValue {
+                    key: "skipped".into(),
+                    value: "1".into(),
+                    enabled: false,
+                },
+            ];
+            url_and_query.body = RequestBody::Json(r#"{"ok":true}"#.into());
+
+            let mut header_and_auth = RequestSpec::new("auth");
+            header_and_auth.url = "https://example.com/items".into();
+            header_and_auth.headers = vec![KeyValue::new("X-Trace", "1")];
+            header_and_auth.auth = RequestAuth::Bearer {
+                token: "token".into(),
+            };
+
+            let mut basic = RequestSpec::new("basic");
+            basic.url = "https://example.com".into();
+            basic.auth = RequestAuth::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            };
+
+            let mut api_key_header = RequestSpec::new("api key header");
+            api_key_header.url = "https://example.com".into();
+            api_key_header.auth = RequestAuth::ApiKey {
+                key: "X-Api-Key".into(),
+                value: "secret".into(),
+                location: ApiKeyLocation::Header,
+            };
+
+            let mut api_key_query = RequestSpec::new("api key query");
+            api_key_query.url = "https://example.com".into();
+            api_key_query.auth = RequestAuth::ApiKey {
+                key: "api_key".into(),
+                value: "secret".into(),
+                location: ApiKeyLocation::Query,
+            };
+
+            let mut multipart = RequestSpec::new("multipart");
+            multipart.method = HttpMethod::Post;
+            multipart.url = "https://example.com/upload".into();
+            multipart.body = RequestBody::Multipart(vec![MultipartPart::text("field", "value")]);
+
+            let mut user_rows = RequestSpec::new("user rows");
+            user_rows.url = "https://example.com".into();
+            user_rows.headers = vec![
+                KeyValue::new("host", "mirror.internal"),
+                KeyValue::new("accept-encoding", "identity"),
+                KeyValue::new("content-type", "text/csv"),
+            ];
+            user_rows.body = RequestBody::Text("a,b".into());
+
+            vec![
+                url_and_query,
+                header_and_auth,
+                basic,
+                api_key_header,
+                api_key_query,
+                multipart,
+                user_rows,
+            ]
+        }
+
+        for spec in fixtures() {
+            let canonical = compose_canonical(&spec).expect("the fixture composes");
+            let (inspected, composed) =
+                compose_canonical_inspected(&spec, None).expect("the fixture inspects");
+
+            assert_eq!(inspected.method, canonical.method);
+            assert_eq!(inspected.url, canonical.url, "{}", spec.name);
+            assert_eq!(inspected.body, canonical.body);
+            assert_eq!(
+                &inspected.headers[..canonical.headers.len()],
+                canonical.headers.as_slice(),
+                "{} keeps the composed request as its prefix",
+                spec.name
+            );
+
+            let expected: Vec<(String, String)> = generated_headers(&spec, None)
+                .into_iter()
+                .filter(|generated| {
+                    !canonical
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(&generated.name))
+                })
+                .map(|generated| (generated.name, generated.value))
+                .collect();
+            assert_eq!(
+                inspected.headers[canonical.headers.len()..],
+                expected[..],
+                "{} appends exactly the transport defaults",
+                spec.name
+            );
+
+            let user_rows = spec
+                .headers
+                .iter()
+                .filter(|row| row.enabled && !row.key.is_empty())
+                .count();
+            let credential = auth_header_name(&spec.auth);
+            for (index, origin) in composed.iter().enumerate() {
+                let (name, value) = &inspected.headers[index];
+                assert_eq!((&origin.name, &origin.value), (name, value));
+                let expected_origin = if index >= canonical.headers.len() {
+                    HeaderOrigin::Generated
+                } else if index < user_rows {
+                    HeaderOrigin::User
+                } else if credential.is_some_and(|credential| credential.eq_ignore_ascii_case(name))
+                {
+                    HeaderOrigin::Auth
+                } else {
+                    HeaderOrigin::Generated
+                };
+                assert_eq!(origin.origin, expected_origin, "{}: {name}", spec.name);
+            }
+        }
     }
 
     #[test]

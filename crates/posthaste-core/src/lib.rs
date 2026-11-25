@@ -5,6 +5,7 @@ pub mod cookies;
 pub mod error;
 pub mod history;
 pub mod http;
+pub mod inspection;
 pub mod interchange;
 pub mod model;
 pub mod paths;
