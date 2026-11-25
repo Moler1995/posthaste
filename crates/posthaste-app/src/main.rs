@@ -9,6 +9,7 @@ mod history;
 mod i18n;
 mod metrics;
 mod overlay;
+mod persistence;
 #[cfg(test)]
 mod test_globals;
 #[cfg(test)]

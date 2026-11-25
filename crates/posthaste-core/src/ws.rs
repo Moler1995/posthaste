@@ -41,6 +41,10 @@ use crate::model::{RequestSpec, ResponseCookie};
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// How much of one received frame is retained.
 pub const MAX_FRAME_RETAINED: usize = 1024 * 1024;
+/// How many outgoing frames may wait for the writer before a send is refused.
+pub const WS_COMMAND_QUEUE: usize = 64;
+/// How many events may wait for the app before the reader stops reading.
+pub const WS_EVENT_QUEUE: usize = 256;
 
 /// Header rows the upgrade owns. A user row with one of these names would
 /// duplicate or contradict the handshake tungstenite generates, so it is
@@ -258,15 +262,19 @@ pub async fn run_session(
     cookies: Arc<CookieJar>,
     timeout: Duration,
     mut cancel: oneshot::Receiver<()>,
-    mut commands: mpsc::UnboundedReceiver<WsCommand>,
-    mut sink: impl FnMut(WsEvent) + Send,
+    mut commands: mpsc::Receiver<WsCommand>,
+    events: mpsc::Sender<WsEvent>,
 ) {
     let request = match handshake.request() {
         Ok(request) => request,
         Err(error) => {
-            sink(WsEvent::Failed {
-                message: error.to_string(),
-            });
+            send_event(
+                &events,
+                WsEvent::Failed {
+                    message: error.to_string(),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -280,15 +288,23 @@ pub async fn run_session(
     let (socket, response) = match connected {
         Ok(Ok(connected)) => connected,
         Ok(Err(error)) => {
-            sink(WsEvent::Failed {
-                message: describe_tungstenite_error(error),
-            });
+            send_event(
+                &events,
+                WsEvent::Failed {
+                    message: describe_tungstenite_error(error),
+                },
+            )
+            .await;
             return;
         }
         Err(_) => {
-            sink(WsEvent::Failed {
-                message: "the WebSocket handshake timed out".to_owned(),
-            });
+            send_event(
+                &events,
+                WsEvent::Failed {
+                    message: "the WebSocket handshake timed out".to_owned(),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -321,139 +337,254 @@ pub async fn run_session(
     // Described after the jar took them, so each row says whether it was
     // stored. This is the same record an HTTP response carries.
     let response_cookies = describe_response_cookies(&headers, &scope, &cookies);
-    sink(WsEvent::Connected {
-        handshake: WsHandshake {
-            status,
-            headers,
-            protocol,
-            cookies: response_cookies,
+    if !send_event(
+        &events,
+        WsEvent::Connected {
+            handshake: WsHandshake {
+                status,
+                headers,
+                protocol,
+                cookies: response_cookies,
+            },
         },
-    });
+    )
+    .await
+    {
+        return;
+    }
 
+    // One reader and one writer share the socket. The reader alone decides
+    // what arrived, including ping, pong, and close, and reports it through a
+    // bounded channel; waiting for room there stops reading instead of growing
+    // memory. The writer alone touches the sink, so sends stay in command
+    // order. A watch keeps the reader from lingering after the writer ends.
     let (mut write, mut read) = socket.split();
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut cancel => {
-                let _ = write.send(Message::Close(None)).await;
-                sink(WsEvent::Closed {
-                    by: WsCloseBy::User,
-                    code: None,
-                    reason: None,
-                });
-                return;
-            }
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    // The tab dropped the sender: close without reporting a
-                    // user action the app no longer shows.
+    let (signals, mut signal_rx) = mpsc::channel::<WriterSignal>(WS_COMMAND_QUEUE);
+    let (stop, mut reader_stop) = tokio::sync::watch::channel(false);
+
+    let writer_events = events.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancel => {
                     let _ = write.send(Message::Close(None)).await;
-                    sink(WsEvent::Closed {
-                        by: WsCloseBy::User,
-                        code: None,
-                        reason: None,
-                    });
-                    return;
-                };
-                match command {
-                    WsCommand::Close => {
-                        let _ = write.send(Message::Close(None)).await;
-                        sink(WsEvent::Closed {
+                    let _ = send_event(
+                        &writer_events,
+                        WsEvent::Closed {
                             by: WsCloseBy::User,
                             code: None,
                             reason: None,
-                        });
-                        return;
-                    }
-                    WsCommand::Text(text) => {
-                        let payload = Bytes::from(text.clone().into_bytes());
-                        let size = payload.len();
-                        if let Err(error) = write.send(Message::Text(text.into())).await {
-                            sink(WsEvent::Failed {
-                                message: describe_tungstenite_error(error),
-                            });
-                            return;
+                        },
+                    )
+                    .await;
+                    break;
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        // The tab dropped the sender: close without reporting a
+                        // user action the app no longer shows.
+                        let _ = write.send(Message::Close(None)).await;
+                        let _ = send_event(
+                            &writer_events,
+                            WsEvent::Closed {
+                                by: WsCloseBy::User,
+                                code: None,
+                                reason: None,
+                            },
+                        )
+                        .await;
+                        break;
+                    };
+                    match command {
+                        WsCommand::Close => {
+                            let _ = write.send(Message::Close(None)).await;
+                            let _ = send_event(
+                                &writer_events,
+                                WsEvent::Closed {
+                                    by: WsCloseBy::User,
+                                    code: None,
+                                    reason: None,
+                                },
+                            )
+                            .await;
+                            break;
                         }
-                        sink(WsEvent::Frame {
-                            direction: WsDirection::Outgoing,
-                            binary: false,
-                            payload,
-                            size,
-                            truncated: false,
-                            at_ms: unix_millis_now(),
-                        });
-                    }
-                    WsCommand::Binary(bytes) => {
-                        let payload = Bytes::from(bytes);
-                        let size = payload.len();
-                        if let Err(error) = write.send(Message::Binary(payload.clone())).await {
-                            sink(WsEvent::Failed {
-                                message: describe_tungstenite_error(error),
-                            });
-                            return;
+                        WsCommand::Text(text) => {
+                            let payload = Bytes::from(text.clone().into_bytes());
+                            let size = payload.len();
+                            if let Err(error) = write.send(Message::Text(text.into())).await {
+                                let _ = send_event(
+                                    &writer_events,
+                                    WsEvent::Failed {
+                                        message: describe_tungstenite_error(error),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                            if !send_event(
+                                &writer_events,
+                                WsEvent::Frame {
+                                    direction: WsDirection::Outgoing,
+                                    binary: false,
+                                    payload,
+                                    size,
+                                    truncated: false,
+                                    at_ms: unix_millis_now(),
+                                },
+                            )
+                            .await
+                            {
+                                break;
+                            }
                         }
-                        sink(WsEvent::Frame {
-                            direction: WsDirection::Outgoing,
-                            binary: true,
-                            payload,
-                            size,
-                            truncated: false,
-                            at_ms: unix_millis_now(),
-                        });
+                        WsCommand::Binary(bytes) => {
+                            let payload = Bytes::from(bytes);
+                            let size = payload.len();
+                            if let Err(error) = write.send(Message::Binary(payload.clone())).await {
+                                let _ = send_event(
+                                    &writer_events,
+                                    WsEvent::Failed {
+                                        message: describe_tungstenite_error(error),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                            if !send_event(
+                                &writer_events,
+                                WsEvent::Frame {
+                                    direction: WsDirection::Outgoing,
+                                    binary: true,
+                                    payload,
+                                    size,
+                                    truncated: false,
+                                    at_ms: unix_millis_now(),
+                                },
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-            message = read.next() => {
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        let bytes = Bytes::copy_from_slice(text.as_bytes());
-                        emit_incoming(&mut sink, bytes, false);
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        emit_incoming(&mut sink, bytes, true);
-                    }
-                    Some(Ok(Message::Ping(_))) => {
-                        // tungstenite queues the pong; flushing writes it on
-                        // this loop turn, so no ping row is presented.
-                        let _ = write.flush().await;
-                    }
-                    Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
-                        let (code, reason) = match frame {
-                            Some(frame) => (
-                                Some(u16::from(frame.code)),
-                                (!frame.reason.is_empty()).then(|| frame.reason.to_string()),
-                            ),
-                            None => (None, None),
-                        };
-                        let _ = write.send(Message::Close(None)).await;
-                        sink(WsEvent::Closed {
-                            by: WsCloseBy::Server,
-                            code,
-                            reason,
-                        });
-                        return;
-                    }
-                    Some(Err(error)) => {
-                        sink(WsEvent::Failed {
-                            message: describe_tungstenite_error(error),
-                        });
-                        return;
-                    }
-                    None => {
-                        sink(WsEvent::Failed {
-                            message: "the connection closed without a close frame".to_owned(),
-                        });
-                        return;
+                signal = signal_rx.recv() => {
+                    match signal {
+                        Some(WriterSignal::Flush) => {
+                            // tungstenite queues the pong when the ping is
+                            // read; flushing here writes it.
+                            let _ = write.flush().await;
+                        }
+                        Some(WriterSignal::CloseEcho) => {
+                            let _ = write.send(Message::Close(None)).await;
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
         }
-    }
+        let _ = stop.send(true);
+    });
+
+    let reader_events = events;
+    let reader = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                changed = reader_stop.changed() => {
+                    if changed.is_err() || *reader_stop.borrow() {
+                        return;
+                    }
+                }
+                message = read.next() => {
+                    match message {
+                        Some(Ok(Message::Text(text))) => {
+                            let bytes = Bytes::copy_from_slice(text.as_bytes());
+                            if !emit_incoming(&reader_events, bytes, false).await {
+                                return;
+                            }
+                        }
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if !emit_incoming(&reader_events, bytes, true).await {
+                                return;
+                            }
+                        }
+                        Some(Ok(Message::Ping(_))) => {
+                            // The pong is queued by the library; the writer
+                            // flushes it on the next signal.
+                            if signals.send(WriterSignal::Flush).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                        Some(Ok(Message::Close(frame))) => {
+                            let (code, reason) = match frame {
+                                Some(frame) => (
+                                    Some(u16::from(frame.code)),
+                                    (!frame.reason.is_empty()).then(|| frame.reason.to_string()),
+                                ),
+                                None => (None, None),
+                            };
+                            let _ = signals.send(WriterSignal::CloseEcho).await;
+                            let _ = send_event(
+                                &reader_events,
+                                WsEvent::Closed {
+                                    by: WsCloseBy::Server,
+                                    code,
+                                    reason,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                        Some(Err(error)) => {
+                            let _ = send_event(
+                                &reader_events,
+                                WsEvent::Failed {
+                                    message: describe_tungstenite_error(error),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                        None => {
+                            let _ = send_event(
+                                &reader_events,
+                                WsEvent::Failed {
+                                    message: "the connection closed without a close frame"
+                                        .to_owned(),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(writer, reader);
+}
+
+/// Writer-side work the reader requests: flush a queued pong or echo a close.
+#[derive(Debug)]
+enum WriterSignal {
+    Flush,
+    CloseEcho,
+}
+
+async fn send_event(events: &mpsc::Sender<WsEvent>, event: WsEvent) -> bool {
+    events.send(event).await.is_ok()
 }
 
 /// Reports one received payload, retaining at most [`MAX_FRAME_RETAINED`].
-fn emit_incoming(sink: &mut (impl FnMut(WsEvent) + ?Sized), bytes: Bytes, binary: bool) {
+///
+/// Returns `false` when the event channel closed, telling the reader to stop.
+async fn emit_incoming(events: &mpsc::Sender<WsEvent>, bytes: Bytes, binary: bool) -> bool {
     let size = bytes.len();
     let truncated = size > MAX_FRAME_RETAINED;
     let payload = if truncated {
@@ -461,14 +592,18 @@ fn emit_incoming(sink: &mut (impl FnMut(WsEvent) + ?Sized), bytes: Bytes, binary
     } else {
         bytes
     };
-    sink(WsEvent::Frame {
-        direction: WsDirection::Incoming,
-        binary,
-        payload,
-        size,
-        truncated,
-        at_ms: unix_millis_now(),
-    });
+    send_event(
+        events,
+        WsEvent::Frame {
+            direction: WsDirection::Incoming,
+            binary,
+            payload,
+            size,
+            truncated,
+            at_ms: unix_millis_now(),
+        },
+    )
+    .await
 }
 
 /// A failure message that names the cause instead of tungstenite's debug form.
@@ -505,7 +640,7 @@ mod tests {
     use crate::model::{KeyValue, RequestAuth, RequestBody, RequestProtocol};
     use std::time::Duration;
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::handshake::server::Response;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -640,7 +775,7 @@ mod tests {
         assert!(error.contains("1024 KiB"), "{error}");
     }
 
-    async fn next_event(rx: &mut UnboundedReceiver<WsEvent>) -> WsEvent {
+    async fn next_event(rx: &mut mpsc::Receiver<WsEvent>) -> WsEvent {
         tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("an event in time")
@@ -672,12 +807,12 @@ mod tests {
         handshake: PreparedHandshake,
         timeout: Duration,
     ) -> (
-        UnboundedReceiver<WsEvent>,
-        mpsc::UnboundedSender<WsCommand>,
+        mpsc::Receiver<WsEvent>,
+        mpsc::Sender<WsCommand>,
         oneshot::Sender<()>,
     ) {
-        let (events_tx, events_rx) = unbounded_channel();
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(WS_EVENT_QUEUE);
+        let (commands_tx, commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let cookies = Arc::new(CookieJar::default());
         tokio::spawn(async move {
@@ -687,9 +822,7 @@ mod tests {
                 timeout,
                 cancel_rx,
                 commands_rx,
-                move |event| {
-                    let _ = events_tx.send(event);
-                },
+                events_tx,
             )
             .await;
         });
@@ -712,7 +845,7 @@ mod tests {
         }
 
         commands
-            .send(WsCommand::Text("ping".to_owned()))
+            .try_send(WsCommand::Text("ping".to_owned()))
             .expect("command channel");
         match next_event(&mut events).await {
             WsEvent::Frame {
@@ -734,7 +867,7 @@ mod tests {
         }
 
         commands
-            .send(WsCommand::Binary(vec![0, 1, 2]))
+            .try_send(WsCommand::Binary(vec![0, 1, 2]))
             .expect("command channel");
         match next_event(&mut events).await {
             WsEvent::Frame {
@@ -755,7 +888,9 @@ mod tests {
             other => panic!("expected the echoed binary frame, got {other:?}"),
         }
 
-        commands.send(WsCommand::Close).expect("command channel");
+        commands
+            .try_send(WsCommand::Close)
+            .expect("command channel");
         match next_event(&mut events).await {
             WsEvent::Closed { by, .. } => assert_eq!(by, WsCloseBy::User),
             other => panic!("expected a user close, got {other:?}"),
@@ -832,7 +967,9 @@ mod tests {
             }
             other => panic!("expected the truncated frame, got {other:?}"),
         }
-        commands.send(WsCommand::Close).expect("command channel");
+        commands
+            .try_send(WsCommand::Close)
+            .expect("command channel");
         server.abort();
     }
 
@@ -871,7 +1008,9 @@ mod tests {
             }
             other => panic!("expected a connection, got {other:?}"),
         }
-        commands.send(WsCommand::Close).expect("command channel");
+        commands
+            .try_send(WsCommand::Close)
+            .expect("command channel");
         let _ = next_event(&mut events).await;
         server.await.expect("server finished");
     }
@@ -1016,8 +1155,8 @@ mod tests {
         });
 
         let jar = Arc::new(CookieJar::default());
-        let (events_tx, mut events_rx) = unbounded_channel();
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::channel(WS_EVENT_QUEUE);
+        let (commands_tx, commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         let spec = spec(&format!("ws://{address}/socket"));
         let handshake = prepare_handshake(&spec, &jar).expect("compose");
@@ -1029,9 +1168,7 @@ mod tests {
                 Duration::from_secs(5),
                 cancel_rx,
                 commands_rx,
-                move |event| {
-                    let _ = events_tx.send(event);
-                },
+                events_tx,
             )
             .await;
         });
@@ -1040,7 +1177,157 @@ mod tests {
             jar.contains("127.0.0.1", "/", "auth"),
             "the handshake cookie reaches the shared jar"
         );
-        commands_tx.send(WsCommand::Close).expect("command channel");
+        commands_tx
+            .try_send(WsCommand::Close)
+            .expect("command channel");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_consumer_stops_the_reader_at_the_event_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            for index in 0..1_000 {
+                socket
+                    .send(Message::text(format!("frame-{index}")))
+                    .await
+                    .expect("send");
+            }
+            while socket.next().await.is_some() {}
+        });
+
+        let spec = spec(&format!("ws://{address}/socket"));
+        let (events_tx, mut events_rx) = mpsc::channel(2);
+        let (commands_tx, commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            run_session(
+                handshake(&spec),
+                Arc::new(CookieJar::default()),
+                Duration::from_secs(5),
+                cancel_rx,
+                commands_rx,
+                events_tx,
+            )
+            .await;
+        });
+
+        match next_event(&mut events_rx).await {
+            WsEvent::Connected { .. } => {}
+            other => panic!("expected a connection, got {other:?}"),
+        }
+        // With nobody consuming, the reader can only park after filling the
+        // channel; it never grows a queue of its own.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events_rx.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reader fills the event bound");
+        assert_eq!(events_rx.len(), 2, "the reader waits at the bound");
+
+        // Draining releases it: every frame is still there, in order.
+        for index in 0..1_000 {
+            match next_event(&mut events_rx).await {
+                WsEvent::Frame {
+                    direction: WsDirection::Incoming,
+                    payload,
+                    ..
+                } => assert_eq!(payload, format!("frame-{index}").into_bytes()),
+                other => panic!("expected frame {index}, got {other:?}"),
+            }
+        }
+        commands_tx
+            .try_send(WsCommand::Close)
+            .expect("command channel");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_frames_stay_in_order_while_the_client_sends() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            for index in 0..100 {
+                socket
+                    .send(Message::text(format!("server-{index}")))
+                    .await
+                    .expect("send");
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    let _ = socket.close(None).await;
+                    break;
+                }
+            }
+        });
+
+        let spec = spec(&format!("ws://{address}/socket"));
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (commands_tx, commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            run_session(
+                handshake(&spec),
+                Arc::new(CookieJar::default()),
+                Duration::from_secs(5),
+                cancel_rx,
+                commands_rx,
+                events_tx,
+            )
+            .await;
+        });
+        let _ = next_event(&mut events_rx).await;
+
+        for index in 0..50 {
+            commands_tx
+                .try_send(WsCommand::Text(format!("client-{index}")))
+                .expect("room in the command queue");
+        }
+
+        let mut incoming = Vec::new();
+        let mut outgoing = 0;
+        while incoming.len() < 100 || outgoing < 50 {
+            match next_event(&mut events_rx).await {
+                WsEvent::Frame {
+                    direction: WsDirection::Incoming,
+                    payload,
+                    ..
+                } => incoming.push(String::from_utf8(payload.to_vec()).expect("text")),
+                WsEvent::Frame {
+                    direction: WsDirection::Outgoing,
+                    ..
+                } => outgoing += 1,
+                WsEvent::Failed { message } => panic!("the session failed: {message}"),
+                WsEvent::Closed { .. } => panic!("the session closed early"),
+                WsEvent::Connected { .. } => {}
+            }
+        }
+        let expected: Vec<String> = (0..100).map(|index| format!("server-{index}")).collect();
+        assert_eq!(
+            incoming, expected,
+            "server frames arrive in their own order"
+        );
+        assert_eq!(outgoing, 50, "every sent frame is reported");
+
+        commands_tx
+            .try_send(WsCommand::Close)
+            .expect("command channel");
+        loop {
+            if let WsEvent::Closed { .. } = next_event(&mut events_rx).await {
+                break;
+            }
+        }
+        server.await.expect("server finished");
     }
 }

@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 
-use async_channel::Sender;
+use async_channel::{Receiver, Sender, TrySendError};
 use bytes::Bytes;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Rgba, Task, WeakEntity, Window,
@@ -42,7 +42,8 @@ use posthaste_core::storage::{
 };
 use posthaste_core::variables::{resolve_request, resolve_request_lossy};
 use posthaste_core::ws::{
-    WsCloseBy, WsCommand, WsDirection, WsEvent, WsHandshake, prepare_handshake, run_session,
+    WS_COMMAND_QUEUE, WS_EVENT_QUEUE, WsCloseBy, WsCommand, WsDirection, WsEvent, WsHandshake,
+    prepare_handshake, run_session,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -56,6 +57,7 @@ use crate::history::{HistoryState, unix_millis_now};
 use crate::i18n::{self, Key, MessageKey, counted};
 use crate::metrics;
 use crate::overlay::{OverlayHost, OverlayKind};
+use crate::persistence::{Document, DocumentPayload, FlushOutcome, Persistence, WriteReport};
 use crate::theme::{self, Mode};
 use crate::views::environment_panel::EnvironmentPanel;
 use crate::views::navigation::NavigationModel;
@@ -84,6 +86,15 @@ pub(crate) const SESSION_WRITE_DELAY: Duration = Duration::from_millis(500);
 /// Delay between the last preferences adjustment and the write. A burst of
 /// stepper clicks becomes one file replacement.
 pub(crate) const PREFERENCES_WRITE_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a synchronous flush may wait for the background writer before the
+/// caller proceeds. Close and workspace switches use it so a stuck disk cannot
+/// hold the window open.
+pub(crate) const PERSISTENCE_FLUSH_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How many transport events may wait for the UI. HTTP progress beyond this
+/// bound is dropped; completion and WebSocket frames are never dropped.
+pub(crate) const HTTP_EVENT_QUEUE: usize = 256;
 
 /// The most body bytes the script preview renders. A larger body is cut at a
 /// character boundary with a visible notice, so a multi-megabyte draft cannot
@@ -946,6 +957,29 @@ enum HttpEvent {
         request: RequestId,
         outcome: Result<ResponseRecord, PosthasteError>,
     },
+}
+
+/// Enqueues the response headers. `Started` is the one progress event that is
+/// never dropped: it waits for room so the pane always learns the status.
+fn forward_http_started(events: &Sender<TransportEvent>, event: TransportEvent) {
+    match events.try_send(event) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(event)) => {
+            let _ = events.send_blocking(event);
+        }
+    }
+}
+
+/// Enqueues one body chunk. Chunks are progress: a slow UI skips one rather
+/// than stalling the network, and completion still carries the whole body.
+fn forward_http_chunk(events: &Sender<TransportEvent>, event: TransportEvent) {
+    let _ = events.try_send(event);
+}
+
+/// Enqueues completion. It waits for room rather than being dropped with the
+/// progress updates.
+async fn forward_http_finished(events: &Sender<TransportEvent>, event: TransportEvent) {
+    let _ = events.send(event).await;
 }
 
 /// The resolved request currently being executed, retained so history can be
@@ -1987,6 +2021,10 @@ pub struct AppState {
     #[cfg(test)]
     revert_comparisons: Cell<u64>,
     events: Sender<TransportEvent>,
+    /// The one background writer for every persisted document.
+    persistence: Persistence,
+    /// Write results waiting to be projected into visible save state.
+    write_reports: Receiver<WriteReport>,
     /// When streaming body bytes last repainted. `None` until headers arrive,
     /// and reset on completion so the next stream starts unthrottled.
     stream_flush: Option<Instant>,
@@ -2014,7 +2052,7 @@ impl Drop for AppState {
             }
             let (commands, cancel) = tab.ws.take_channels();
             if let Some(commands) = commands {
-                let _ = commands.send(WsCommand::Close);
+                let _ = commands.try_send(WsCommand::Close);
             }
             drop(cancel);
             closing = true;
@@ -2072,7 +2110,7 @@ impl AppState {
         } = startup;
         let launch_workspace = Arc::new(spawn_workspace_instance);
         let open_directory = Arc::new(open_in_file_manager);
-        let (events, receiver) = async_channel::unbounded();
+        let (events, receiver) = async_channel::bounded(HTTP_EVENT_QUEUE);
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
@@ -2092,6 +2130,17 @@ impl AppState {
             .enable_all()
             .build()
             .expect("failed to start the HTTP runtime");
+        // One background writer owns every persisted document. Tests use the
+        // synchronous adapter, so a timer that earlier code treated as "the
+        // write happened" still observes the file.
+        let executor = cx.background_executor().clone();
+        let persistence = if cfg!(test) {
+            Persistence::synchronous(executor)
+        } else {
+            Persistence::background(executor)
+        };
+        let write_reports = persistence.report_receiver();
+
         // The transport and every tab's cookie dialog share this one jar. It is
         // backed by a per-workspace file so cookies outlive a restart; tests
         // keep theirs in memory.
@@ -2410,10 +2459,28 @@ impl AppState {
             #[cfg(test)]
             revert_comparisons: Cell::new(0),
             events,
+            persistence,
+            write_reports,
             stream_flush: None,
             stream_flush_task: None,
             stream_flush_generation: 0,
         };
+        state
+            .workspace
+            .set_persistence(Some(state.persistence.clone()));
+        state.install_cookie_write_sink();
+        let reports = state.write_reports.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(report) = reports.recv().await {
+                let updated = this.update(cx, |state, cx| {
+                    state.apply_write_report(report, cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Restored blank numbers keep their labels when they are still unique;
         // a duplicated or unset one takes the smallest free number.
         for index in 0..state.tabs.len() {
@@ -2865,19 +2932,15 @@ impl AppState {
         self.preferences.layout.window = Some(frame);
         self.preferences.layout.split_ratio = Some(split_ratio);
         self.preferences.clamp();
-        if self.preferences_store.is_writable()
-            && let Err(error) = self.preferences_store.save(&self.preferences)
-        {
-            tracing::warn!(error = %error, "could not write the preferences on close");
-        }
+        self.schedule_preferences_document();
         // Invalidate a debounce that would otherwise rewrite the same session.
         self.session_generation = self.session_generation.wrapping_add(1);
         if self.session.is_writable() {
-            let document = self.capture_session();
-            if let Err(error) = self.session.save(&document) {
-                tracing::warn!(error = %error, "could not write the session on close");
-            }
+            self.schedule_session_document();
         }
+        // The window may disappear as soon as this returns, so wait for the
+        // writer, but never longer than the deadline.
+        self.flush_pending_documents("closing the window");
     }
 
     /// Opens the title bar's workspace menu, closing other menus first.
@@ -3356,9 +3419,8 @@ impl AppState {
     /// Records `path` in the machine-local recent list. A failed write is
     /// logged; the in-memory list still reflects the selection.
     fn record_workspace(&mut self, path: &Path) {
-        if let Err(error) = self.recents_store.record(&mut self.recent_workspaces, path) {
-            tracing::warn!(error = %error, "could not write the workspaces document");
-        }
+        self.recent_workspaces.record(path);
+        self.schedule_recents_document();
     }
 
     /// Removes `path` from the recent list after it stopped opening.
@@ -3376,9 +3438,8 @@ impl AppState {
         if !remembered {
             return;
         }
-        if let Err(error) = self.recents_store.forget(&mut self.recent_workspaces, path) {
-            tracing::warn!(error = %error, "could not write the workspaces document");
-        }
+        self.recent_workspaces.forget(path);
+        self.schedule_recents_document();
     }
 
     /// Starts a fresh instance on `path`, then closes this window.
@@ -3416,14 +3477,13 @@ impl AppState {
     /// this one holds.
     fn open_workspace_in_new_window(&mut self, directory: &Path, cx: &mut Context<Self>) {
         let target = normalize_directory_path(directory);
-        if self.preferences_store.is_writable()
-            && let Err(error) = self.preferences_store.save(&self.preferences)
-        {
-            tracing::warn!(error = %error, "could not write the preferences before opening a window");
-        }
+        self.schedule_preferences_document();
         for pending in std::mem::take(&mut self.pending_variables) {
             self.workspace.save_variables(&pending);
         }
+        // The new instance reads the same documents, so they must be on disk
+        // before it starts.
+        self.flush_pending_documents("opening a workspace in a new window");
         if let Err(error) = (self.launch_workspace)(&target) {
             self.set_workspace_notice(
                 i18n::msg(
@@ -3442,21 +3502,17 @@ impl AppState {
     /// Writes the pending documents a workspace switch would otherwise leave
     /// to expired debounce timers.
     fn flush_before_switch(&mut self) {
-        if self.preferences_store.is_writable()
-            && let Err(error) = self.preferences_store.save(&self.preferences)
-        {
-            tracing::warn!(error = %error, "could not write the preferences before switching");
-        }
+        self.schedule_preferences_document();
         self.session_generation = self.session_generation.wrapping_add(1);
         if self.session.is_writable() {
-            let document = self.capture_session();
-            if let Err(error) = self.session.save(&document) {
-                tracing::warn!(error = %error, "could not write the session before switching");
-            }
+            self.schedule_session_document();
         }
         for target in std::mem::take(&mut self.pending_variables) {
             self.workspace.save_variables(&target);
         }
+        // The next process starts after this window closes, so wait for the
+        // queued documents before leaving.
+        self.flush_pending_documents("switching workspaces");
     }
 
     /// Applies the live preferences to the rest of the app: palette, editor
@@ -3568,20 +3624,210 @@ impl AppState {
         {
             self.prefs_write_attempts += 1;
         }
-        match self.preferences_store.save(&self.preferences) {
-            Ok(()) => {
-                if self.prefs_error.take().is_some() {
-                    cx.notify();
+        self.schedule_preferences_document();
+        self.drain_write_reports(cx);
+    }
+
+    /// Queues the live preferences document.
+    fn schedule_preferences_document(&self) {
+        if !self.preferences_store.is_writable() {
+            return;
+        }
+        let Some(path) = self.preferences_store.path() else {
+            return;
+        };
+        self.persistence.schedule(
+            Document::Preferences,
+            path,
+            DocumentPayload::Preferences(self.preferences.clone()),
+        );
+    }
+
+    /// Queues the recents document.
+    fn schedule_recents_document(&self) {
+        if !self.recents_store.is_writable() {
+            return;
+        }
+        let Some(path) = self.recents_store.path() else {
+            return;
+        };
+        self.persistence.schedule(
+            Document::Recents,
+            path,
+            DocumentPayload::Recents(self.recent_workspaces.clone()),
+        );
+    }
+
+    /// Queues the captured session document.
+    fn schedule_session_document(&self) {
+        if !self.session.is_writable() {
+            return;
+        }
+        let Some(path) = self.session.path() else {
+            return;
+        };
+        let path = path.to_path_buf();
+        self.persistence.schedule(
+            Document::Session,
+            path,
+            DocumentPayload::Session(self.capture_session()),
+        );
+    }
+
+    /// Hands cookie-document writes to the background writer.
+    fn install_cookie_write_sink(&self) {
+        let persistence = self.persistence.clone();
+        let jar = self.cookies.clone();
+        self.cookies.set_write_sink(Arc::new(move |write| {
+            let path = write.path().to_path_buf();
+            // The test adapter reports inline, so the jar's visible state keeps
+            // up with an edit made outside any AppState update.
+            if let Some(result) = persistence.schedule_reporting(
+                Document::Cookies,
+                path,
+                DocumentPayload::Cookies(write),
+            ) {
+                jar.report_persisted(result);
+            }
+        }));
+    }
+
+    /// Applies every write result that has already arrived.
+    ///
+    /// The synchronous test adapter reports immediately, so the commit paths
+    /// call this to keep visible state in step without pumping the executor.
+    fn drain_write_reports(&mut self, cx: &mut Context<Self>) {
+        while let Ok(report) = self.write_reports.try_recv() {
+            self.apply_write_report(report, cx);
+        }
+    }
+
+    /// Projects one background write result into the visible save state.
+    fn apply_write_report(&mut self, report: WriteReport, cx: &mut Context<Self>) {
+        match &report.document {
+            Document::Preferences => match &report.result {
+                Ok(()) => {
+                    if self.prefs_error.take().is_some() {
+                        cx.notify();
+                    }
+                }
+                Err(error) => {
+                    let message = i18n::msg(MessageKey::SettingsWriteFailed, &[&error.as_str()]);
+                    if self.prefs_error.as_deref() != Some(message.as_str()) {
+                        self.prefs_error = Some(message);
+                        cx.notify();
+                    }
+                }
+            },
+            Document::Session => {
+                if let Err(error) = &report.result
+                    && self.session_failure_generation != Some(report.generation)
+                {
+                    tracing::warn!(
+                        error = %error,
+                        path = %report.path.display(),
+                        "could not write the session document"
+                    );
+                    self.session_failure_generation = Some(report.generation);
                 }
             }
-            Err(error) => {
-                let message = i18n::msg(MessageKey::SettingsWriteFailed, &[&error]);
-                if self.prefs_error.as_deref() != Some(message.as_str()) {
-                    self.prefs_error = Some(message);
-                    cx.notify();
+            Document::Request { id, .. } => match &report.result {
+                Ok(()) => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.opened_request() == Some(*id))
+                        && tab.save_state == RequestSaveState::Edited
+                    {
+                        tab.save_state = RequestSaveState::Clean;
+                    }
+                }
+                Err(message) => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.opened_request() == Some(*id))
+                    {
+                        tab.save_state = RequestSaveState::Failed(message.clone());
+                    }
+                }
+            },
+            Document::HistoryEntry { .. } => {
+                if let Err(error) = &report.result {
+                    self.history.error = Some(i18n::msg(
+                        MessageKey::HistoryWriteFailed,
+                        &[&error.as_str()],
+                    ));
+                }
+            }
+            Document::Cookies => {
+                self.cookies.report_persisted(report.result.clone());
+                self.cookie_count.set(None);
+            }
+            Document::Recents => {
+                if let Err(error) = &report.result {
+                    tracing::warn!(
+                        error = %error,
+                        path = %report.path.display(),
+                        "could not write the workspaces document"
+                    );
+                }
+            }
+            Document::Workspace | Document::Collection { .. } | Document::Environment { .. } => {
+                if let Err(message) = &report.result {
+                    self.workspace.save_status =
+                        crate::workspace::SaveStatus::Failed(message.clone());
+                    self.workspace.needs_resync = true;
                 }
             }
         }
+        cx.notify();
+    }
+
+    /// Commits the run's request and the current session, then waits for the
+    /// writer before a history entry is recorded.
+    fn flush_before_history(&mut self, cx: &mut Context<Self>, index: usize) {
+        self.flush_edits(cx);
+        if self.autosave_enabled && index != self.active {
+            let pending = {
+                let tab = &mut self.tabs[index];
+                tab.edit_generation = tab.edit_generation.wrapping_add(1);
+                tab.pending_save.take()
+            };
+            if let Some(spec) = pending {
+                self.write_tab_request(index, &spec);
+            }
+        }
+        if self.session.is_writable() {
+            self.commit_session_write(self.session_generation, cx);
+        }
+        self.flush_pending_documents("recording a completed run");
+        self.drain_write_reports(cx);
+    }
+
+    /// Waits for every queued document write. Used before a dependent action
+    /// and on close; a timed-out write reports through tracing and leaves the
+    /// writer running.
+    fn flush_pending_documents(&mut self, reason: &str) -> FlushOutcome {
+        let outcome = self.persistence.flush_blocking(PERSISTENCE_FLUSH_DEADLINE);
+        if !outcome.is_success() {
+            tracing::warn!(
+                timed_out = outcome.timed_out,
+                failures = outcome.failures.len(),
+                reason,
+                "documents were not all written before the dependent action"
+            );
+            for failure in &outcome.failures {
+                tracing::warn!(
+                    document = %failure.document.label(),
+                    path = %failure.path.display(),
+                    message = %failure.message,
+                    reason,
+                    "a document write failed before the dependent action"
+                );
+            }
+        }
+        outcome
     }
 
     pub fn shell(&self) -> &ShellState {
@@ -3663,11 +3909,22 @@ impl AppState {
         self.active_tab_mut().ws.set_composer_binary(binary);
     }
 
-    /// Hands a composed frame to the running session. Nothing happens once the
-    /// session's channels are gone.
-    pub fn send_ws_frame(&self, command: WsCommand) {
-        if let Some(sender) = self.active_tab().ws.command_sender() {
-            let _ = sender.send(command);
+    /// Hands a composed frame to the running session.
+    ///
+    /// The command queue is bounded: a full queue refuses the frame with a
+    /// visible message, while the session itself stays connected.
+    pub fn send_ws_frame(&self, command: WsCommand) -> Result<(), String> {
+        let Some(sender) = self.active_tab().ws.command_sender() else {
+            return Err("the session is no longer connected".to_owned());
+        };
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err("the send buffer is full; the frame was not sent".to_owned())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err("the session is no longer connected".to_owned())
+            }
         }
     }
 
@@ -5608,6 +5865,10 @@ impl AppState {
     /// clears the selection and draft when `id` is missing or unknown.
     pub fn select_request(&mut self, cx: &mut Context<Self>, id: Option<RequestId>) {
         self.flush_edits(cx);
+        // Switching away must not lose text typed since the last debounce.
+        if self.autosave_enabled {
+            self.flush_pending_documents("changing the request selection");
+        }
         // Opening anything leaves the welcome screen; this is the shared leaf
         // of the sidebar and recent-list open paths.
         self.content = ContentView::Tabs;
@@ -6108,7 +6369,7 @@ impl AppState {
     }
 
     /// Writes the pending edit now and invalidates any debounce timer.
-    pub(crate) fn flush_edits(&mut self, _cx: &mut Context<Self>) {
+    pub(crate) fn flush_edits(&mut self, cx: &mut Context<Self>) {
         let pending = {
             let tab = self.active_tab_mut();
             tab.edit_generation = tab.edit_generation.wrapping_add(1);
@@ -6125,6 +6386,7 @@ impl AppState {
         for target in std::mem::take(&mut self.pending_variables) {
             self.workspace.save_variables(&target);
         }
+        self.drain_write_reports(cx);
     }
 
     /// Commits the pending edits that belong to `ids` before a duplication.
@@ -6606,6 +6868,7 @@ impl AppState {
         for target in std::mem::take(&mut self.pending_variables) {
             self.workspace.save_variables(&target);
         }
+        self.drain_write_reports(cx);
         cx.notify();
     }
 
@@ -6621,6 +6884,7 @@ impl AppState {
         if let Some(spec) = pending {
             self.write_tab_request(index, &spec);
             self.schedule_session_write(cx);
+            self.drain_write_reports(cx);
             cx.notify();
         }
     }
@@ -6691,21 +6955,12 @@ impl AppState {
     ///
     /// A failed write is logged once per generation: the next change retries,
     /// but a tab strip that stops changing does not log on every reconnect.
-    fn commit_session_write(&mut self, generation: u64, _cx: &mut Context<Self>) {
+    fn commit_session_write(&mut self, generation: u64, cx: &mut Context<Self>) {
         if generation != self.session_generation {
             return;
         }
-        let document = self.capture_session();
-        if let Err(error) = self.session.save(&document)
-            && self.session_failure_generation != Some(generation)
-        {
-            tracing::warn!(
-                error = %error,
-                path = ?self.session.path(),
-                "could not write the session document"
-            );
-            self.session_failure_generation = Some(generation);
-        }
+        self.schedule_session_document();
+        self.drain_write_reports(cx);
     }
 
     /// Creates a collection and persists it synchronously.
@@ -7442,7 +7697,7 @@ impl AppState {
         }
 
         let source_request_id = self.active_tab().send_source();
-        let (commands, commands_rx) = mpsc::unbounded_channel();
+        let (commands, commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel, cancel_rx) = oneshot::channel();
         let generation = self.active_tab_mut().ws.begin_connect(
             spec.clone(),
@@ -7474,21 +7729,35 @@ impl AppState {
                     return;
                 }
             };
-            run_session(
+            // The session reports into its own bounded channel. Forwarding
+            // awaits room in the UI channel, so a stalled UI stops the reader
+            // instead of growing the queue. A bounded session channel is what
+            // makes server frames arrive in order.
+            let (ws_events, mut ws_events_rx) = mpsc::channel(WS_EVENT_QUEUE);
+            let forward_events = events.clone();
+            let forward = async move {
+                while let Some(event) = ws_events_rx.recv().await {
+                    let delivered = forward_events
+                        .send(TransportEvent::Ws {
+                            request,
+                            generation,
+                            event,
+                        })
+                        .await;
+                    if delivered.is_err() {
+                        break;
+                    }
+                }
+            };
+            let session = run_session(
                 handshake,
                 cookies,
                 timeout,
                 cancel_rx,
                 commands_rx,
-                move |event| {
-                    let _ = events.try_send(TransportEvent::Ws {
-                        request,
-                        generation,
-                        event,
-                    });
-                },
-            )
-            .await;
+                ws_events,
+            );
+            let _ = tokio::join!(session, forward);
         });
 
         self.schedule_session_write(cx);
@@ -7520,7 +7789,7 @@ impl AppState {
         let Some(commands) = commands else {
             return;
         };
-        let _ = commands.send(WsCommand::Close);
+        let _ = commands.try_send(WsCommand::Close);
         drop(commands);
         drop(cancel);
         cx.notify();
@@ -7545,7 +7814,7 @@ impl AppState {
             }
         } else {
             if let Some(commands) = &commands {
-                let _ = commands.send(WsCommand::Close);
+                let _ = commands.try_send(WsCommand::Close);
             }
             let end = WsEnd::Closed {
                 by: WsCloseBy::User,
@@ -7646,26 +7915,30 @@ impl AppState {
         let request = spec.id;
         self.runtime.spawn(async move {
             let outcome = executor
-                .execute_streaming(&spec, cancel_rx, |event| {
-                    // The channel is unbounded, so a full channel is not a
-                    // failure; a closed one means the app is shutting down.
-                    let event = match event {
-                        ResponseEvent::Started { status, headers } => HttpEvent::Started {
-                            request,
-                            status,
-                            headers,
-                        },
-                        ResponseEvent::Chunk(bytes) => HttpEvent::Chunk { request, bytes },
-                    };
-                    let _ = events.try_send(TransportEvent::Http(event));
+                .execute_streaming(&spec, cancel_rx, |event| match event {
+                    ResponseEvent::Started { status, headers } => {
+                        forward_http_started(
+                            &events,
+                            TransportEvent::Http(HttpEvent::Started {
+                                request,
+                                status,
+                                headers,
+                            }),
+                        );
+                    }
+                    ResponseEvent::Chunk(bytes) => {
+                        forward_http_chunk(
+                            &events,
+                            TransportEvent::Http(HttpEvent::Chunk { request, bytes }),
+                        );
+                    }
                 })
                 .await;
-            let _ = events
-                .send(TransportEvent::Http(HttpEvent::Finished {
-                    request,
-                    outcome,
-                }))
-                .await;
+            forward_http_finished(
+                &events,
+                TransportEvent::Http(HttpEvent::Finished { request, outcome }),
+            )
+            .await;
         });
 
         self.schedule_session_write(cx);
@@ -7824,7 +8097,25 @@ impl AppState {
     /// Records one finished attempt and marks the sidebar's history list stale.
     /// Every history write goes through here.
     fn record_history(&mut self, entry: HistoryEntry) -> HistoryId {
-        let id = self.history.record(entry);
+        let id = entry.id;
+        let path = self
+            .history
+            .store
+            .as_ref()
+            .map(|store| store.entry_file(id));
+        match path {
+            Some(path) => {
+                self.persistence.schedule(
+                    Document::HistoryEntry { id },
+                    path,
+                    DocumentPayload::HistoryEntry(Box::new(entry.clone())),
+                );
+                self.history.record_staged(entry);
+            }
+            None => {
+                self.history.record(entry);
+            }
+        }
         self.touch_navigation();
         id
     }
@@ -8016,6 +8307,11 @@ impl AppState {
             .map(|flight| flight.spec.method)
             .unwrap_or_else(|| self.tabs[index].shell.draft().method);
 
+        // The history entry and the request and session documents must agree:
+        // wait for the autosaved draft and the captured session before
+        // recording the completed run.
+        self.flush_before_history(cx, index);
+
         match outcome {
             Ok(response) => {
                 if let Some(flight) = flight {
@@ -8080,6 +8376,7 @@ impl AppState {
             }
         }
         self.schedule_session_write(cx);
+        self.drain_write_reports(cx);
         cx.notify();
     }
 
@@ -8107,8 +8404,7 @@ impl AppState {
                 error.to_string(),
             ),
         };
-        self.history
-            .record(entry.with_source(flight.source_request_id));
+        self.record_history(entry.with_source(flight.source_request_id));
     }
 
     /// Boots on `store` and switches to the tab view. Most tests describe the
@@ -8387,7 +8683,7 @@ impl AppState {
     pub(crate) fn begin_test_websocket(&mut self) -> u64 {
         let spec = self.shell().draft().clone();
         let source = self.active_tab().send_source();
-        let (commands, _commands_rx) = mpsc::unbounded_channel();
+        let (commands, _commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel, _cancel_rx) = oneshot::channel();
         let generation = self.active_tab_mut().ws.begin_connect(
             spec,
@@ -17911,7 +18207,7 @@ mod tests {
     fn begin_test_ws(state: &mut AppState) -> u64 {
         let spec = state.shell().draft().clone();
         let source = state.opened_request();
-        let (commands, _commands_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _commands_rx) = tokio::sync::mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel, _cancel_rx) = tokio::sync::oneshot::channel();
         state.active_tab_mut().ws.begin_connect(
             spec,
@@ -17936,10 +18232,10 @@ mod tests {
     /// what the composer sent.
     fn begin_test_ws_with_commands(
         state: &mut AppState,
-    ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<WsCommand>) {
+    ) -> (u64, tokio::sync::mpsc::Receiver<WsCommand>) {
         let spec = state.shell().draft().clone();
         let source = state.opened_request();
-        let (commands, commands_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, commands_rx) = tokio::sync::mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel, _cancel_rx) = tokio::sync::oneshot::channel();
         let generation = state.active_tab_mut().ws.begin_connect(
             spec,
@@ -18264,7 +18560,7 @@ mod tests {
                     .ws
                     .command_sender()
                     .expect("the first session is open")
-                    .send(WsCommand::Text("ping".to_owned()))
+                    .try_send(WsCommand::Text("ping".to_owned()))
                     .expect("queue a frame");
             });
         });
@@ -20567,5 +20863,286 @@ mod tests {
         });
         let mut store = PreferencesStore::at(&preferences_root);
         assert_eq!(store.load().preferences.requests.timeout_seconds, 21);
+    }
+
+    #[test]
+    fn ui_handlers_never_encode_or_write_a_persisted_document() {
+        // The handlers live above the test module. Everything they persist is
+        // an owned payload handed to the background writer.
+        let source = include_str!("app.rs");
+        let marker = "#[cfg(test)]\nmod tests {";
+        let production = &source[..source.find(marker).expect("the test module marker")];
+
+        for forbidden in [
+            "serde_json::to_vec",
+            "write_document_atomic",
+            "persist_bytes_atomic",
+            ".save(",
+            "save_all(",
+            "std::fs::remove_file",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the UI thread must not call {forbidden}"
+            );
+        }
+
+        // The collection export is the one direct write: it is a user-chosen
+        // destination, not a persisted document.
+        let export_start = production
+            .find("fn export_to_path")
+            .expect("the export seam");
+        let export_end = production[export_start..]
+            .find("\n    fn ")
+            .map(|offset| export_start + offset)
+            .unwrap_or(production.len());
+        for (offset, _) in production.match_indices("std::fs::write") {
+            assert!(
+                (export_start..export_end).contains(&offset),
+                "only the export seam may write a file directly"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn http_progress_stays_at_the_event_bound_and_started_gets_through(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let (events, receiver) = async_channel::bounded(2);
+        let request = RequestId::new();
+        for value in 0..5u8 {
+            forward_http_chunk(
+                &events,
+                TransportEvent::Http(HttpEvent::Chunk {
+                    request,
+                    bytes: Bytes::from(vec![value]),
+                }),
+            );
+        }
+        assert_eq!(
+            receiver.len(),
+            2,
+            "a slow consumer leaves chunks at the bound"
+        );
+
+        let started = TransportEvent::Http(HttpEvent::Started {
+            request,
+            status: 204,
+            headers: vec![("x-test".to_owned(), "yes".to_owned())],
+        });
+        let sender = events.clone();
+        // `Started` blocks for room; a separate thread keeps the test's
+        // executor free while the queue is full.
+        let thread = std::thread::spawn(move || forward_http_started(&sender, started));
+
+        let mut seen_started = false;
+        for _ in 0..3 {
+            match receiver.recv().await.expect("a queued event") {
+                TransportEvent::Http(HttpEvent::Started {
+                    status, headers, ..
+                }) => {
+                    assert_eq!(status, 204);
+                    assert_eq!(headers, vec![("x-test".to_owned(), "yes".to_owned())]);
+                    seen_started = true;
+                    break;
+                }
+                TransportEvent::Http(HttpEvent::Chunk { .. }) => {}
+                _ => {}
+            }
+        }
+        assert!(seen_started, "Started is never dropped");
+        thread.join().expect("the blocked send finishes");
+    }
+
+    #[gpui::test]
+    async fn a_chunk_flood_keeps_the_completed_body_complete(cx: &mut gpui::TestAppContext) {
+        let bound = 4;
+        let (events, receiver) = async_channel::bounded(bound);
+        let request = RequestId::new();
+        let mut body = Vec::new();
+        for index in 0..300u16 {
+            let bytes = Bytes::from(index.to_le_bytes().to_vec());
+            body.extend_from_slice(&bytes);
+            forward_http_chunk(
+                &events,
+                TransportEvent::Http(HttpEvent::Chunk { request, bytes }),
+            );
+        }
+        assert_eq!(
+            receiver.len(),
+            bound,
+            "a server streaming faster than the UI fills the queue only to its bound"
+        );
+
+        let record = ResponseRecord {
+            status: 200,
+            headers: vec![(
+                "content-type".to_owned(),
+                "application/octet-stream".to_owned(),
+            )],
+            body: Bytes::from(body.clone()),
+            duration: Duration::from_millis(5),
+            truncated: false,
+            cookies: Vec::new(),
+        };
+        let sender = events.clone();
+        let producer = cx.background_executor.spawn(async move {
+            forward_http_finished(
+                &sender,
+                TransportEvent::Http(HttpEvent::Finished {
+                    request,
+                    outcome: Ok(record),
+                }),
+            )
+            .await;
+        });
+
+        let mut chunks = 0;
+        let finished = loop {
+            match receiver.recv().await.expect("a queued event") {
+                TransportEvent::Http(HttpEvent::Chunk { .. }) => chunks += 1,
+                TransportEvent::Http(HttpEvent::Finished { outcome, .. }) => {
+                    break outcome.expect("the completed record");
+                }
+                _ => {}
+            }
+        };
+        producer.await;
+        assert!(chunks <= bound, "only queued progress survived: {chunks}");
+        assert_eq!(finished.status, 200);
+        assert_eq!(finished.body.len(), body.len());
+        assert_eq!(&finished.body[..], &body[..]);
+        assert_eq!(
+            finished.headers,
+            vec![(
+                "content-type".to_owned(),
+                "application/octet-stream".to_owned()
+            )]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_completed_run_flushes_the_edited_request_before_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let history_dir = tempfile::tempdir().expect("temp history");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let request = store
+            .create_request(&collection.id, "Ping")
+            .expect("request");
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                AppState::new_with_store_session_and_history(
+                    cx,
+                    store.clone(),
+                    SessionStore::at(&dir.path().join("session.json")),
+                    HistoryStore::at(history_dir.path()),
+                )
+            })
+        });
+
+        let recorded = cx.update(|app| {
+            state.update(app, |state, cx| {
+                state.select_request(cx, Some(request.id));
+                let mut edited = state.shell().draft().clone();
+                edited.url = "https://example.test/sent".into();
+                state.edit_active_draft(edited.clone(), cx);
+                let sent = state.begin_test_request(cx);
+                assert_eq!(sent, request.id, "the sent draft targets the saved request");
+                state.apply_synthetic_event(sent, Ok(response(200, "ok")), cx);
+                state.active_tab().recorded_run().expect("recorded")
+            })
+        });
+
+        cx.update(|app| {
+            let state = state.read(app);
+            let entry = state
+                .history()
+                .entries
+                .iter()
+                .find(|entry| entry.id == recorded)
+                .expect("the run is in history");
+            assert_eq!(entry.request.url, "https://example.test/sent");
+        });
+        let loaded = store.load().expect("reload workspace");
+        let saved = loaded.collections[0]
+            .requests
+            .iter()
+            .find(|saved| saved.id() == request.id)
+            .expect("the saved request");
+        assert_eq!(
+            saved.url(),
+            "https://example.test/sent",
+            "the request file reflects the draft sent before history was recorded"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_full_send_buffer_is_reported_while_the_session_stays_connected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        let state = cx.update(|cx| cx.new(|cx| AppState::new_with_store(cx, store)));
+        let (generation, mut commands) =
+            cx.update(|app| state.update(app, |state, _| begin_test_ws_with_commands(state)));
+        cx.update(|app| {
+            state.update(app, |state, _| {
+                assert!(state.active_tab_mut().ws.set_connected(
+                    generation,
+                    test_handshake(),
+                    std::time::Instant::now(),
+                ));
+            });
+        });
+
+        // Fill the session's own command queue.
+        cx.update(|app| {
+            let state = state.read(app);
+            let sender = state
+                .active_tab()
+                .ws
+                .command_sender()
+                .expect("the session is open")
+                .clone();
+            for index in 0..WS_COMMAND_QUEUE {
+                sender
+                    .try_send(WsCommand::Text(format!("queued-{index}")))
+                    .expect("room in the queue");
+            }
+        });
+        let error = cx
+            .update(|app| {
+                state
+                    .read(app)
+                    .send_ws_frame(WsCommand::Text("overflow".into()))
+            })
+            .expect_err("a full queue refuses the frame");
+        assert!(error.contains("send buffer is full"), "{error}");
+        cx.update(|app| {
+            assert!(
+                state.read(app).active_tab().ws.is_connected(),
+                "a refused frame leaves the session connected"
+            );
+        });
+
+        // Draining one command makes room again.
+        commands.try_recv().expect("a queued command");
+        assert!(
+            cx.update(|app| {
+                state
+                    .read(app)
+                    .send_ws_frame(WsCommand::Text("after".into()))
+            })
+            .is_ok()
+        );
     }
 }

@@ -221,7 +221,7 @@ pub struct SaveFailure {
 
 impl SaveReport {
     /// A report for one document that was written.
-    fn written(path: PathBuf) -> Self {
+    pub fn written(path: PathBuf) -> Self {
         Self {
             written: vec![path],
             failures: Vec::new(),
@@ -2298,7 +2298,8 @@ fn push_error_issue(issues: &mut Vec<StorageIssue>, error: &StorageError) {
     }
 }
 
-pub(crate) trait Versioned {
+/// A document that carries a `schema_version` this build can check.
+pub trait Versioned {
     fn schema_version(&self) -> u32;
 }
 
@@ -2346,6 +2347,87 @@ pub(crate) fn read_versioned<T: DeserializeOwned + Versioned>(
     Ok(value)
 }
 
+/// What [`JsonStore::load`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadOutcome<T> {
+    /// The document does not exist, or the path is not a readable file.
+    Absent,
+    /// The document exists and parsed.
+    Loaded(T),
+}
+
+/// One machine-local JSON document addressed by its file path.
+///
+/// The store owns root/version/write plumbing only: it reads through
+/// [`read_versioned`], so a newer `schema_version` is rejected the same way for
+/// every document, and it writes through [`persist_bytes_atomic`], the single
+/// atomic temp-file-and-rename path. Each document's own facade keeps its
+/// tolerance policy and its `Loaded*` result type.
+#[derive(Debug, Clone)]
+pub struct JsonStore {
+    path: PathBuf,
+}
+
+impl JsonStore {
+    /// A store for an explicit document path.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// A store for `file` inside `root`.
+    pub fn in_dir(root: impl Into<PathBuf>, file: &str) -> Self {
+        Self {
+            path: root.into().join(file),
+        }
+    }
+
+    /// The document path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes atomic-write residue beside the document. Best-effort.
+    pub fn cleanup(&self) {
+        if let Some(directory) = self.path.parent() {
+            cleanup_temporary_files(directory);
+        }
+    }
+
+    /// Reads the document, rejecting a newer schema. Residue from an
+    /// interrupted write beside it is removed first. A missing or non-file path
+    /// is [`LoadOutcome::Absent`], not an error.
+    pub fn load<T: DeserializeOwned + Versioned>(&self) -> Result<LoadOutcome<T>, StorageError> {
+        self.cleanup();
+        if !self.path.is_file() {
+            return Ok(LoadOutcome::Absent);
+        }
+        read_versioned::<T>(&self.path).map(LoadOutcome::Loaded)
+    }
+
+    /// Serializes `value` exactly as [`write_document_atomic`] does: pretty
+    /// JSON with one trailing newline.
+    pub fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, StorageError> {
+        let mut contents =
+            serde_json::to_string_pretty(value).map_err(|error| StorageError::Serialize {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        contents.push('\n');
+        Ok(contents.into_bytes())
+    }
+
+    /// Encoded bytes straight to the atomic writer.
+    pub fn write_encoded(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        persist_bytes_atomic(&self.path, bytes)
+    }
+
+    /// Serializes and atomically replaces the document.
+    pub fn write<T: Serialize>(&self, value: &T) -> Result<(), StorageError> {
+        let bytes = self.encode(value)?;
+        self.write_encoded(&bytes)
+    }
+}
+
 /// Suffix of an atomic write's temporary file. The name is recognizable on
 /// purpose: `cleanup_temporary_files` removes residue an interrupted write left
 /// behind, and `.gitignore` hides it in a workspace under version control.
@@ -2360,13 +2442,7 @@ pub(crate) fn write_document_atomic<T: Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), StorageError> {
-    let mut contents =
-        serde_json::to_string_pretty(value).map_err(|error| StorageError::Serialize {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    contents.push('\n');
-    persist_bytes_atomic(path, contents.as_bytes())
+    JsonStore::at(path).write(value)
 }
 
 /// Replaces `path` with `bytes` by writing a temporary sibling and renaming it.
@@ -4791,6 +4867,114 @@ mod tests {
             })
             .collect();
         assert_eq!(json_files.len(), 1);
+    }
+
+    #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+    struct VersionedSample {
+        #[serde(default)]
+        schema_version: u32,
+        value: u32,
+    }
+
+    impl Versioned for VersionedSample {
+        fn schema_version(&self) -> u32 {
+            self.schema_version
+        }
+    }
+
+    #[test]
+    fn json_store_reports_the_same_load_outcomes_as_the_typed_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonStore::in_dir(dir.path(), "sample.json");
+
+        assert_eq!(
+            store.load::<VersionedSample>().unwrap(),
+            LoadOutcome::Absent,
+            "a missing document is absent, not an error"
+        );
+
+        store
+            .write(&VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 7,
+            })
+            .unwrap();
+        assert_eq!(
+            store.load::<VersionedSample>().unwrap(),
+            LoadOutcome::Loaded(VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 7,
+            })
+        );
+        assert!(
+            !fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(TEMP_SUFFIX)),
+            "a completed write leaves no temporary residue"
+        );
+
+        fs::write(store.path(), b"{ not json").unwrap();
+        let error = store.load::<VersionedSample>().unwrap_err();
+        assert!(matches!(error, StorageError::Parse { .. }), "got {error:?}");
+
+        fs::write(
+            store.path(),
+            format!(r#"{{"schema_version": {}}}"#, SCHEMA_VERSION + 1),
+        )
+        .unwrap();
+        let error = store.load::<VersionedSample>().unwrap_err();
+        assert!(
+            matches!(error, StorageError::UnsupportedSchema { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn stores_rooted_at_one_directory_write_distinct_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = JsonStore::in_dir(dir.path(), "first.json");
+        let second = JsonStore::in_dir(dir.path(), "second.json");
+
+        first
+            .write(&VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 1,
+            })
+            .unwrap();
+        second
+            .write(&VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 2,
+            })
+            .unwrap();
+
+        assert_ne!(first.path(), second.path());
+        assert_eq!(
+            first.load::<VersionedSample>().unwrap(),
+            LoadOutcome::Loaded(VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 1,
+            }),
+            "one store never reads the other's document"
+        );
+        assert_eq!(
+            second.load::<VersionedSample>().unwrap(),
+            LoadOutcome::Loaded(VersionedSample {
+                schema_version: SCHEMA_VERSION,
+                value: 2,
+            })
+        );
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "only the two documents remain: {names:?}");
+        assert!(
+            names.iter().all(|name| !name.ends_with(TEMP_SUFFIX)),
+            "neither store sees the other's temporary residue: {names:?}"
+        );
     }
 
     struct FailingSerialize;

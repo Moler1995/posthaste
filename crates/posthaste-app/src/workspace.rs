@@ -19,6 +19,7 @@ use posthaste_core::storage::{
 use posthaste_core::variables::{VariableCatalog, Variables};
 
 use crate::i18n::{self, Key, MessageKey, counted};
+use crate::persistence::{Document, DocumentPayload, Persistence};
 
 /// Source of navigation generations.
 ///
@@ -179,6 +180,8 @@ pub struct WorkspaceState {
     /// Changes with every mutation the sidebar's tree and history can see.
     /// The navigation cache compares it instead of walking the workspace.
     navigation_generation: u64,
+    /// When set, autosaves are queued here instead of written inline.
+    persistence: Option<Persistence>,
 }
 
 impl WorkspaceState {
@@ -229,7 +232,13 @@ impl WorkspaceState {
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
             navigation_generation: next_navigation_generation(),
+            persistence: None,
         }
+    }
+
+    /// Routes subsequent autosaves through `persistence`.
+    pub fn set_persistence(&mut self, persistence: Option<Persistence>) {
+        self.persistence = persistence;
     }
 
     /// An empty, read-only workspace state used when storage is unavailable.
@@ -255,6 +264,7 @@ impl WorkspaceState {
             save_issue_paths: Vec::new(),
             pending_issue_delete: None,
             navigation_generation: next_navigation_generation(),
+            persistence: None,
         }
     }
 
@@ -436,17 +446,50 @@ impl WorkspaceState {
             self.fail_unavailable();
             return;
         };
-        let result = match target {
-            VariableTarget::Defaults => self.persist_workspace(&store),
-            VariableTarget::Environment { slug } => {
-                let environment = self
-                    .environment(slug)
-                    .map(|loaded| loaded.environment.clone());
-                match environment {
-                    Some(environment) if !self.needs_resync => {
-                        store.save_environment(slug, &environment)
+        let result = if let Some(persistence) = self.persistence.clone() {
+            match target {
+                VariableTarget::Defaults => {
+                    persistence.schedule(
+                        Document::Workspace,
+                        store.workspace_file(),
+                        DocumentPayload::Workspace(self.workspace.clone()),
+                    );
+                    self.queued_save()
+                }
+                VariableTarget::Environment { slug } if !self.needs_resync => {
+                    let environment = self
+                        .environment(slug)
+                        .map(|loaded| loaded.environment.clone());
+                    match environment {
+                        Some(environment) => match store.environment_file(slug) {
+                            Ok(path) => {
+                                persistence.schedule(
+                                    Document::Environment { slug: slug.clone() },
+                                    path,
+                                    DocumentPayload::Environment(Box::new(environment)),
+                                );
+                                self.queued_save()
+                            }
+                            Err(error) => Err(error),
+                        },
+                        None => self.schedule_resync(&store, &persistence),
                     }
-                    _ => self.resave(&store),
+                }
+                VariableTarget::Environment { .. } => self.schedule_resync(&store, &persistence),
+            }
+        } else {
+            match target {
+                VariableTarget::Defaults => self.persist_workspace(&store),
+                VariableTarget::Environment { slug } => {
+                    let environment = self
+                        .environment(slug)
+                        .map(|loaded| loaded.environment.clone());
+                    match environment {
+                        Some(environment) if !self.needs_resync => {
+                            store.save_environment(slug, &environment)
+                        }
+                        _ => self.resave(&store),
+                    }
                 }
             }
         };
@@ -1793,7 +1836,26 @@ impl WorkspaceState {
             return false;
         };
         saved.clone_from(request);
-        let result = if self.needs_resync {
+        let result = if let Some(persistence) = self.persistence.clone() {
+            if self.needs_resync {
+                self.schedule_resync(&store, &persistence)
+            } else {
+                match store.request_file(&slug, request.id) {
+                    Ok(path) => {
+                        persistence.schedule(
+                            Document::Request {
+                                slug: slug.clone(),
+                                id: request.id,
+                            },
+                            path,
+                            DocumentPayload::Request(Box::new(request.clone())),
+                        );
+                        self.queued_save()
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        } else if self.needs_resync {
             self.resave(&store)
         } else {
             store.save_request(&slug, request)
@@ -2056,7 +2118,10 @@ impl WorkspaceState {
 
     fn finish_mutation(&mut self, store: &WorkspaceStore) {
         if self.needs_resync {
-            let result = self.resave(store);
+            let result = match self.persistence.clone() {
+                Some(persistence) => self.schedule_resync(store, &persistence),
+                None => self.resave(store),
+            };
             self.record_save(result);
         } else {
             self.record_save(Ok(SaveReport::default()));
@@ -2076,6 +2141,65 @@ impl WorkspaceState {
             report.append(store.save_environments(&self.environments));
             Ok(report)
         }
+    }
+
+    /// A save queued for the background writer: nothing failed yet, and the
+    /// write reports will correct the status if anything does.
+    fn queued_save(&self) -> Result<SaveReport, StorageError> {
+        Ok(SaveReport::default())
+    }
+
+    /// Queues every loaded document after an earlier write failed.
+    ///
+    /// The sets match [`Self::resave`]: the workspace document is skipped when
+    /// it failed to load, while every collection, loaded request, and
+    /// environment is rewritten.
+    fn schedule_resync(
+        &self,
+        store: &WorkspaceStore,
+        persistence: &Persistence,
+    ) -> Result<SaveReport, StorageError> {
+        if self.workspace_file_ok {
+            persistence.schedule(
+                Document::Workspace,
+                store.workspace_file(),
+                DocumentPayload::Workspace(self.workspace.clone()),
+            );
+        }
+        for loaded in &self.collections {
+            let slug = loaded.collection.id.clone();
+            let path = store.collection_file(&slug)?;
+            persistence.schedule(
+                Document::Collection { slug: slug.clone() },
+                path,
+                DocumentPayload::Collection(Box::new(loaded.collection.clone())),
+            );
+            for request in &loaded.requests {
+                let RequestEntry::Loaded(request) = request else {
+                    continue;
+                };
+                let path = store.request_file(&slug, request.id)?;
+                persistence.schedule(
+                    Document::Request {
+                        slug: slug.clone(),
+                        id: request.id,
+                    },
+                    path,
+                    DocumentPayload::Request(Box::new(request.as_ref().clone())),
+                );
+            }
+        }
+        for loaded in &self.environments {
+            let path = store.environment_file(&loaded.slug)?;
+            persistence.schedule(
+                Document::Environment {
+                    slug: loaded.slug.clone(),
+                },
+                path,
+                DocumentPayload::Environment(Box::new(loaded.environment.clone())),
+            );
+        }
+        self.queued_save()
     }
 
     /// Saves one collection after a rename, or every loaded entry when an
