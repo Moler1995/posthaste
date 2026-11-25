@@ -6,23 +6,26 @@
 
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Element,
     ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton,
+    GlobalElementId, InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, Rgba,
-    ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, prelude::*, px, relative, size,
+    ShapedLine, SharedString, Style, Subscription, UTF16Selection, Window, actions, div, fill,
+    point, prelude::*, px, relative, size,
 };
 use posthaste_core::variables::VariableCatalog;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::i18n::{self, Key};
 use crate::metrics::{TypeStyle as _, layout, type_role};
 use crate::theme;
-use crate::views::text_history::{self, EditEntry, EditKind, Selection, TextHistory};
+use crate::views::text_area::Syntax;
+use crate::views::text_engine::{TextEngine, TextMode};
+use crate::views::text_history::{EditKind, Selection};
+use crate::views::text_layout::{LayoutSpec, TextLayout};
 use crate::views::text_selection::{Drag, Granularity};
 use crate::views::ui::text_field_shell;
 
@@ -31,9 +34,7 @@ use crate::views::ui::text_field_shell;
 #[path = "variable_assist.rs"]
 pub(crate) mod variable_assist;
 
-use variable_assist::{
-    AcceptCompletion, DismissCompletion, MissingSpan, PlaceholderSpans, VariableAssist,
-};
+use variable_assist::{AcceptCompletion, DismissCompletion, MissingSpan, PlaceholderSpans};
 
 actions!(
     posthaste_text_input,
@@ -117,16 +118,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// How long after an IME commit a following Enter still belongs to the
-/// composition that committed it.
-const IME_ENTER_GRACE: Duration = Duration::from_millis(100);
-
-/// The text and selection at the start of an in-progress IME composition.
-struct Composition {
-    content: String,
-    selection: Selection,
-}
-
 /// Who paints a field's resting fill, hover outline, and focus treatment.
 ///
 /// A standalone field owns its own chrome. A flat field is embedded in a group
@@ -143,16 +134,12 @@ pub enum FieldChrome {
 /// Single-line editable text.
 pub struct TextInput {
     focus_handle: FocusHandle,
-    content: SharedString,
     placeholder: SharedString,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
+    /// Content, selection, composition, history, and variable assistance.
+    pub(crate) engine: TextEngine,
+    /// Shaped line and horizontal scroll, cached across frames.
+    layout: TextLayout,
     last_bounds: Option<Bounds<Pixels>>,
-    /// Horizontal scroll applied to the shaped line so the caret stays in view
-    /// when the text is wider than the field.
-    scroll_x: Pixels,
     /// Whether scrolling follows the caret. Loading text resets it so a long
     /// value opens at its beginning rather than at its end.
     scroll_follow: bool,
@@ -172,17 +159,6 @@ pub struct TextInput {
     /// Registered on the first render so a blur listener can be attached to the
     /// focus handle acquired in [`TextInput::new`].
     blur_subscription: Option<Subscription>,
-    history: TextHistory,
-    composition: Option<Composition>,
-    /// When the last IME composition committed. Windows may deliver the Enter
-    /// that committed it as a key press once the marked text is already gone.
-    ime_committed_at: Option<Instant>,
-    /// Set by paste and cut so the recorded step does not merge with typing.
-    edit_kind: EditKind,
-    /// The pre-edit selection when backspace or delete synthesized a selection
-    /// from a collapsed caret.
-    pending_before: Option<Selection>,
-    assist: VariableAssist,
     pending_assignment_click: Option<PendingAssignmentClick>,
     /// Whether the request editor mounts this field's assist card at the app
     /// root instead of the field painting it locally.
@@ -203,17 +179,12 @@ impl TextInput {
         placeholder: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = content.into();
         Self {
             focus_handle: cx.focus_handle(),
-            selected_range: 0..content.len(),
-            selection_reversed: false,
-            content,
             placeholder: placeholder.into(),
-            marked_range: None,
-            last_layout: None,
+            engine: TextEngine::new(content, TextMode::SingleLine),
+            layout: TextLayout::new(),
             last_bounds: None,
-            scroll_x: px(0.),
             scroll_follow: false,
             drag: None,
             accent: theme::accent::base(),
@@ -225,12 +196,6 @@ impl TextInput {
             on_blur: None,
             on_assign_variable: None,
             blur_subscription: None,
-            history: TextHistory::default(),
-            composition: None,
-            ime_committed_at: None,
-            edit_kind: EditKind::Insert,
-            pending_before: None,
-            assist: VariableAssist::default(),
             pending_assignment_click: None,
             root_hosted: false,
             on_overlay_change: None,
@@ -345,42 +310,42 @@ impl TextInput {
 
     /// Replaces the names completion offers and the spans marked as missing.
     pub fn set_variable_catalog(&mut self, catalog: VariableCatalog, cx: &mut Context<Self>) {
-        if self.assist.set_catalog(catalog) {
+        if self.engine.assist.set_catalog(catalog) {
             cx.notify();
         }
     }
 
     /// Whether this field currently has a completion list or assignment card.
     pub(crate) fn has_variable_overlay(&self) -> bool {
-        self.assist.has_overlay()
+        self.engine.assist.has_overlay()
     }
 
     /// Whether an assignment card, rather than a completion list, is open.
     pub(crate) fn has_variable_assignment(&self) -> bool {
-        self.assist.assignment().is_some()
+        self.engine.assist.assignment().is_some()
     }
 
     /// Whether the pointer is over a complete placeholder, so this field's
     /// value card should be mounted even when the field is not focused.
     pub(crate) fn has_variable_hover(&self) -> bool {
-        self.assist.has_hover()
+        self.engine.assist.has_hover()
     }
 
     /// The name of the placeholder under the pointer, if any.
     #[cfg(test)]
     pub fn hovered_variable(&self) -> Option<&str> {
-        self.assist.hover().map(|hover| hover.name.as_str())
+        self.engine.assist.hover().map(|hover| hover.name.as_str())
     }
 
     /// Every complete placeholder whose name the merged catalog lacks.
     #[cfg(test)]
     pub fn missing_spans(&self) -> Vec<MissingSpan> {
-        self.assist.missing_spans(&self.content)
+        self.engine.assist.missing_spans(&self.engine.content)
     }
 
     #[cfg(test)]
     pub fn completion(&self) -> Option<&variable_assist::CompletionState> {
-        self.assist.completion()
+        self.engine.assist.completion()
     }
 
     /// Replaces the content and selects it, as [`Self::new`] does. Fires the
@@ -392,10 +357,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = content.into();
-        self.selected_range = 0..content.len();
-        self.selection_reversed = false;
-        self.content = content;
+        self.engine.load_select_all(content);
         self.reset_history();
         self.sync_assist(cx);
         self.notify_change(window, cx);
@@ -405,10 +367,7 @@ impl TextInput {
     /// Replaces the content and selects it, without firing [`Self::on_change`].
     /// Used when loading a value into the editor.
     pub(crate) fn set_content_quiet(&mut self, content: impl Into<SharedString>) {
-        let content = content.into();
-        self.selected_range = 0..content.len();
-        self.selection_reversed = false;
-        self.content = content;
+        self.engine.load_select_all(content);
         self.reset_history();
     }
 
@@ -424,307 +383,202 @@ impl TextInput {
         content: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let content = content.into();
-        self.selected_range = content.len()..content.len();
-        self.selection_reversed = false;
-        self.content = content;
+        self.engine.load_caret_end(content);
         self.reset_history();
         self.sync_assist(cx);
     }
 
     /// A loaded value starts a new history: undo must not reach across requests.
     fn reset_history(&mut self) {
-        self.marked_range = None;
-        self.history.clear();
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
+        self.engine.reset_history();
         self.scroll_follow = false;
-        self.assist.dismiss_completion();
-        self.assist.take_assignment();
-        self.assist.clear_hover();
         self.pending_assignment_click = None;
-    }
-
-    fn selection(&self) -> Selection {
-        Selection::new(self.selected_range.clone(), self.selection_reversed)
     }
 
     fn notify_change(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handler) = self.on_change.as_ref() {
-            handler(self.content.to_string(), window, cx);
+            handler(self.engine.content.to_string(), window, cx);
         }
     }
 
     /// Recomputes completion from the current text and caret. Returns whether
     /// the list changed.
     fn sync_assist(&mut self, cx: &mut Context<Self>) -> bool {
-        let changed = self.assist.sync_completion(
-            &self.content,
-            self.cursor_offset(),
-            self.selected_range.is_empty(),
-        );
+        let changed = self.engine.sync_assist();
         if changed {
             cx.notify();
         }
         changed
     }
 
-    /// The complete placeholder covering `offset`, resolved or unresolved, with
-    /// the name the hover card reads from the catalog.
-    fn placeholder_at(&self, offset: usize) -> Option<(String, Range<usize>)> {
-        let spans = self.assist.placeholder_spans(&self.content);
-        if let Some(range) = spans.resolved.iter().find(|range| range.contains(&offset)) {
-            let name = self
-                .content
-                .get(range.start + 2..range.end.saturating_sub(2))?
-                .trim()
-                .to_owned();
-            return Some((name, range.clone()));
-        }
-        spans
-            .missing
-            .into_iter()
-            .find(|span| span.range.contains(&offset))
-            .map(|span| (span.name, span.range))
-    }
-
     /// Window-space rectangle of a byte range on the shaped line.
     fn range_anchor(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
         let bounds = self.last_bounds?;
-        let line = self.last_layout.as_ref()?;
+        let line = self.layout.line(0)?;
+        let scroll_x = self.layout.scroll().x;
         Some(Bounds::from_corners(
             point(
-                bounds.left() + line.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + line.x_for_index(range.start) - scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + line.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + line.x_for_index(range.end) - scroll_x,
                 bounds.bottom(),
             ),
         ))
     }
 
     pub fn content(&self) -> &str {
-        &self.content
+        &self.engine.content
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
     }
 
+    /// The view side of a caret move: the next paint follows it, and an open
+    /// completion list follows the caret.
+    fn after_caret_move(&mut self, cx: &mut Context<Self>) {
+        self.scroll_follow = true;
+        self.sync_assist(cx);
+        cx.notify();
+    }
+
+    /// The view side of any edit: scroll to the caret, refresh the assist
+    /// list, and report the new content.
+    fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_follow = true;
+        self.sync_assist(cx);
+        self.notify_change(window, cx);
+        cx.notify();
+    }
+
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.start, cx);
-        }
+        self.engine.move_left();
+        self.after_caret_move(cx);
     }
 
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), cx);
-        } else {
-            self.move_to(self.selected_range.end, cx);
-        }
+        self.engine.move_right();
+        self.after_caret_move(cx);
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.engine.select_left();
+        self.after_caret_move(cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        self.engine.select_right();
+        self.after_caret_move(cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.move_to(0, cx);
-        self.select_to(self.content.len(), cx);
+        self.engine.select_all();
         // Selecting everything shows the beginning, not the caret at the end.
         self.scroll_follow = false;
+        self.sync_assist(cx);
+        cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.move_to(0, cx);
+        self.engine.home();
+        self.after_caret_move(cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.history.end_group();
-        self.move_to(self.content.len(), cx);
+        self.engine.end();
+        self.after_caret_move(cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.selection();
-        if self.selected_range.is_empty() {
-            self.pending_before = Some(before);
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx);
-        } else {
-            self.pending_before = None;
-        }
-        self.edit_kind = EditKind::Delete;
-        self.replace_text_in_range(None, "", window, cx);
+        self.engine.backspace(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.selection();
-        if self.selected_range.is_empty() {
-            self.pending_before = Some(before);
-            self.select_to(self.next_boundary(self.cursor_offset()), cx);
-        } else {
-            self.pending_before = None;
-        }
-        self.edit_kind = EditKind::Delete;
-        self.replace_text_in_range(None, "", window, cx);
+        self.engine.delete_forward(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit_kind = EditKind::Paste;
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            self.engine.replace_text_in_range(
+                None,
+                &text.replace('\n', " "),
+                EditKind::Paste,
+                Instant::now(),
+            );
+            self.after_edit(window, cx);
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         // A selection dragged out of the hover card is what the pointer last
         // picked, so it wins over the field's own selection.
-        if let Some(text) = self.assist.hover_selection_text() {
+        if let Some(text) = self.engine.assist.hover_selection_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
-        if !self.selected_range.is_empty() {
+        if !self.engine.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.engine.content[self.engine.selected_range.clone()].to_string(),
             ));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
-            self.edit_kind = EditKind::Cut;
-            self.replace_text_in_range(None, "", window, cx);
+        if let Some(text) = self.engine.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            self.engine
+                .replace_text_in_range(None, "", EditKind::Cut, Instant::now());
+            self.after_edit(window, cx);
         }
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(replay) = self.history.undo() {
-            self.apply_replay(replay, window, cx);
-        }
+        self.engine.undo(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(replay) = self.history.redo() {
-            self.apply_replay(replay, window, cx);
-        }
-    }
-
-    /// Puts a replay step back into the text and selection. The change is
-    /// reported like any other edit so the draft and autosave stay in sync.
-    fn apply_replay(
-        &mut self,
-        replay: text_history::Replay,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let start = replay.range.start.min(self.content.len());
-        let end = replay.range.end.min(self.content.len());
-        debug_assert!(
-            self.content.is_char_boundary(start) && self.content.is_char_boundary(end),
-            "history ranges stay on character boundaries"
-        );
-        self.content =
-            (self.content[0..start].to_owned() + &replay.text + &self.content[end..]).into();
-        self.assist.clear_hover();
-        let len = self.content.len();
-        let selection_start = replay.selection.range.start.min(len);
-        let selection_end = replay.selection.range.end.clamp(selection_start, len);
-        self.selected_range = selection_start..selection_end;
-        self.selection_reversed = replay.selection.reversed;
-        self.scroll_follow = true;
-        self.marked_range = None;
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
-        self.sync_assist(cx);
-        self.notify_change(window, cx);
-        cx.notify();
-    }
-
-    /// Records the whole composition as one step once it commits.
-    fn finish_composition(&mut self) {
-        let Some(composition) = self.composition.take() else {
-            return;
-        };
-        let after = self.selection();
-        if let Some(entry) = text_history::diff_edit(
-            &composition.content,
-            &self.content,
-            composition.selection,
-            after,
-            EditKind::Ime,
-        ) {
-            self.history.record(entry, Instant::now());
-        }
-    }
-
-    /// Whether an IME composition is open. Its keys must step aside while it
-    /// is: the IME uses Enter to pick or commit a candidate and Escape to
-    /// cancel the composition, and neither may also submit or cancel the
-    /// field.
-    fn is_composing(&self, _window: &Window) -> bool {
-        self.marked_range.is_some() || self.composition.is_some()
-    }
-
-    /// Swallows the Enter that ended an IME composition. The commit can land
-    /// before the key press, so the composition state alone cannot tell that
-    /// Enter apart from a submit.
-    fn take_ime_enter(&mut self) -> bool {
-        self.ime_committed_at
-            .take()
-            .is_some_and(|at| at.elapsed() < IME_ENTER_GRACE)
+        self.engine.redo(Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_composing(window) || self.take_ime_enter() {
+        if self.engine.is_composing() || self.engine.take_ime_enter() {
             return;
         }
         // While the list is open, Enter accepts instead of submitting.
-        if self.assist.completion_open() {
+        if self.engine.assist.completion_open() {
             self.accept_selected(window, cx);
             return;
         }
         if let Some(handler) = self.on_submit.as_ref() {
-            handler(self.content().to_string(), window, cx);
+            handler(self.engine.content().to_string(), window, cx);
         }
     }
 
     fn submit_back(&mut self, _: &SubmitBack, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_composing(window) || self.take_ime_enter() {
+        if self.engine.is_composing() || self.engine.take_ime_enter() {
             return;
         }
         // An open completion list consumes Enter, with or without Shift.
-        if self.assist.completion_open() {
+        if self.engine.assist.completion_open() {
             self.accept_selected(window, cx);
             return;
         }
         if let Some(handler) = self.on_submit_back.as_ref() {
-            handler(self.content().to_string(), window, cx);
+            handler(self.engine.content().to_string(), window, cx);
         }
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_composing(window) {
+        if self.engine.is_composing() {
             return;
         }
-        if self.assist.dismiss_completion() {
+        if self.engine.assist.dismiss_completion() {
             cx.notify();
             return;
         }
@@ -748,70 +602,40 @@ impl TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.assist.dismiss_completion() {
+        if self.engine.assist.dismiss_completion() {
             cx.notify();
         }
     }
 
     fn completion_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.move_completion(-1) {
+        if self.engine.assist.move_completion(-1) {
             cx.notify();
         }
     }
 
     fn completion_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.move_completion(1) {
+        if self.engine.assist.move_completion(1) {
             cx.notify();
         }
     }
 
     /// Accepts the highlighted suggestion as one undoable edit.
     fn accept_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(accepted) = self.assist.accept_span() else {
+        if self.engine.assist.accept_span().is_none() {
             return;
-        };
-        let before = self.selection();
-        let range = accepted.range.clone();
-        let removed = self.content[range.clone()].to_owned();
-        self.history.end_group();
-        self.assist.clear_hover();
-        self.content = (self.content[0..range.start].to_owned()
-            + &accepted.replacement
-            + &self.content[range.end..])
-            .into();
-        let caret = accepted.caret.min(self.content.len());
-        self.selected_range = caret..caret;
-        self.selection_reversed = false;
-        self.scroll_follow = true;
-        self.marked_range = None;
-        self.composition = None;
-        self.edit_kind = EditKind::Insert;
-        self.pending_before = None;
-        self.history.record(
-            EditEntry {
-                range,
-                inserted: accepted.replacement,
-                removed,
-                before,
-                after: self.selection(),
-                kind: EditKind::Insert,
-            },
-            Instant::now(),
-        );
-        self.assist.dismiss_completion();
-        self.sync_assist(cx);
-        self.notify_change(window, cx);
-        cx.notify();
+        }
+        self.engine.accept_completion();
+        self.after_edit(window, cx);
     }
 
     fn accept_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(completion) = self.assist.completion() {
+        if let Some(completion) = self.engine.assist.completion() {
             if index >= completion.candidates.len() {
                 return;
             }
             let delta = index as isize - completion.selected as isize;
             if delta != 0 {
-                self.assist.move_completion(delta);
+                self.engine.assist.move_completion(delta);
             }
         }
         self.accept_selected(window, cx);
@@ -829,6 +653,7 @@ impl TextInput {
         // Prefill the scope's current value; a defined variable opens as an
         // edit, and an undefined one opens empty for its first assignment.
         let current = self
+            .engine
             .assist
             .catalog()
             .value(&span.name)
@@ -853,8 +678,9 @@ impl TextInput {
         });
         let focus = value.read(cx).focus_handle().clone();
         window.focus(&focus);
-        let scope = self.assist.catalog().target_scope();
-        self.assist
+        let scope = self.engine.assist.catalog().target_scope();
+        self.engine
+            .assist
             .open_assignment(span.name, scope, span.range, anchor, value);
         cx.notify();
     }
@@ -867,7 +693,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(assignment) = self.assist.take_assignment() else {
+        let Some(assignment) = self.engine.assist.take_assignment() else {
             return;
         };
         let value = text.unwrap_or_else(|| assignment.value.read(cx).content().to_owned());
@@ -880,7 +706,7 @@ impl TextInput {
     }
 
     fn cancel_assignment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.assist.take_assignment().is_some() {
+        if self.engine.assist.take_assignment().is_some() {
             window.focus(&self.focus_handle);
             cx.notify();
         }
@@ -896,7 +722,7 @@ impl TextInput {
         entity: Entity<TextInput>,
         window: &Window,
     ) -> Option<AnyElement> {
-        if let Some(assignment) = self.assist.assignment() {
+        if let Some(assignment) = self.engine.assist.assignment() {
             let anchor = assignment.anchor?;
             let save_entity = entity;
             let cancel_entity = save_entity.clone();
@@ -914,7 +740,7 @@ impl TextInput {
                 cancel,
             ));
         }
-        if let Some(completion) = self.assist.completion() {
+        if let Some(completion) = self.engine.assist.completion() {
             let anchor = completion.anchor?;
             return Some(variable_assist::completion_overlay(
                 completion,
@@ -927,7 +753,7 @@ impl TextInput {
         }
         // The value card is the last resort: an open list or assignment card
         // owns the space beside the field.
-        let hover = self.assist.hover()?;
+        let hover = self.engine.assist.hover()?;
         let anchor = hover.anchor?;
         let pin_entity = entity.clone();
         let on_hover = Rc::new(move |pinned: bool, _window: &mut Window, cx: &mut App| {
@@ -939,7 +765,7 @@ impl TextInput {
                 // Ctrl+C after a drag belongs to this field's copy, so the
                 // field takes focus even when the card came from a hover.
                 window.focus(&input.focus_handle);
-                if input.assist.start_hover_selection(offset) {
+                if input.engine.assist.start_hover_selection(offset) {
                     cx.notify();
                 }
             });
@@ -947,7 +773,7 @@ impl TextInput {
         let extend_entity = entity.clone();
         let on_select_extend = Rc::new(move |offset: usize, _window: &mut Window, cx: &mut App| {
             extend_entity.update(cx, |input, cx| {
-                if input.assist.extend_hover_selection(offset) {
+                if input.engine.assist.extend_hover_selection(offset) {
                     cx.notify();
                 }
             });
@@ -955,7 +781,7 @@ impl TextInput {
         let end_entity = entity.clone();
         let on_select_end = Rc::new(move |_window: &mut Window, cx: &mut App| {
             end_entity.update(cx, |input, cx| {
-                if input.assist.end_hover_selection() {
+                if input.engine.assist.end_hover_selection() {
                     cx.notify();
                 }
             });
@@ -964,7 +790,7 @@ impl TextInput {
         let on_double_click = Rc::new(move |window: &mut Window, cx: &mut App| {
             double_entity.update(cx, |input, cx| {
                 window.focus(&input.focus_handle);
-                if input.assist.select_hover_all() {
+                if input.engine.assist.select_hover_all() {
                     cx.notify();
                 }
             });
@@ -972,7 +798,7 @@ impl TextInput {
         Some(variable_assist::hover_card(
             hover,
             anchor,
-            self.assist.catalog(),
+            self.engine.assist.catalog(),
             self.accent,
             variable_assist::HoverCardHandlers {
                 on_hover,
@@ -991,24 +817,25 @@ impl TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.history.end_group();
-        self.assist.clear_hover();
+        self.engine.history.end_group();
+        self.engine.assist.clear_hover();
         self.pending_assignment_click = None;
         let offset = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
             // Shift extends the existing selection one character at a time;
             // the click count never changes that.
             self.select_to(offset, cx);
-            self.drag = Some(Drag::new(Granularity::Char, &self.content, offset));
+            self.drag = Some(Drag::new(Granularity::Char, &self.engine.content, offset));
             return;
         }
-        let before = self.selection();
+        let before = self.engine.selection();
         // A plain click on any placeholder opens its assignment card on release,
         // whether or not a scope defines the name yet: the card prefills the
         // current value, so clicking a placeholder always means "edit".
         if event.click_count <= 1 {
             self.pending_assignment_click =
-                self.placeholder_at(offset)
+                self.engine
+                    .placeholder_at(offset)
                     .map(|(name, range)| PendingAssignmentClick {
                         span: MissingSpan { name, range },
                         offset,
@@ -1021,15 +848,15 @@ impl TextInput {
             Granularity::Char if self.pending_assignment_click.is_some() => {
                 // The release opens the assignment card; a click is not typing,
                 // so do not flash a one-row completion list for the name.
-                self.selected_range = offset..offset;
+                self.engine.selected_range = offset..offset;
                 self.scroll_follow = true;
-                self.assist.dismiss_completion();
+                self.engine.assist.dismiss_completion();
                 cx.notify();
             }
             Granularity::Char => self.move_to(offset, cx),
             _ => {
-                self.selected_range = granularity.range_at(&self.content, offset);
-                self.selection_reversed = false;
+                self.engine.selected_range = granularity.range_at(&self.engine.content, offset);
+                self.engine.selection_reversed = false;
                 // A triple click selects the whole value, so show its
                 // beginning the way select-all does.
                 self.scroll_follow = granularity == Granularity::Word;
@@ -1037,7 +864,7 @@ impl TextInput {
                 cx.notify();
             }
         }
-        self.drag = Some(Drag::new(granularity, &self.content, offset));
+        self.drag = Some(Drag::new(granularity, &self.engine.content, offset));
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1054,8 +881,8 @@ impl TextInput {
         }
         // The press moved the caret; a click on the mark leaves it where it
         // was before the gesture.
-        self.selected_range = pending.before.range;
-        self.selection_reversed = pending.before.reversed;
+        self.engine.selected_range = pending.before.range;
+        self.engine.selection_reversed = pending.before.reversed;
         self.scroll_follow = true;
         self.open_assignment(pending.span, window, cx);
     }
@@ -1068,15 +895,15 @@ impl TextInput {
             return;
         }
         let offset = self.index_for_mouse_position(event.position);
-        match self.placeholder_at(offset) {
+        match self.engine.placeholder_at(offset) {
             // The card waits for the pointer to rest, so crossing the text
             // does not flash a card for every span on the way.
             Some((name, range)) => self.request_hover(name, range, cx),
             None => {
                 // Ordinary text may be the pointer's path to the card, so the
                 // card lingers briefly instead of vanishing under it.
-                let canceled = self.assist.cancel_hover_delay();
-                if self.assist.has_hover() {
+                let canceled = self.engine.assist.cancel_hover_delay();
+                if self.engine.assist.has_hover() {
                     self.schedule_hover_clear(cx);
                 }
                 if canceled {
@@ -1088,22 +915,30 @@ impl TextInput {
 
     /// Arms the show timer for a span the pointer is resting on.
     fn request_hover(&mut self, name: String, range: Range<usize>, cx: &mut Context<Self>) {
-        if self.assist.hover_matches(&name, &range) {
+        if self.engine.assist.hover_matches(&name, &range) {
             // Still on the same span: a pending close must not fire while the
             // pointer rests here.
-            self.assist.set_hover(name, range);
+            self.engine.assist.set_hover(name, range);
             return;
         }
-        if !self.assist.begin_hover_delay(name.clone(), range.clone()) {
+        if !self
+            .engine
+            .assist
+            .begin_hover_delay(name.clone(), range.clone())
+        {
             return;
         }
-        let generation = self.assist.hover_generation();
+        let generation = self.engine.assist.hover_generation();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(variable_assist::HOVER_SHOW_DELAY)
                 .await;
             let _ = this.update(cx, |input, cx| {
-                if input.assist.finish_hover_delay(generation, name, range) {
+                if input
+                    .engine
+                    .assist
+                    .finish_hover_delay(generation, name, range)
+                {
                     cx.notify();
                 }
             });
@@ -1121,15 +956,15 @@ impl TextInput {
     /// both the field and the card. Entering the card pins the hover, which
     /// cancels this timer, so a pointer crossing the gap keeps the card open.
     fn schedule_hover_clear(&mut self, cx: &mut Context<Self>) {
-        let generation = self.assist.next_hover_generation();
+        let generation = self.engine.assist.next_hover_generation();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(variable_assist::HOVER_LINGER)
                 .await;
             let _ = this.update(cx, |input, cx| {
-                if input.assist.hover_generation() == generation
-                    && !input.assist.hover_pinned()
-                    && input.assist.clear_hover()
+                if input.engine.assist.hover_generation() == generation
+                    && !input.engine.assist.hover_pinned()
+                    && input.engine.assist.clear_hover()
                 {
                     cx.notify();
                 }
@@ -1141,7 +976,7 @@ impl TextInput {
     /// Pins the card open while the pointer is over it. Leaving it arms the
     /// same close timer the field uses.
     fn set_hover_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
-        let changed = self.assist.set_hover_pinned(pinned);
+        let changed = self.engine.assist.set_hover_pinned(pinned);
         if !pinned {
             self.schedule_hover_clear(cx);
         }
@@ -1161,9 +996,9 @@ impl TextInput {
             pending.dragged = true;
         }
         if drag.granularity() != Granularity::Char {
-            let (range, reversed) = drag.extend(&self.content, offset);
-            self.selected_range = range;
-            self.selection_reversed = reversed;
+            let (range, reversed) = drag.extend(&self.engine.content, offset);
+            self.engine.selected_range = range;
+            self.engine.selection_reversed = reversed;
             self.scroll_follow = true;
             self.sync_assist(cx);
             cx.notify();
@@ -1175,11 +1010,11 @@ impl TextInput {
         let Some(bounds) = self.last_bounds.as_ref() else {
             return;
         };
-        let cursor = self.cursor_offset();
+        let cursor = self.engine.cursor_offset();
         let extended = if event.position.x >= bounds.right() {
-            self.next_boundary(cursor)
+            self.engine.next_boundary(cursor)
         } else if event.position.x <= bounds.left() {
-            self.previous_boundary(cursor)
+            self.engine.previous_boundary(cursor)
         } else {
             cursor
         };
@@ -1189,111 +1024,26 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.selected_range = offset..offset;
-        self.scroll_follow = true;
-        self.sync_assist(cx);
-        cx.notify();
-    }
-
-    fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
+        self.engine.move_to(offset);
+        self.after_caret_move(cx);
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
-        if self.content.is_empty() {
+        if self.engine.content.is_empty() {
             return 0;
         }
 
-        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
-        else {
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.layout.line(0)) else {
             return 0;
         };
         // A single line has no row to pick: the pointer's x decides the index
         // even while a drag wanders above or below the field.
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        line.closest_index_for_x(position.x - bounds.left() + self.layout.scroll().x)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.scroll_follow = true;
-        if self.selection_reversed {
-            self.selected_range.start = offset;
-        } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        self.sync_assist(cx);
-        cx.notify();
-    }
-
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-
-        utf8_offset
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        utf16_offset
-    }
-
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
-    }
-
-    fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
-    }
-
-    /// Bounds a range carried in the editor's state. A composition that commits
-    /// empty text can leave a stale marked range; clamping keeps every slice
-    /// safe.
-    fn clamp_range(&self, range: Range<usize>) -> Range<usize> {
-        let start = range.start.min(self.content.len());
-        let end = range.end.clamp(start, self.content.len());
-        start..end
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .as_str()
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .as_str()
-            .grapheme_indices(true)
-            .find_map(|(idx, _)| (idx > offset).then_some(idx))
-            .unwrap_or(self.content.len())
+        self.engine.select_to(offset);
+        self.after_caret_move(cx);
     }
 }
 
@@ -1305,9 +1055,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
-        actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        let range = self.engine.range_from_utf16(&range_utf16);
+        actual_range.replace(self.engine.range_to_utf16(&range));
+        Some(self.engine.content[range].to_string())
     }
 
     fn selected_text_range(
@@ -1317,8 +1067,8 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
-            reversed: self.selection_reversed,
+            range: self.engine.range_to_utf16(&self.engine.selected_range),
+            reversed: self.engine.selection_reversed,
         })
     }
 
@@ -1327,70 +1077,30 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.marked_range
+        self.engine
+            .marked_range
             .as_ref()
-            .map(|range| self.range_to_utf16(range))
+            .map(|range| self.engine.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
-        self.finish_composition();
+        self.engine.unmark_text();
     }
 
     fn replace_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.clamp_range(
-            range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .or(self.marked_range.clone())
-                .unwrap_or(self.selected_range.clone()),
-        );
-        let new_text: String = new_text
-            .chars()
-            .filter(|ch| *ch != '\n' && *ch != '\r')
-            .collect();
-
-        let before = self
-            .pending_before
-            .take()
-            .unwrap_or_else(|| self.selection());
-        let removed = self.content[range.clone()].to_owned();
-        let kind = self.edit_kind;
-
-        self.content =
-            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
-                .into();
-        self.assist.clear_hover();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.scroll_follow = true;
-        self.marked_range.take();
-        self.edit_kind = EditKind::Insert;
-
-        if self.composition.is_some() {
-            self.ime_committed_at = Some(Instant::now());
-            self.finish_composition();
-        } else {
-            self.history.record(
-                EditEntry {
-                    range,
-                    inserted: new_text,
-                    removed,
-                    before,
-                    after: self.selection(),
-                    kind,
-                },
-                Instant::now(),
-            );
-        }
-        self.sync_assist(cx);
-        self.notify_change(_window, cx);
-        cx.notify();
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.engine.range_from_utf16(range_utf16));
+        let kind = self.engine.edit_kind;
+        self.engine
+            .replace_text_in_range(range, new_text, kind, Instant::now());
+        self.after_edit(window, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1398,54 +1108,15 @@ impl EntityInputHandler for TextInput {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.clamp_range(
-            range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .or(self.marked_range.clone())
-                .unwrap_or(self.selected_range.clone()),
-        );
-        let new_text: String = new_text
-            .chars()
-            .filter(|ch| *ch != '\n' && *ch != '\r')
-            .collect();
-
-        if !new_text.is_empty() && self.composition.is_none() {
-            let selection = self.selection();
-            self.composition = Some(Composition {
-                content: self.content.to_string(),
-                selection,
-            });
-            self.pending_before = None;
-        }
-
-        self.content =
-            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
-                .into();
-        self.assist.clear_hover();
-        if new_text.is_empty() {
-            self.marked_range = None;
-        } else {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        }
-        // `new_selected_range_utf16` is relative to `new_text`, so both ends
-        // shift by the replacement start.
-        self.selected_range = new_selected_range_utf16
+        let range = range_utf16
             .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
-        self.scroll_follow = true;
-
-        if new_text.is_empty() {
-            self.finish_composition();
-        }
-        self.sync_assist(cx);
-        self.notify_change(_window, cx);
-        cx.notify();
+            .map(|range_utf16| self.engine.range_from_utf16(range_utf16));
+        self.engine
+            .replace_and_mark_text_in_range(range, new_text, new_selected_range_utf16);
+        self.after_edit(window, cx);
     }
 
     fn bounds_for_range(
@@ -1455,15 +1126,16 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
-        let range = self.range_from_utf16(&range_utf16);
+        let line = self.layout.line(0)?;
+        let range = self.engine.range_from_utf16(&range_utf16);
+        let scroll_x = self.layout.scroll().x;
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + line.x_for_index(range.start) - scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + line.x_for_index(range.end) - scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -1476,87 +1148,11 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
-        let last_layout = self.last_layout.as_ref()?;
+        let line = self.layout.line(0)?;
 
-        assert_eq!(last_layout.text, self.content);
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_x)?;
-        Some(self.offset_to_utf16(utf8_index))
-    }
-}
-
-/// Splits one base run at the IME composition and placeholder boundaries. The
-/// resulting runs cover the whole text, so shaping, caret positions, selection,
-/// and click mapping keep their existing indices.
-///
-/// A resolved placeholder takes `accent`, the field's method hue, so the text a
-/// suggestion just filled in is visible as a variable; an unresolved one takes
-/// the warning color plus an underline.
-fn input_runs(
-    base: TextRun,
-    marked: Option<Range<usize>>,
-    spans: &PlaceholderSpans,
-    accent: Rgba,
-    len: usize,
-) -> Vec<TextRun> {
-    let mut boundaries = vec![0, len];
-    if let Some(marked) = marked.as_ref() {
-        boundaries.push(marked.start.min(len));
-        boundaries.push(marked.end.min(len));
-    }
-    for range in &spans.resolved {
-        boundaries.push(range.start.min(len));
-        boundaries.push(range.end.min(len));
-    }
-    for span in &spans.missing {
-        boundaries.push(span.range.start.min(len));
-        boundaries.push(span.range.end.min(len));
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let danger: Hsla = theme::status::danger().into();
-    let accent: Hsla = accent.into();
-    let runs: Vec<TextRun> = boundaries
-        .windows(2)
-        .filter_map(|pair| {
-            let (start, end) = (pair[0], pair[1]);
-            if end <= start {
-                return None;
-            }
-            let unresolved = spans
-                .missing
-                .iter()
-                .any(|span| span.range.start <= start && end <= span.range.end);
-            let resolved = spans
-                .resolved
-                .iter()
-                .any(|range| range.start <= start && end <= range.end);
-            let composing = marked
-                .as_ref()
-                .is_some_and(|marked| marked.start <= start && end <= marked.end);
-            let color = if unresolved {
-                danger
-            } else if resolved {
-                accent
-            } else {
-                base.color
-            };
-            Some(TextRun {
-                len: end - start,
-                color,
-                underline: (unresolved || composing).then_some(UnderlineStyle {
-                    color: Some(color),
-                    thickness: px(1.0),
-                    wavy: false,
-                }),
-                ..base.clone()
-            })
-        })
-        .collect();
-    if runs.is_empty() {
-        vec![TextRun { len: 0, ..base }]
-    } else {
-        runs
+        assert_eq!(line.text, self.engine.content);
+        let utf8_index = line.index_for_x(point.x - line_point.x + self.layout.scroll().x)?;
+        Some(self.engine.offset_to_utf16(utf8_index))
     }
 }
 
@@ -1565,7 +1161,7 @@ struct TextElement {
 }
 
 struct PrepaintState {
-    line: Option<ShapedLine>,
+    line: Option<Arc<ShapedLine>>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
     scroll: Pixels,
@@ -1614,25 +1210,16 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
+        let content = input.engine.content.clone();
         let content_is_empty = content.is_empty();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let selected_range = input.engine.selected_range.clone();
+        let cursor = input.engine.cursor_offset();
+        let accent = input.accent;
         let style = window.text_style();
-
         let (display_text, text_color) = if content_is_empty {
             (input.placeholder.clone(), theme::text::tertiary().into())
         } else {
             (content, style.color)
-        };
-
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
         };
         // Resolved placeholders take the method hue and unresolved ones the
         // warning color plus an underline; the IME composition underline sits
@@ -1641,44 +1228,52 @@ impl Element for TextElement {
         let spans = if content_is_empty {
             PlaceholderSpans::default()
         } else {
-            input.assist.placeholder_spans(&display_text)
+            input.engine.assist.placeholder_spans(&display_text)
         };
-        let runs = input_runs(
-            run,
-            input.marked_range.clone(),
-            &spans,
-            input.accent,
-            display_text.len(),
-        );
-
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
-
+        let spec = LayoutSpec {
+            text: display_text,
+            placeholder: content_is_empty,
+            font: style.font(),
+            font_size: style.font_size.to_pixels(window.rem_size()),
+            text_color,
+            accent,
+            syntax: Syntax::Plain,
+            spans,
+            marked_range: input.engine.marked_range.clone(),
+            line_numbers: false,
+            gutter: px(0.),
+            line_height: window.line_height(),
+            width: bounds.size.width,
+            generation: input.engine.generation,
+            delta: input.engine.last_delta().cloned(),
+            mode: TextMode::SingleLine,
+        };
         // A field narrower than its text scrolls with the caret, so an edit at
         // the end stays visible instead of disappearing past the clipped edge.
         // Blurred fields always show the beginning.
         let focused = input.focus_handle.is_focused(window) && input.scroll_follow;
-        let caret_pos = line.x_for_index(cursor);
-        let visible = bounds.size.width;
-        let scroll = if focused && caret_pos + CURSOR_WIDTH > visible {
-            let wanted = caret_pos + CURSOR_WIDTH - visible;
-            let max_scroll = line.x_for_index(line.text.len()) + CURSOR_WIDTH - visible;
-            if wanted < max_scroll {
-                wanted
-            } else if max_scroll > px(0.) {
-                max_scroll
-            } else {
-                px(0.)
-            }
-        } else {
-            px(0.)
-        };
+        let completion_open = input.engine.assist.completion().is_some();
+        let assignment_range = input
+            .engine
+            .assist
+            .assignment()
+            .map(|assignment| assignment.range.clone());
+        let hover_range = input.engine.assist.hover().map(|hover| hover.range.clone());
+        let _ = input;
 
-        // Caret and selection belong to the field's accent, which follows the
-        // request method for request-scoped fields.
-        let accent = input.accent;
+        let (line, scroll) = self.input.update(cx, |input, _cx| {
+            input.layout.sync(spec);
+            let scroll = if focused {
+                input.layout.follow_caret(window, cursor, bounds.size)
+            } else {
+                input.layout.set_scroll(Point::new(px(0.), px(0.)));
+                input.layout.scroll()
+            };
+            (input.layout.ensure_line(window, 0), scroll)
+        });
+        let line = line.expect("the field has a line");
+        let scroll = scroll.x;
+        let caret_pos = line.x_for_index(cursor);
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -1712,15 +1307,15 @@ impl Element for TextElement {
         // Anchors are captured from the shaped line each prepaint, so the
         // overlay follows scrolling, resizing, and caret movement.
         let text_len = line.text.len();
-        let completion_anchor = input.assist.completion().map(|_| {
+        let completion_anchor = completion_open.then(|| {
             Bounds::new(
                 point(bounds.left() + caret_pos - scroll, bounds.top()),
                 size(CURSOR_WIDTH, bounds.bottom() - bounds.top()),
             )
         });
-        let assignment_anchor = input.assist.assignment().map(|assignment| {
-            let start = assignment.range.start.min(text_len);
-            let end = assignment.range.end.min(text_len);
+        let assignment_anchor = assignment_range.map(|range| {
+            let start = range.start.min(text_len);
+            let end = range.end.min(text_len);
             Bounds::from_corners(
                 point(
                     bounds.left() + line.x_for_index(start) - scroll,
@@ -1734,9 +1329,9 @@ impl Element for TextElement {
         });
         // The hover card anchors to the placeholder it describes, so it follows
         // scrolling and resizing without waiting for the pointer to move.
-        let hover_anchor = input.assist.hover().map(|hover| {
-            let start = hover.range.start.min(text_len);
-            let end = hover.range.end.min(text_len);
+        let hover_anchor = hover_range.map(|range| {
+            let start = range.start.min(text_len);
+            let end = range.end.min(text_len);
             Bounds::from_corners(
                 point(
                     bounds.left() + line.x_for_index(start) - scroll,
@@ -1751,13 +1346,13 @@ impl Element for TextElement {
         self.input.update(cx, |input, cx| {
             let mut changed = false;
             if let Some(anchor) = completion_anchor {
-                changed |= input.assist.set_completion_anchor(anchor);
+                changed |= input.engine.assist.set_completion_anchor(anchor);
             }
             if let Some(anchor) = assignment_anchor {
-                changed |= input.assist.set_assignment_anchor(anchor);
+                changed |= input.engine.assist.set_assignment_anchor(anchor);
             }
             if let Some(anchor) = hover_anchor {
-                changed |= input.assist.set_hover_anchor(anchor);
+                changed |= input.engine.assist.set_hover_anchor(anchor);
             }
             if changed {
                 cx.notify();
@@ -1830,9 +1425,7 @@ impl Element for TextElement {
         }
 
         self.input.update(cx, |input, _cx| {
-            input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
-            input.scroll_x = prepaint.scroll;
         });
     }
 }
@@ -1844,11 +1437,11 @@ impl Render for TextInput {
         if self.blur_subscription.is_none() {
             self.blur_subscription =
                 Some(cx.on_blur(&self.focus_handle, window, |this, window, cx| {
-                    this.history.end_group();
-                    this.assist.dismiss_completion();
-                    this.assist.clear_hover();
+                    this.engine.end_group();
+                    this.engine.assist.dismiss_completion();
+                    this.engine.assist.clear_hover();
                     if let Some(handler) = this.on_blur.as_ref() {
-                        handler(this.content.to_string(), window, cx);
+                        handler(this.engine.content.to_string(), window, cx);
                     }
                 }));
         }
@@ -1858,7 +1451,7 @@ impl Render for TextInput {
         // field last reported. Deferring keeps the update off the render stack;
         // notifying from `sync_assist` alone would leave the first `{{` without
         // a card until some unrelated redraw happened.
-        let signature = self.assist.overlay_signature();
+        let signature = self.engine.assist.overlay_signature();
         if self.overlay_seen.as_ref() != Some(&signature) {
             self.overlay_seen = Some(signature);
             if let Some(handler) = self.on_overlay_change.clone() {
@@ -1873,7 +1466,7 @@ impl Render for TextInput {
         } else {
             self.variable_overlay(cx.entity(), window)
         };
-        let key_context = if self.assist.completion_open() {
+        let key_context = if self.engine.assist.completion_open() {
             "TextInput VariableCompletion"
         } else {
             "TextInput"
@@ -1995,19 +1588,29 @@ mod tests {
         });
     }
 
+    /// The single line is cached like a body's visible lines: a repaint reuses
+    /// it, and only the edit that changes it reshapes it.
     #[gpui::test]
-    async fn select_all_replacement_and_backspace(cx: &mut gpui::TestAppContext) {
+    async fn a_repaint_shapes_nothing_and_a_keystroke_reshapes_one_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("hello", "Name", cx));
-        cx.update(|window, app| {
-            window.focus(input.read(app).focus_handle());
-        });
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("abc", "Name", cx));
+        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
+        cx.update(|window, app| window.draw(app).clear());
+        let _ = cx.update(|_, app| input.update(app, |input, _| input.layout.take_lines_shaped()));
 
-        cx.simulate_input("new");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "new"));
+        cx.update(|window, app| window.draw(app).clear());
+        let shaped =
+            cx.update(|_, app| input.update(app, |input, _| input.layout.take_lines_shaped()));
+        assert_eq!(shaped, 0, "a repaint with nothing new shapes no lines");
 
-        cx.simulate_keystrokes("secondary-a backspace");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), ""));
+        cx.simulate_input("x");
+        cx.update(|window, app| window.draw(app).clear());
+        let shaped =
+            cx.update(|_, app| input.update(app, |input, _| input.layout.take_lines_shaped()));
+        assert_eq!(shaped, 1, "the edited line is reshaped once");
+        cx.update(|_, app| assert_eq!(input.read(app).content(), "abcx"));
     }
 
     #[gpui::test]
@@ -2129,86 +1732,11 @@ mod tests {
         );
 
         // A later Enter submits what it typed.
-        std::thread::sleep(IME_ENTER_GRACE + Duration::from_millis(20));
+        std::thread::sleep(
+            crate::views::text_engine::IME_ENTER_GRACE + std::time::Duration::from_millis(20),
+        );
         cx.simulate_keystrokes("enter");
         assert_eq!(submitted.borrow().as_slice(), ["chat".to_owned()]);
-    }
-
-    #[gpui::test]
-    async fn typing_run_undoes_in_one_step_and_both_redo_shortcuts_work(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("", "Name", cx));
-        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
-
-        cx.simulate_input("hello");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "hello"));
-
-        cx.simulate_keystrokes("secondary-z");
-        cx.update(|_, app| {
-            assert_eq!(input.read(app).content(), "");
-            assert_eq!(input.read(app).selected_range, 0..0);
-        });
-
-        cx.simulate_keystrokes("secondary-shift-z");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "hello"));
-
-        cx.simulate_keystrokes("secondary-z");
-        cx.simulate_keystrokes("secondary-y");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "hello"));
-    }
-
-    #[gpui::test]
-    async fn undo_restores_the_selection_a_typing_run_replaced(cx: &mut gpui::TestAppContext) {
-        cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("abc", "Name", cx));
-        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
-
-        cx.simulate_input("x");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "x"));
-
-        cx.simulate_keystrokes("secondary-z");
-        cx.update(|_, app| {
-            let input = input.read(app);
-            assert_eq!(input.content(), "abc");
-            assert_eq!(input.selected_range, 0..3);
-            assert!(!input.selection_reversed);
-        });
-    }
-
-    #[gpui::test]
-    async fn consecutive_backspaces_undo_as_one_step_with_the_original_caret(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("abc", "Name", cx));
-        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
-
-        cx.simulate_keystrokes("end backspace backspace backspace");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), ""));
-
-        cx.simulate_keystrokes("secondary-z");
-        cx.update(|_, app| {
-            let input = input.read(app);
-            assert_eq!(input.content(), "abc");
-            assert_eq!(input.selected_range, 3..3);
-        });
-    }
-
-    #[gpui::test]
-    async fn a_new_edit_after_undo_clears_redo(cx: &mut gpui::TestAppContext) {
-        cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("", "Name", cx));
-        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
-
-        cx.simulate_input("abc");
-        cx.simulate_keystrokes("secondary-z");
-        cx.simulate_input("x");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "x"));
-
-        cx.simulate_keystrokes("secondary-y");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "x"));
     }
 
     #[gpui::test]
@@ -2239,9 +1767,9 @@ mod tests {
 
         cx.update(|window, app| {
             input.update(app, |input, cx| {
-                input.edit_kind = EditKind::Paste;
+                input.engine.edit_kind = EditKind::Paste;
                 input.replace_text_in_range(None, "one", window, cx);
-                input.edit_kind = EditKind::Paste;
+                input.engine.edit_kind = EditKind::Paste;
                 input.replace_text_in_range(None, "two", window, cx);
             });
         });
@@ -2296,9 +1824,9 @@ mod tests {
 
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "https://x/items");
+            assert_eq!(input.engine.content(), "https://x/items");
             assert_eq!(
-                input.selected_range,
+                input.engine.selected_range,
                 15..15,
                 "the projection leaves the caret at the end"
             );
@@ -2307,26 +1835,6 @@ mod tests {
 
         cx.simulate_keystrokes("secondary-z");
         cx.update(|_, app| assert_eq!(input.read(app).content(), "https://x/items"));
-    }
-
-    #[gpui::test]
-    async fn an_ime_commit_undoes_as_one_step(cx: &mut gpui::TestAppContext) {
-        cx.update(|app| app.bind_keys(key_bindings()));
-        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("", "Name", cx));
-        cx.update(|window, app| window.focus(input.read(app).focus_handle()));
-
-        cx.update(|window, app| {
-            input.update(app, |input, cx| {
-                input.replace_and_mark_text_in_range(Some(0..0), "你好", Some(2..2), window, cx);
-                input.replace_text_in_range(None, "你好", window, cx);
-            });
-        });
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "你好"));
-
-        cx.simulate_keystrokes("secondary-z");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), ""));
-        cx.simulate_keystrokes("secondary-y");
-        cx.update(|_, app| assert_eq!(input.read(app).content(), "你好"));
     }
 
     #[gpui::test]
@@ -2349,9 +1857,9 @@ mod tests {
     /// The pointer position that resolves to `offset` in a painted field.
     fn pointer_at(input: &TextInput, offset: usize) -> Point<Pixels> {
         let bounds = input.last_bounds.expect("the field painted once");
-        let layout = input.last_layout.as_ref().expect("a shaped line");
+        let layout = input.layout.line(0).expect("a shaped line");
         point(
-            bounds.left() + layout.x_for_index(offset) - input.scroll_x + px(1.),
+            bounds.left() + layout.x_for_index(offset) - input.layout.scroll().x + px(1.),
             bounds.center().y,
         )
     }
@@ -2434,8 +1942,11 @@ mod tests {
         press(&input, position, 2, false, cx);
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.selected_range, 7..14);
-            assert_eq!(&input.content()[input.selected_range.clone()], "example");
+            assert_eq!(input.engine.selected_range, 7..14);
+            assert_eq!(
+                &input.engine.content()[input.engine.selected_range.clone()],
+                "example"
+            );
         });
     }
 
@@ -2446,7 +1957,7 @@ mod tests {
 
         let position = cx.update(|_, app| pointer_at(input.read(app), 2));
         press(&input, position, 3, false, cx);
-        cx.update(|_, app| assert_eq!(input.read(app).selected_range, 0..10));
+        cx.update(|_, app| assert_eq!(input.read(app).engine.selected_range, 0..10));
     }
 
     #[gpui::test]
@@ -2460,8 +1971,11 @@ mod tests {
         drag_to(&input, target, cx);
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.selected_range, 0..10);
-            assert_eq!(&input.content()[input.selected_range.clone()], "alpha beta");
+            assert_eq!(input.engine.selected_range, 0..10);
+            assert_eq!(
+                &input.engine.content()[input.engine.selected_range.clone()],
+                "alpha beta"
+            );
         });
     }
 
@@ -2577,8 +2091,8 @@ mod tests {
                     range: 19..30,
                 }]
             );
-            assert_eq!(input.content(), text);
-            assert_eq!(input.selected_range, 0..text.len());
+            assert_eq!(input.engine.content(), text);
+            assert_eq!(input.engine.selected_range, 0..text.len());
         });
 
         // Marking is presentation only: a normal edit and its undo behave as
@@ -2592,8 +2106,8 @@ mod tests {
         cx.simulate_keystrokes("secondary-z");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), text);
-            assert_eq!(input.selected_range, end..end);
+            assert_eq!(input.engine.content(), text);
+            assert_eq!(input.engine.selected_range, end..end);
             assert_eq!(input.missing_spans().len(), 1);
         });
     }
@@ -2630,8 +2144,8 @@ mod tests {
         cx.simulate_keystrokes("enter");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "{{empty}}");
-            assert_eq!(input.selected_range, 9..9);
+            assert_eq!(input.engine.content(), "{{empty}}");
+            assert_eq!(input.engine.selected_range, 9..9);
             assert!(input.completion().is_none());
         });
 
@@ -2640,16 +2154,16 @@ mod tests {
         cx.simulate_keystrokes("secondary-z");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "{{");
-            assert_eq!(input.selected_range, 2..2);
+            assert_eq!(input.engine.content(), "{{");
+            assert_eq!(input.engine.selected_range, 2..2);
             assert!(input.completion().is_some());
         });
 
         cx.simulate_keystrokes("down down tab");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "{{token}}");
-            assert_eq!(input.selected_range, 9..9);
+            assert_eq!(input.engine.content(), "{{token}}");
+            assert_eq!(input.engine.selected_range, 9..9);
         });
         assert!(!*cancelled.borrow());
 
@@ -2657,8 +2171,8 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "{{");
-            assert_eq!(input.selected_range, 2..2);
+            assert_eq!(input.engine.content(), "{{");
+            assert_eq!(input.engine.selected_range, 2..2);
             assert!(input.completion().is_none());
         });
         assert!(
@@ -2689,8 +2203,8 @@ mod tests {
         cx.update(|_, app| {
             let input = input.read(app);
             assert!(input.has_variable_assignment());
-            assert_eq!(input.selected_range, 0..11, "the caret stays put");
-            assert_eq!(input.content(), "{{missing}}");
+            assert_eq!(input.engine.selected_range, 0..11, "the caret stays put");
+            assert_eq!(input.engine.content(), "{{missing}}");
         });
     }
 
@@ -2710,7 +2224,7 @@ mod tests {
         release(&input, outside, cx);
         cx.update(|_, app| {
             assert!(!input.read(app).has_variable_assignment());
-            assert_eq!(input.read(app).selected_range, 1..1);
+            assert_eq!(input.read(app).engine.selected_range, 1..1);
         });
 
         let inside = cx.update(|_, app| pointer_at(input.read(app), 4));
@@ -2765,7 +2279,7 @@ mod tests {
                 input.is_focused(window),
                 "focus returns to the request field"
             );
-            assert_eq!(input.content(), "{{missing}}");
+            assert_eq!(input.engine.content(), "{{missing}}");
         });
 
         // Escape in the value field cancels without writing.
@@ -2789,7 +2303,7 @@ mod tests {
             let input = input.read(app);
             assert!(!input.has_variable_assignment());
             assert!(input.is_focused(window));
-            assert_eq!(input.content(), "{{missing}}");
+            assert_eq!(input.engine.content(), "{{missing}}");
         });
     }
 
@@ -2870,8 +2384,8 @@ mod tests {
 
         cx.update(|window, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "{{host}}");
-            assert_eq!(input.selected_range, 8..8);
+            assert_eq!(input.engine.content(), "{{host}}");
+            assert_eq!(input.engine.selected_range, 8..8);
             assert!(input.completion().is_none());
             assert!(input.is_focused(window), "the card does not steal focus");
         });
@@ -2906,7 +2420,7 @@ mod tests {
         cx.simulate_keystrokes("secondary-y");
         cx.update(|_, app| {
             let input = input.read(app);
-            assert_eq!(input.content(), "ab");
+            assert_eq!(input.engine.content(), "ab");
             assert!(input.completion().is_none());
         });
     }
@@ -2956,7 +2470,7 @@ mod tests {
         cx.update(|_, app| {
             let input = input.read(app);
             assert_eq!(input.hovered_variable(), Some("host"));
-            assert_eq!(input.content(), "{{host}}/{{token}}");
+            assert_eq!(input.engine.content(), "{{host}}/{{token}}");
             assert!(input.completion().is_none(), "hovering opens no list");
         });
 
@@ -3070,7 +2584,10 @@ mod tests {
 
         let (content, caret) = cx.update(|_, app| {
             let input = input.read(app);
-            (input.content().to_owned(), input.selected_range.clone())
+            (
+                input.engine.content().to_owned(),
+                input.engine.selected_range.clone(),
+            )
         });
         let inside = cx.update(|_, app| pointer_at(input.read(app), 3));
         move_to(&input, inside, cx);
@@ -3079,8 +2596,8 @@ mod tests {
         cx.update(|_, app| {
             let input = input.read(app);
             assert_eq!(input.hovered_variable(), Some("host"));
-            assert_eq!(input.content(), content);
-            assert_eq!(input.selected_range, caret);
+            assert_eq!(input.engine.content(), content);
+            assert_eq!(input.engine.selected_range, caret);
         });
 
         // One undo still removes the whole typed run.
