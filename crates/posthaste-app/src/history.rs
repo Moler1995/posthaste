@@ -184,9 +184,17 @@ impl HistoryState {
         self.record_with_cap(entry, self.cap)
     }
 
+    /// Records one entry in memory without writing it.
+    ///
+    /// The app uses this when a [`crate::persistence::Persistence`] has been
+    /// handed the entry: the list updates immediately and the write result
+    /// arrives later. Retention still deletes pruned files immediately.
+    pub fn record_staged(&mut self, entry: HistoryEntry) -> HistoryId {
+        self.push_entry(entry, self.cap)
+    }
+
     /// Testable retention path with an explicit cap.
     pub(crate) fn record_with_cap(&mut self, entry: HistoryEntry, cap: usize) -> HistoryId {
-        let id = entry.id;
         if let Some(store) = &self.store
             && let Err(error) = store.append(&entry)
         {
@@ -195,6 +203,11 @@ impl HistoryState {
                 &[&error],
             ));
         }
+        self.push_entry(entry, cap)
+    }
+
+    fn push_entry(&mut self, entry: HistoryEntry, cap: usize) -> HistoryId {
+        let id = entry.id;
         self.entries.push(entry);
         self.entries.sort_by(|a, b| {
             b.timestamp_ms

@@ -16,7 +16,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
 use reqwest::cookie::CookieStore as ReqwestCookieStore;
@@ -128,6 +128,87 @@ struct CookieFile {
     cookies: Vec<Cookie<'static>>,
 }
 
+/// An owned cookie-document write.
+///
+/// The jar hands this value to a write sink instead of touching the filesystem
+/// itself, so a background writer can encode and persist it. The value carries
+/// everything the write needs: the destination, the workspace guard, and the
+/// cookie snapshot.
+pub enum CookieWrite {
+    /// Replaces the jar file with this cookie snapshot.
+    Save {
+        path: PathBuf,
+        workspace: String,
+        cookies: Vec<Cookie<'static>>,
+    },
+    /// Removes the jar file.
+    Remove { path: PathBuf },
+}
+
+impl CookieWrite {
+    /// The document path this write targets.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Save { path, .. } | Self::Remove { path } => path,
+        }
+    }
+
+    /// Encodes the jar file exactly as it is stored.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Save {
+                workspace, cookies, ..
+            } => {
+                let file = CookieFile {
+                    schema_version: COOKIE_FILE_SCHEMA,
+                    workspace: workspace.clone(),
+                    cookies: cookies.clone(),
+                };
+                serde_json::to_string(&file)
+                    .map(String::into_bytes)
+                    .map_err(|error| format!("could not encode the cookie file: {error}"))
+            }
+            Self::Remove { .. } => Ok(Vec::new()),
+        }
+    }
+
+    /// Writes the value synchronously. Used when no background sink is set.
+    fn write(&self) -> Result<(), String> {
+        match self {
+            Self::Save { path, .. } => {
+                let bytes = self.encode()?;
+                persist_bytes_atomic(path, &bytes)
+                    .map_err(|error| format!("could not write the cookie file: {error}"))
+            }
+            Self::Remove { path } => match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("could not remove the cookie file: {error}")),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for CookieWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Save { path, cookies, .. } => f
+                .debug_struct("CookieWrite::Save")
+                .field("path", path)
+                .field("cookies", &cookies.len())
+                .finish(),
+            Self::Remove { path } => f
+                .debug_struct("CookieWrite::Remove")
+                .field("path", path)
+                .finish(),
+        }
+    }
+}
+
+/// Receives cookie-document writes instead of writing them on the calling
+/// thread. The application installs one that schedules the background writer.
+pub type CookieWriteSink = Arc<dyn Fn(CookieWrite) + Send + Sync + 'static>;
+
 /// Whether the jar is written to disk for the active workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistenceState {
@@ -176,6 +257,8 @@ pub struct CookieJar {
     /// Bumped on every jar write, so a reader can tell whether the jar it read
     /// is still current.
     revision: AtomicU64,
+    /// When set, persisted writes are handed here instead of written inline.
+    sink: RwLock<Option<CookieWriteSink>>,
 }
 
 impl Default for CookieJar {
@@ -195,6 +278,7 @@ impl CookieJar {
             }),
             dirty: AtomicBool::new(false),
             revision: AtomicU64::new(0),
+            sink: RwLock::new(None),
         }
     }
 
@@ -222,6 +306,7 @@ impl CookieJar {
             state: RwLock::new(PersistenceState::Saved),
             dirty: AtomicBool::new(false),
             revision: AtomicU64::new(0),
+            sink: RwLock::new(None),
         };
         if let Err(reason) = jar.read_persisted() {
             *jar.state() = PersistenceState::SessionOnly { reason };
@@ -284,6 +369,27 @@ impl CookieJar {
         Ok(())
     }
 
+    /// Installs a sink that receives persisted writes instead of the jar
+    /// writing them inline.
+    pub fn set_write_sink(&self, sink: CookieWriteSink) {
+        *self.sink.write().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Records the outcome of a write that a sink performed.
+    pub fn report_persisted(&self, result: Result<(), String>) {
+        *self.state() = match result {
+            Ok(()) => PersistenceState::Saved,
+            Err(message) => PersistenceState::Failed { message },
+        };
+    }
+
+    /// The document path this jar writes, when persistence is available.
+    pub fn persistence_path(&self) -> Option<&Path> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| persistence.path.as_path())
+    }
+
     /// Writes the jar when a change is pending and persistence is available.
     ///
     /// A failure is reported through [`Self::persistence_state`] and never
@@ -297,10 +403,21 @@ impl CookieJar {
         };
         // Snapshot under the store lock, then release it before any file I/O.
         let cookies = self.read().iter_unexpired().cloned().collect::<Vec<_>>();
-        match write_cookie_file(persistence, &cookies) {
-            Ok(()) => *self.state() = PersistenceState::Saved,
-            Err(message) => *self.state() = PersistenceState::Failed { message },
+        let write = CookieWrite::Save {
+            path: persistence.path.clone(),
+            workspace: persistence.workspace.clone(),
+            cookies,
+        };
+        if let Some(sink) = self
+            .sink
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            sink(write);
+            return;
         }
+        self.report_persisted(write.write());
     }
 
     /// Removes this workspace's persisted file. Used when the jar is cleared.
@@ -427,28 +544,21 @@ impl CookieJar {
         self.write().clear();
         self.dirty.store(false, Ordering::SeqCst);
         self.revision.fetch_add(1, Ordering::SeqCst);
+        if let Some(sink) = self
+            .sink
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            if let Some(persistence) = &self.persistence {
+                sink(CookieWrite::Remove {
+                    path: persistence.path.clone(),
+                });
+            }
+            return;
+        }
         self.delete_persisted();
     }
-}
-
-/// Writes the cookie list for `persistence` atomically.
-///
-/// The write goes through the workspace storage helper, so the temporary file
-/// is created in the destination directory and an interrupted write leaves the
-/// previous file intact.
-fn write_cookie_file(
-    persistence: &CookiePersistence,
-    cookies: &[Cookie<'static>],
-) -> Result<(), String> {
-    let file = CookieFile {
-        schema_version: COOKIE_FILE_SCHEMA,
-        workspace: persistence.workspace.clone(),
-        cookies: cookies.to_vec(),
-    };
-    let contents = serde_json::to_string(&file)
-        .map_err(|error| format!("could not encode the cookie file: {error}"))?;
-    persist_bytes_atomic(&persistence.path, contents.as_bytes())
-        .map_err(|error| format!("could not write the cookie file: {error}"))
 }
 
 /// Count-only debug output: names and values are as sensitive as the values

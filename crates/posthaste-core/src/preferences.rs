@@ -21,10 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::http::{DEFAULT_CONNECT_TIMEOUT, HttpConfig};
 use crate::model::SCHEMA_VERSION;
 use crate::paths;
-use crate::storage::{
-    StorageError, StorageIssue, Versioned, cleanup_temporary_files, read_versioned,
-    write_document_atomic,
-};
+use crate::storage::{JsonStore, LoadOutcome, StorageError, StorageIssue, Versioned};
 
 /// File name of the preferences document inside its directory.
 pub const PREFERENCES_FILE: &str = "preferences.json";
@@ -373,7 +370,7 @@ impl LoadedPreferences {
 /// defaults and ignores saves, which keeps the app usable without a profile.
 #[derive(Debug, Clone)]
 pub struct PreferencesStore {
-    root: Option<PathBuf>,
+    store: Option<JsonStore>,
     writable: bool,
 }
 
@@ -395,7 +392,7 @@ impl PreferencesStore {
             data_home.map(|data_home| data_home.join("preferences"))
         };
         Self {
-            root,
+            store: root.map(|root| JsonStore::in_dir(root, PREFERENCES_FILE)),
             writable: true,
         }
     }
@@ -404,7 +401,7 @@ impl PreferencesStore {
     /// `preferences.json` inside it.
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: Some(root.into()),
+            store: Some(JsonStore::in_dir(root, PREFERENCES_FILE)),
             writable: true,
         }
     }
@@ -412,19 +409,19 @@ impl PreferencesStore {
     /// A store that loads defaults and writes nothing.
     pub fn disabled() -> Self {
         Self {
-            root: None,
+            store: None,
             writable: false,
         }
     }
 
     /// The preferences directory, when the store is enabled.
     pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+        self.store.as_ref().and_then(|store| store.path().parent())
     }
 
     /// The document path, when the store is enabled.
     pub fn path(&self) -> Option<PathBuf> {
-        self.root.as_deref().map(|root| root.join(PREFERENCES_FILE))
+        self.store.as_ref().map(|store| store.path().to_path_buf())
     }
 
     /// Whether [`Self::save`] may write. A document from a newer build clears
@@ -441,17 +438,12 @@ impl PreferencesStore {
         if !self.writable {
             return LoadedPreferences::defaults();
         }
-        let Some(path) = self.path() else {
+        let Some(store) = self.store.as_ref() else {
             return LoadedPreferences::defaults();
         };
-        if let Some(directory) = path.parent() {
-            cleanup_temporary_files(directory);
-        }
-        if !path.is_file() {
-            return LoadedPreferences::defaults();
-        }
-        match read_versioned::<Preferences>(&path) {
-            Ok(preferences) => LoadedPreferences {
+        match store.load::<Preferences>() {
+            Ok(LoadOutcome::Absent) => LoadedPreferences::defaults(),
+            Ok(LoadOutcome::Loaded(preferences)) => LoadedPreferences {
                 preferences: preferences.normalized(),
                 issue: None,
             },
@@ -462,7 +454,7 @@ impl PreferencesStore {
             }
             Err(error) => {
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %store.path().display(),
                     error = %error,
                     "ignoring unreadable preferences document; the defaults apply"
                 );
@@ -481,10 +473,10 @@ impl PreferencesStore {
         if !self.writable {
             return Ok(());
         }
-        let Some(path) = self.path() else {
+        let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
-        write_document_atomic(&path, preferences).map(|_| ())
+        store.write(preferences)
     }
 }
 

@@ -292,8 +292,9 @@ impl WebSocketPanel {
                 }
             },
         };
-        self.error = None;
-        state.update(cx, |state, _| state.send_ws_frame(command));
+        self.error = state
+            .update(cx, |state, _| state.send_ws_frame(command))
+            .err();
         cx.notify();
     }
 

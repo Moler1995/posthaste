@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::model::SCHEMA_VERSION;
 use crate::preferences::PreferencesStore;
 use crate::storage::{
-    StorageError, StorageIssue, Versioned, cleanup_temporary_files, normalize_directory_path,
-    read_versioned, same_directory, write_document_atomic,
+    JsonStore, LoadOutcome, StorageError, StorageIssue, Versioned, normalize_directory_path,
+    same_directory,
 };
 
 /// File name of the recents document inside its directory.
@@ -137,7 +137,7 @@ impl LoadedRecents {
 /// independent of the user's real recents.
 #[derive(Debug, Clone)]
 pub struct RecentsStore {
-    root: Option<PathBuf>,
+    store: Option<JsonStore>,
     writable: bool,
 }
 
@@ -157,7 +157,7 @@ impl RecentsStore {
             .root()
             .map(Path::to_path_buf);
         Self {
-            root,
+            store: root.map(|root| JsonStore::in_dir(root, RECENTS_FILE)),
             writable: true,
         }
     }
@@ -166,7 +166,7 @@ impl RecentsStore {
     /// `workspaces.json` inside it.
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: Some(root.into()),
+            store: Some(JsonStore::in_dir(root, RECENTS_FILE)),
             writable: true,
         }
     }
@@ -174,19 +174,19 @@ impl RecentsStore {
     /// A store that loads an empty document and writes nothing.
     pub fn disabled() -> Self {
         Self {
-            root: None,
+            store: None,
             writable: false,
         }
     }
 
     /// The document directory, when the store is enabled.
     pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+        self.store.as_ref().and_then(|store| store.path().parent())
     }
 
     /// The document path, when the store is enabled.
     pub fn path(&self) -> Option<PathBuf> {
-        self.root.as_deref().map(|root| root.join(RECENTS_FILE))
+        self.store.as_ref().map(|store| store.path().to_path_buf())
     }
 
     /// Whether [`Self::save`] may write. A document from a newer build clears
@@ -203,17 +203,12 @@ impl RecentsStore {
         if !self.writable {
             return LoadedRecents::empty();
         }
-        let Some(path) = self.path() else {
+        let Some(store) = self.store.as_ref() else {
             return LoadedRecents::empty();
         };
-        if let Some(directory) = path.parent() {
-            cleanup_temporary_files(directory);
-        }
-        if !path.is_file() {
-            return LoadedRecents::empty();
-        }
-        match read_versioned::<RecentWorkspaces>(&path) {
-            Ok(document) => LoadedRecents {
+        match store.load::<RecentWorkspaces>() {
+            Ok(LoadOutcome::Absent) => LoadedRecents::empty(),
+            Ok(LoadOutcome::Loaded(document)) => LoadedRecents {
                 document: document.normalized(),
                 issue: None,
             },
@@ -224,7 +219,7 @@ impl RecentsStore {
             }
             Err(error) => {
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %store.path().display(),
                     error = %error,
                     "ignoring unreadable workspaces document; starting with no recents"
                 );
@@ -243,10 +238,10 @@ impl RecentsStore {
         if !self.writable {
             return Ok(());
         }
-        let Some(path) = self.path() else {
+        let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
-        write_document_atomic(&path, document).map(|_| ())
+        store.write(document)
     }
 
     /// Records `path` in `document` and writes the document.

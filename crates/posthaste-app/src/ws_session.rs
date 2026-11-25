@@ -15,7 +15,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use posthaste_core::history::SessionEnd;
 use posthaste_core::model::{RequestId, RequestSpec};
-use posthaste_core::ws::{WsCloseBy, WsCommand, WsDirection, WsHandshake};
+use posthaste_core::ws::{WS_COMMAND_QUEUE, WsCloseBy, WsCommand, WsDirection, WsHandshake};
 use tokio::sync::{mpsc, oneshot};
 
 /// The largest number of rows the transcript retains.
@@ -237,7 +237,7 @@ pub struct WsSessionState {
     composer_binary: bool,
     attempt: Option<WsAttempt>,
     generation: u64,
-    commands: Option<mpsc::UnboundedSender<WsCommand>>,
+    commands: Option<mpsc::Sender<WsCommand>>,
     cancel: Option<oneshot::Sender<()>>,
     counts: WsCounts,
 }
@@ -300,7 +300,7 @@ impl WsSessionState {
 
     /// The running session's command channel, used by the composer's send
     /// path.
-    pub fn command_sender(&self) -> Option<&mpsc::UnboundedSender<WsCommand>> {
+    pub fn command_sender(&self) -> Option<&mpsc::Sender<WsCommand>> {
         self.commands.as_ref()
     }
 
@@ -345,7 +345,7 @@ impl WsSessionState {
         source_request_id: Option<RequestId>,
         started: Instant,
         started_ms: u64,
-        commands: mpsc::UnboundedSender<WsCommand>,
+        commands: mpsc::Sender<WsCommand>,
         cancel: oneshot::Sender<()>,
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
@@ -454,10 +454,7 @@ impl WsSessionState {
     /// the closing event can still find this attempt.
     pub fn take_channels(
         &mut self,
-    ) -> (
-        Option<mpsc::UnboundedSender<WsCommand>>,
-        Option<oneshot::Sender<()>>,
-    ) {
+    ) -> (Option<mpsc::Sender<WsCommand>>, Option<oneshot::Sender<()>>) {
         (self.commands.take(), self.cancel.take())
     }
 
@@ -491,7 +488,7 @@ mod tests {
     }
 
     fn begin(state: &mut WsSessionState) -> u64 {
-        let (commands, _commands_rx) = mpsc::unbounded_channel();
+        let (commands, _commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
         let (cancel, _cancel_rx) = oneshot::channel();
         state.begin_connect(
             RequestSpec::new("socket"),

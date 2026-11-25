@@ -21,9 +21,7 @@ use uuid::Uuid;
 
 use crate::history::HistoryId;
 use crate::model::{RequestId, RequestSpec, SCHEMA_VERSION};
-use crate::storage::{
-    StorageError, Versioned, cleanup_temporary_files, read_versioned, write_document_atomic,
-};
+use crate::storage::{JsonStore, LoadOutcome, StorageError, Versioned};
 
 /// Directory below the platform data directory, relative to the Posthaste root.
 const SESSIONS_DIR: &str = "sessions";
@@ -139,7 +137,7 @@ pub enum SessionLoad {
 /// as a no-op, which keeps tests away from the real user profile.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
-    path: Option<PathBuf>,
+    store: Option<JsonStore>,
     workspace_root: Option<String>,
     writable: bool,
 }
@@ -160,11 +158,11 @@ impl SessionStore {
         };
         let name = Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes());
         Self {
-            path: Some(
+            store: Some(JsonStore::at(
                 data_home
                     .join(SESSIONS_DIR)
                     .join(format!("workspace-{name}.json")),
-            ),
+            )),
             workspace_root: Some(key),
             writable: true,
         }
@@ -173,7 +171,7 @@ impl SessionStore {
     /// A store for an explicit path, without a root to validate against.
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: Some(path.into()),
+            store: Some(JsonStore::at(path)),
             workspace_root: None,
             writable: true,
         }
@@ -182,7 +180,7 @@ impl SessionStore {
     /// A store that neither loads nor writes anything.
     pub fn disabled() -> Self {
         Self {
-            path: None,
+            store: None,
             workspace_root: None,
             writable: false,
         }
@@ -190,7 +188,7 @@ impl SessionStore {
 
     /// The resolved file, when the store is enabled.
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        self.store.as_ref().map(|store| store.path())
     }
 
     /// The canonical root this store was resolved for, when it has one.
@@ -214,21 +212,12 @@ impl SessionStore {
         if !self.writable {
             return SessionLoad::Absent;
         }
-        let Some(path) = self.path.as_deref() else {
+        let Some(store) = self.store.as_ref() else {
             return SessionLoad::Absent;
         };
-        // Residue from an interrupted write would otherwise accumulate beside
-        // the document forever.
-        if let Some(directory) = path.parent() {
-            cleanup_temporary_files(directory);
-        }
-        // A directory or an unreadable path is treated like a missing document;
-        // the next write replaces it.
-        if !path.is_file() {
-            return SessionLoad::Absent;
-        }
-        match read_versioned::<SessionDocument>(path) {
-            Ok(document) => {
+        match store.load::<SessionDocument>() {
+            Ok(LoadOutcome::Absent) => SessionLoad::Absent,
+            Ok(LoadOutcome::Loaded(document)) => {
                 let matches = self
                     .workspace_root
                     .as_deref()
@@ -246,7 +235,7 @@ impl SessionStore {
             }
             Err(StorageError::Parse { .. }) => {
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %store.path().display(),
                     "ignoring malformed session document; the next write replaces it"
                 );
                 SessionLoad::Absent
@@ -262,10 +251,10 @@ impl SessionStore {
         if !self.writable {
             return Ok(());
         }
-        let Some(path) = self.path.as_deref() else {
+        let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
-        write_document_atomic(path, document).map(|_| ())
+        store.write(document)
     }
 }
 
