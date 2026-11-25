@@ -294,6 +294,129 @@ pub enum DraftOrigin {
     UnlinkedHistory,
 }
 
+/// The one document a tab holds: a new draft, a saved request with the version
+/// the tab opened, or a history snapshot together with the saved request the
+/// entry was recorded from.
+///
+/// Every transition that changes what a tab saves goes through one of the
+/// constructors, so a tab can never hold a saved origin without a matching
+/// baseline or an unlinked snapshot that claims a source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentOrigin {
+    /// A draft with no saved request behind it.
+    New,
+    /// The saved request this tab opened and the version it opened.
+    Saved {
+        id: RequestId,
+        baseline: RequestSpec,
+    },
+    /// A stored history entry replayed as a draft, with the source request the
+    /// entry names, if any.
+    Snapshot {
+        entry: HistoryId,
+        source: Option<RequestId>,
+    },
+}
+
+impl DocumentOrigin {
+    fn new() -> Self {
+        Self::New
+    }
+
+    /// Opens `saved` as the tab's document; its current version is both the
+    /// draft and the restore point.
+    fn open(saved: &RequestSpec) -> Self {
+        let id = saved.id;
+        debug_assert!(!is_nil_id(id), "a saved origin needs a request id");
+        debug_assert_eq!(saved.id, id, "the baseline must be the opened request");
+        Self::Saved {
+            id,
+            baseline: saved.clone(),
+        }
+    }
+
+    /// Promotes a snapshot into the saved request just written from it. The
+    /// snapshot's source is not touched.
+    fn promote(saved: &RequestSpec) -> Self {
+        Self::open(saved)
+    }
+
+    /// Replays a stored history entry. The entry's source request, when it has
+    /// one, is recorded so a later deletion can clear it.
+    fn snapshot(entry: &HistoryEntry) -> Self {
+        let source = entry.source_request_id;
+        debug_assert!(!is_nil_id(entry.id), "a snapshot needs a history entry");
+        debug_assert!(
+            source.is_none_or(|id| !is_nil_id(id)),
+            "a snapshot source names a request"
+        );
+        Self::Snapshot {
+            entry: entry.id,
+            source,
+        }
+    }
+
+    /// Detaches the origin from a saved request that no longer exists. The
+    /// draft is kept by the caller; a snapshot keeps its entry and source.
+    fn detached(&self) -> Self {
+        match self {
+            Self::Saved { .. } => Self::New,
+            other => other.clone(),
+        }
+    }
+
+    /// The saved request and its restore point, only for a saved origin.
+    fn saved(&self) -> Option<(RequestId, &RequestSpec)> {
+        match self {
+            Self::Saved { id, baseline } => Some((*id, baseline)),
+            _ => None,
+        }
+    }
+
+    /// The saved request's id, only for a saved origin.
+    fn saved_id(&self) -> Option<RequestId> {
+        self.saved().map(|(id, _)| id)
+    }
+
+    /// The restore point, mutable so a move or rename can keep it in step.
+    fn baseline_mut(&mut self) -> Option<&mut RequestSpec> {
+        match self {
+            Self::Saved { baseline, .. } => Some(baseline),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an identifier is the UUID nil value. Identifiers are generated, so
+/// this only guards a hand-built or deserialized origin.
+fn is_nil_id(id: impl std::fmt::Display) -> bool {
+    id.to_string() == "00000000-0000-0000-0000-000000000000"
+}
+
+/// The recorded run a tab presents, and how it came to present it.
+///
+/// A run recorded by this tab's own send is shown as the live completion; a run
+/// the user selected or a session restored as a selection is shown as stored
+/// history. The two look different, so the tab keeps both under one field
+/// rather than losing the distinction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentedRun {
+    /// The run this tab's own send recorded, shown as the completed response.
+    Recorded(HistoryId),
+    /// A stored run the user selected, replayed, or restored from the session's
+    /// `selected_history`, shown with the history banner.
+    Selected(HistoryId),
+}
+
+impl PresentedRun {
+    /// The history entry this presentation names.
+    fn id(self) -> HistoryId {
+        match self {
+            Self::Recorded(id) | Self::Selected(id) => id,
+        }
+    }
+}
+
 /// Where a draft saved from the dialog lands: a collection's root when
 /// `folder_id` is `None`, or one of its folders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,10 +432,6 @@ pub struct SaveDestination {
 #[derive(Debug)]
 pub struct ShellState {
     selected_collection: Option<String>,
-    selected_request: Option<RequestId>,
-    /// The history entry this tab presents, if any. Each tab keeps its own so
-    /// switching away and back restores the run it was showing.
-    selected_history: Option<HistoryId>,
     execution: ExecutionState,
     draft: RequestSpec,
 }
@@ -321,8 +440,6 @@ impl Default for ShellState {
     fn default() -> Self {
         Self {
             selected_collection: None,
-            selected_request: None,
-            selected_history: None,
             execution: ExecutionState::Idle,
             draft: RequestSpec::new("Untitled request"),
         }
@@ -332,19 +449,6 @@ impl Default for ShellState {
 impl ShellState {
     pub fn selected_collection(&self) -> Option<&str> {
         self.selected_collection.as_deref()
-    }
-
-    pub fn selected_request(&self) -> Option<RequestId> {
-        self.selected_request
-    }
-
-    /// The history entry presented by this tab, if any.
-    pub fn selected_history(&self) -> Option<HistoryId> {
-        self.selected_history
-    }
-
-    pub fn select_history(&mut self, id: Option<HistoryId>) {
-        self.selected_history = id;
     }
 
     /// The request shown in the request pane until request editing exists.
@@ -385,10 +489,6 @@ impl ShellState {
 
     pub fn select_collection(&mut self, id: Option<String>) {
         self.selected_collection = id;
-    }
-
-    pub fn select_request(&mut self, id: Option<RequestId>) {
-        self.selected_request = id;
     }
 
     /// Replaces the request shown in the request pane.
@@ -522,27 +622,24 @@ pub struct RequestTab {
     edit_generation: u64,
     /// Whether the current draft is on disk, edited, or failed to save.
     save_state: RequestSaveState,
-    /// The version of the saved request this tab opened, kept as the restore
-    /// point for revert.
-    opened_baseline: Option<RequestSpec>,
+    /// What Ctrl+S writes and what a revert restores to.
+    origin: DocumentOrigin,
     revert_confirmation_open: bool,
-    /// Whether the draft can currently be restored to `opened_baseline`.
-    /// Cached so a repaint never compares the draft with the restore point;
-    /// every event that can change the answer recomputes it.
+    /// Whether the draft can currently be restored to the saved origin's
+    /// baseline. Cached so a repaint never compares the draft with the restore
+    /// point; every event that can change the answer recomputes it.
     revert_available: bool,
     /// Whether the draft changed since the tab loaded it.
     edited_since_open: bool,
-    /// The saved request this tab opened, kept for its chip title and for
-    /// finding an already-open request. The draft's selection stays the save
-    /// target.
-    opened_request: Option<RequestId>,
     /// This tab's running request, retained so history can be recorded.
     in_flight: Option<InFlight>,
-    /// The history entry recorded when this tab's send completed. A session
-    /// stores only this reference, so the response body is never copied into
-    /// the session document. Cleared by every transition that replaces the
-    /// presented response.
-    recorded_response: Option<HistoryId>,
+    /// The recorded run this tab presents, if any, and whether it is the run
+    /// this tab's own send recorded or a selected stored run. It is set by a
+    /// history selection, by a completed send, and by session restore, and
+    /// cleared by every transition that replaces the presented response. The
+    /// origin does not change when it is set: a linked run keeps a saved
+    /// origin.
+    presented_run: Option<PresentedRun>,
     /// Cancels this tab's running request.
     cancel: Option<oneshot::Sender<()>>,
     /// The number this tab showed while it held a blank default draft, kept
@@ -568,7 +665,7 @@ impl RequestTab {
     /// The history presentation and the edited flag are passed explicitly so
     /// tests can describe a tab's state without building one.
     fn is_untouched_blank(&self, history_presented: bool, edited_since_open: bool) -> bool {
-        self.shell.selected_request().is_none()
+        matches!(self.origin, DocumentOrigin::New)
             && !history_presented
             && !edited_since_open
             && matches!(self.shell.execution(), ExecutionState::Idle)
@@ -579,7 +676,68 @@ impl RequestTab {
     /// a blank-tab number. A tab that opened a saved request keeps its number
     /// for later but does not count as holding it.
     fn shows_blank_number(&self) -> bool {
-        self.opened_request.is_none() && is_default_draft(self.shell.draft())
+        self.opened_request().is_none() && is_default_draft(self.shell.draft())
+    }
+
+    /// The saved request this tab opened. Only a saved origin names one; a new
+    /// draft and a snapshot do not.
+    fn opened_request(&self) -> Option<RequestId> {
+        self.origin.saved_id()
+    }
+
+    /// The stored run this tab presents because the user selected or replayed
+    /// it. A run recorded by this tab's own send is not a selection.
+    fn selected_history(&self) -> Option<HistoryId> {
+        match self.presented_run {
+            Some(PresentedRun::Selected(id)) => Some(id),
+            Some(PresentedRun::Recorded(_)) | None => None,
+        }
+    }
+
+    /// The run this tab's own send recorded, shown as the completed response.
+    fn recorded_run(&self) -> Option<HistoryId> {
+        match self.presented_run {
+            Some(PresentedRun::Recorded(id)) => Some(id),
+            Some(PresentedRun::Selected(_)) | None => None,
+        }
+    }
+
+    /// The source a new history entry records for a send from this tab. Only a
+    /// saved origin names one.
+    fn send_source(&self) -> Option<RequestId> {
+        self.opened_request()
+    }
+
+    /// Where the footer says the draft came from.
+    fn draft_origin(&self) -> DraftOrigin {
+        match (self.selected_history(), &self.origin) {
+            (None, _) => DraftOrigin::Ordinary,
+            (Some(_), DocumentOrigin::Saved { .. }) => DraftOrigin::LinkedHistory,
+            (Some(_), _) => DraftOrigin::UnlinkedHistory,
+        }
+    }
+
+    /// Whether the draft can be restored to the saved origin's baseline. Reads
+    /// the cached answer so a repaint never compares the whole draft.
+    fn can_revert(&self) -> bool {
+        self.revert_available
+    }
+
+    /// The save action the tab menu offers, if the draft needs saving.
+    fn save_action(&self) -> Option<TabSaveAction> {
+        match self.origin {
+            // A bound tab offers to write its request while edits are unwritten.
+            DocumentOrigin::Saved { .. } => matches!(
+                self.save_state,
+                RequestSaveState::Edited | RequestSaveState::Failed(_)
+            )
+            .then_some(TabSaveAction::Save),
+            // An unbound tab offers the destination dialog once its draft has
+            // content worth saving.
+            DocumentOrigin::New | DocumentOrigin::Snapshot { .. } => (!self
+                .is_untouched_blank(self.selected_history().is_some(), self.edited_since_open))
+            .then_some(TabSaveAction::SaveAs),
+        }
     }
 }
 
@@ -929,13 +1087,12 @@ fn build_tab(
         pending_save: None,
         edit_generation: 0,
         save_state: RequestSaveState::NoTarget,
-        opened_baseline: None,
+        origin: DocumentOrigin::new(),
         revert_confirmation_open: false,
         revert_available: false,
         edited_since_open: false,
-        opened_request: None,
         in_flight: None,
-        recorded_response: None,
+        presented_run: None,
         cancel: None,
         blank_number: 0,
         failed_flash: None,
@@ -963,13 +1120,47 @@ fn restore_session_tabs(
         shell.set_draft(recorded.draft.clone());
         let (opened_request, baseline, collection, save_state, edited) =
             restored_attachment(workspace, &recorded.draft, recorded.opened_request);
-        shell.select_request(opened_request);
         shell.select_collection(collection);
-        shell.select_history(
-            recorded
-                .selected_history
-                .filter(|id| history.entries.iter().any(|entry| entry.id == *id)),
-        );
+
+        // A selected entry is the presentation the user chose; the recorded
+        // response is the fallback a completed send left behind. The selection
+        // only wins when its entry still exists; `restore_tab_presentation`
+        // decides whether a recorded or selected entry can still be shown.
+        let presented_selection = recorded
+            .selected_history
+            .filter(|id| history.entries.iter().any(|entry| entry.id == *id));
+        let presented_response = recorded.recorded_response;
+        let presented_run = match (presented_selection, presented_response) {
+            (Some(id), _) => Some(PresentedRun::Selected(id)),
+            (None, Some(id)) => Some(PresentedRun::Recorded(id)),
+            (None, None) => None,
+        };
+
+        let origin = match (opened_request, baseline) {
+            (Some(id), Some(baseline)) => {
+                debug_assert_eq!(baseline.id, id, "a restored baseline names its request");
+                DocumentOrigin::open(&baseline)
+            }
+            // The recorded request is gone. The entry it presented, when it
+            // still exists, makes the tab a snapshot instead.
+            _ => match presented_run
+                .map(PresentedRun::id)
+                .and_then(|id| history.entries.iter().find(|entry| entry.id == id))
+            {
+                Some(entry) => {
+                    let mut origin = DocumentOrigin::snapshot(entry);
+                    // A source deleted since the session was written leaves
+                    // no dangling id.
+                    if let DocumentOrigin::Snapshot { source, .. } = &mut origin
+                        && source.is_some_and(|id| workspace.find_request(id).is_none())
+                    {
+                        *source = None;
+                    }
+                    origin
+                }
+                None => DocumentOrigin::new(),
+            },
+        };
 
         let mut tab = build_tab(
             cx,
@@ -979,15 +1170,14 @@ fn restore_session_tabs(
             workspace.store.clone(),
             wrap_long_lines,
         );
-        tab.opened_request = opened_request;
-        tab.opened_baseline = baseline;
+        tab.origin = origin;
         tab.save_state = save_state;
         // The recorded draft differs from the restore point it was attached
-        // to; an unattached tab has no restore point at all.
-        tab.revert_available = edited && tab.opened_baseline.is_some();
+        // to; a tab without a saved origin has no restore point at all.
+        tab.revert_available = edited && tab.origin.saved().is_some();
         tab.edited_since_open = edited;
         tab.blank_number = recorded.blank_number;
-        tab.recorded_response = recorded.recorded_response;
+        tab.presented_run = presented_run;
         restore_tab_presentation(&mut tab, recorded, history, cx);
         tabs.push(tab);
     }
@@ -1047,51 +1237,61 @@ fn restored_attachment(
 /// Applies a recorded response presentation to a freshly built tab.
 ///
 /// A presented history entry wins because its banner is part of the
-/// presentation. Otherwise the recorded run is rebuilt from its history entry,
-/// or, when that entry is gone, left idle. Failed and cancelled runs carry no
-/// history reference and are restored from the session itself.
+/// presentation. When it is the tab's own recorded run rather than an explicit
+/// selection, the tab also presents it as the completed response, exactly as
+/// after a send. Either variant shows the stored body. When the entry is gone,
+/// the presentation is cleared; a selected run then falls back to the session's
+/// recorded non-response execution, while a recorded run has nothing to show.
 fn restore_tab_presentation(
     tab: &mut RequestTab,
     recorded: &SessionTab,
     history: &HistoryState,
     cx: &mut Context<AppState>,
 ) {
-    if let Some(id) = tab.shell.selected_history() {
-        if let Some(entry) = history.entries.iter().find(|entry| entry.id == id) {
-            if let HistoryOutcome::Response(stored) = &entry.outcome {
-                show_stored_body(&tab.response, stored, entry.request.method, cx);
+    if let Some(run) = tab.presented_run {
+        let Some(entry) = history.entries.iter().find(|entry| entry.id == run.id()) else {
+            // The entry was deleted or pruned since the session was written.
+            // A recorded response has nothing else to show; a selection falls
+            // through to the execution state the session recorded.
+            tab.presented_run = None;
+            if matches!(run, PresentedRun::Recorded(_)) {
+                return;
             }
+            restore_session_execution(tab, recorded);
+            return;
+        };
+        if matches!(run, PresentedRun::Recorded(_)) {
+            let HistoryOutcome::Response(stored) = &entry.outcome else {
+                // The recorded response no longer backs this presentation.
+                tab.presented_run = None;
+                return;
+            };
+            let response = ResponseRecord {
+                status: stored.status,
+                headers: stored.headers.clone(),
+                body: Bytes::from(stored.body.clone()),
+                duration: entry.duration(),
+                truncated: stored.truncated,
+                cookies: stored.cookies.clone(),
+            };
+            tab.shell.execution = ExecutionState::Completed {
+                request: tab.shell.draft().id,
+                response,
+            };
+            show_stored_body(&tab.response, stored, entry.request.method, cx);
             return;
         }
-        // The entry was deleted or pruned since the session was written.
-        tab.shell.select_history(None);
-    }
-
-    if let Some(id) = tab.recorded_response {
-        let Some(entry) = history.entries.iter().find(|entry| entry.id == id) else {
-            tab.recorded_response = None;
-            return;
-        };
-        let HistoryOutcome::Response(stored) = &entry.outcome else {
-            tab.recorded_response = None;
-            return;
-        };
-        let response = ResponseRecord {
-            status: stored.status,
-            headers: stored.headers.clone(),
-            body: Bytes::from(stored.body.clone()),
-            duration: entry.duration(),
-            truncated: stored.truncated,
-            cookies: stored.cookies.clone(),
-        };
-        tab.shell.execution = ExecutionState::Completed {
-            request: tab.shell.draft().id,
-            response,
-        };
-        show_stored_body(&tab.response, stored, entry.request.method, cx);
+        if let HistoryOutcome::Response(stored) = &entry.outcome {
+            show_stored_body(&tab.response, stored, entry.request.method, cx);
+        }
         return;
     }
 
+    restore_session_execution(tab, recorded);
+}
+
+/// Rebuilds a restored tab's non-response execution state from the session.
+fn restore_session_execution(tab: &mut RequestTab, recorded: &SessionTab) {
     match &recorded.execution {
         SessionExecution::Failed { message } => {
             tab.shell.execution = ExecutionState::Failed {
@@ -3292,8 +3492,7 @@ impl AppState {
                 // debounce, so a tab already marked unsaved is written once.
                 let mut schedules = Vec::new();
                 for tab in &mut self.tabs {
-                    if tab.save_state == RequestSaveState::Edited
-                        && tab.shell.selected_request().is_some()
+                    if tab.save_state == RequestSaveState::Edited && tab.opened_request().is_some()
                     {
                         tab.edit_generation = tab.edit_generation.wrapping_add(1);
                         tab.pending_save = Some(tab.shell.draft().clone());
@@ -3502,9 +3701,28 @@ impl AppState {
         &self.history
     }
 
-    /// The history entry the active tab presents, if it still exists.
+    /// The saved request the active tab was opened from.
+    pub fn opened_request(&self) -> Option<RequestId> {
+        self.active_tab().opened_request()
+    }
+
+    /// The stored history entry the active tab presents because the user
+    /// selected or replayed it.
+    pub fn selected_history(&self) -> Option<HistoryId> {
+        self.active_tab().selected_history()
+    }
+
+    /// The history entry the active tab's own send recorded and still presents
+    /// as its completed response.
+    pub fn recorded_run(&self) -> Option<HistoryId> {
+        self.active_tab().recorded_run()
+    }
+
+    /// The stored entry the active tab selected, if it still exists. A run the
+    /// tab's own send recorded is not returned here, so it keeps the live
+    /// completed readout rather than the history banner.
     pub fn selected_history_entry(&self) -> Option<&HistoryEntry> {
-        let id = self.shell().selected_history()?;
+        let id = self.selected_history()?;
         self.history.entries.iter().find(|entry| entry.id == id)
     }
 
@@ -3851,18 +4069,10 @@ impl AppState {
             }
         };
         for tab in &mut self.tabs {
-            let holds = tab.opened_request.is_some_and(|id| moved.contains(&id))
-                || tab
-                    .shell
-                    .selected_request()
-                    .is_some_and(|id| moved.contains(&id));
-            if !holds {
-                continue;
-            }
-            tab.shell.select_collection(Some(slug.to_owned()));
-            let Some(id) = tab.shell.selected_request() else {
+            let Some(id) = tab.opened_request().filter(|id| moved.contains(id)) else {
                 continue;
             };
+            tab.shell.select_collection(Some(slug.to_owned()));
             let Some(folder) = self
                 .workspace
                 .request_entry(slug, id)
@@ -3875,7 +4085,7 @@ impl AppState {
                 draft.folder_id = folder;
                 tab.shell.set_draft(draft);
             }
-            if let Some(baseline) = tab.opened_baseline.as_mut() {
+            if let Some(baseline) = tab.origin.baseline_mut() {
                 baseline.folder_id = folder;
             }
         }
@@ -4964,17 +5174,14 @@ impl AppState {
     /// Whether closing the tab at `index` would discard an unsaved draft.
     fn close_needs_confirmation(&self, index: usize) -> bool {
         let tab = &self.tabs[index];
-        if tab.opened_request.is_some() {
+        if tab.opened_request().is_some() {
             // A flush just wrote the request; only an unwritten edit is lost.
             return matches!(
                 tab.save_state,
                 RequestSaveState::Failed(_) | RequestSaveState::Edited
             );
         }
-        !tab.is_untouched_blank(
-            tab.shell.selected_history().is_some(),
-            tab.edited_since_open,
-        )
+        !tab.is_untouched_blank(tab.selected_history().is_some(), tab.edited_since_open)
     }
 
     /// Removes the tab at `index`, keeping at least one blank tab open.
@@ -5140,19 +5347,7 @@ impl AppState {
                 // A bound tab offers to write its request while edits are
                 // unwritten; an unbound tab offers the destination dialog only
                 // once its draft has content worth saving.
-                save_action: if tab.opened_request.is_some() {
-                    matches!(
-                        tab.save_state,
-                        RequestSaveState::Edited | RequestSaveState::Failed(_)
-                    )
-                    .then_some(TabSaveAction::Save)
-                } else {
-                    (!tab.is_untouched_blank(
-                        tab.shell.selected_history().is_some(),
-                        tab.edited_since_open,
-                    ))
-                    .then_some(TabSaveAction::SaveAs)
-                },
+                save_action: tab.save_action(),
                 can_close_others: count > 1,
                 can_close_to_right: index + 1 < count,
                 can_close_to_left: index > 0,
@@ -5166,7 +5361,7 @@ impl AppState {
     /// distinguishable.
     fn tab_title(&self, tab: &RequestTab) -> String {
         if let Some(name) = tab
-            .opened_request
+            .opened_request()
             .and_then(|id| self.workspace.find_request(id))
             .map(|(_, request)| request.name().to_owned())
         {
@@ -5265,7 +5460,7 @@ impl AppState {
     /// [`Self::refresh_revert_available`] instead of every repaint comparing
     /// the whole draft.
     pub fn can_revert(&self) -> bool {
-        self.active_tab().revert_available
+        self.active_tab().can_revert()
     }
 
     /// Recomputes the active tab's cached revert answer.
@@ -5279,10 +5474,8 @@ impl AppState {
     fn refresh_tab_revert_available(&mut self, index: usize) {
         let available = {
             let tab = &self.tabs[index];
-            match (tab.shell.selected_request(), tab.opened_baseline.as_ref()) {
-                (Some(id), Some(baseline))
-                    if baseline.id == id && self.workspace.find_request(id).is_some() =>
-                {
+            match tab.origin.saved() {
+                Some((id, baseline)) if self.workspace.find_request(id).is_some() => {
                     #[cfg(test)]
                     self.revert_comparisons
                         .set(self.revert_comparisons.get().wrapping_add(1));
@@ -5302,11 +5495,7 @@ impl AppState {
     /// Whether the draft presents a history entry, and whether that entry is
     /// linked to its saved request.
     pub fn draft_origin(&self) -> DraftOrigin {
-        match self.shell().selected_history() {
-            None => DraftOrigin::Ordinary,
-            Some(_) if self.shell().selected_request().is_some() => DraftOrigin::LinkedHistory,
-            Some(_) => DraftOrigin::UnlinkedHistory,
-        }
+        self.active_tab().draft_origin()
     }
 
     /// Whether `draft` differs from `baseline` in any field a restore touches.
@@ -5328,7 +5517,7 @@ impl AppState {
         self.flush_edits(cx);
         self.dismiss_row_menu();
         self.dismiss_save_picker();
-        self.shell_mut().select_history(None);
+        self.active_tab_mut().presented_run = None;
         if let Some(id) = &id {
             self.expand_collection(id);
         }
@@ -5346,7 +5535,7 @@ impl AppState {
         if self.expanded_collections.remove(&slug) {
             // Collapsing: select the collection without re-expanding it.
             self.flush_edits(cx);
-            self.shell_mut().select_history(None);
+            self.active_tab_mut().presented_run = None;
             self.shell_mut().select_collection(Some(slug));
             self.schedule_session_write(cx);
             cx.notify();
@@ -5367,10 +5556,9 @@ impl AppState {
         self.dismiss_save_picker();
         self.active_tab_mut().revert_confirmation_open = false;
         self.active_tab_mut().edited_since_open = false;
-        self.shell_mut().select_history(None);
         // Opening another request replaces what the pane presented, so the
-        // old response reference no longer describes this tab.
-        self.active_tab_mut().recorded_response = None;
+        // old history reference no longer describes this tab.
+        self.active_tab_mut().presented_run = None;
         let selected = id.and_then(|id| {
             let slug = self
                 .workspace
@@ -5388,19 +5576,15 @@ impl AppState {
                 request.normalize_query();
                 self.expand_collection(&slug);
                 self.shell_mut().select_collection(Some(slug));
-                self.shell_mut().select_request(Some(request.id));
                 // Capture the version being opened before any edit can reach
                 // the draft; autosave keeps it as the only restore point.
-                self.active_tab_mut().opened_baseline = Some(request.clone());
-                self.active_tab_mut().opened_request = Some(request.id);
+                self.active_tab_mut().origin = DocumentOrigin::open(&request);
                 self.shell_mut().set_draft(request);
                 self.active_tab_mut().save_state = RequestSaveState::Clean;
             }
             None => {
-                self.shell_mut().select_request(None);
                 self.shell_mut().reset_draft();
-                self.active_tab_mut().opened_baseline = None;
-                self.active_tab_mut().opened_request = None;
+                self.active_tab_mut().origin = DocumentOrigin::new();
                 self.active_tab_mut().save_state = RequestSaveState::NoTarget;
                 // The draft is blank again, so its number may be taken now.
                 self.ensure_blank_number_unique(self.active);
@@ -5423,7 +5607,7 @@ impl AppState {
         if let Some(index) = self
             .tabs
             .iter()
-            .position(|tab| tab.opened_request == Some(id))
+            .position(|tab| tab.opened_request() == Some(id))
         {
             self.content = ContentView::Tabs;
             self.activate_tab(index, cx);
@@ -5431,10 +5615,7 @@ impl AppState {
         }
         let reusable = {
             let tab = self.active_tab();
-            tab.is_untouched_blank(
-                tab.shell.selected_history().is_some(),
-                tab.edited_since_open,
-            )
+            tab.is_untouched_blank(tab.selected_history().is_some(), tab.edited_since_open)
         };
         if !reusable {
             self.flush_edits(cx);
@@ -5454,10 +5635,7 @@ impl AppState {
         // leaving the screen shows one tab rather than two.
         let parked = self.content == ContentView::Welcome && {
             let tab = self.active_tab();
-            tab.is_untouched_blank(
-                tab.shell.selected_history().is_some(),
-                tab.edited_since_open,
-            )
+            tab.is_untouched_blank(tab.selected_history().is_some(), tab.edited_since_open)
         };
         if parked {
             self.content = ContentView::Tabs;
@@ -5538,8 +5716,13 @@ impl AppState {
         self.history.clear();
         self.touch_navigation();
         for tab in &mut self.tabs {
-            tab.shell.select_history(None);
-            tab.recorded_response = None;
+            tab.presented_run = None;
+            // A snapshot existed only because its entry did; the draft it
+            // replayed stays.
+            if let DocumentOrigin::Snapshot { .. } = tab.origin {
+                tab.origin = DocumentOrigin::new();
+                tab.revert_available = false;
+            }
         }
         self.schedule_session_write(cx);
         cx.notify();
@@ -5551,11 +5734,17 @@ impl AppState {
         self.history.delete(id);
         self.touch_navigation();
         for tab in &mut self.tabs {
-            if tab.shell.selected_history() == Some(id) {
-                tab.shell.select_history(None);
+            if tab.presented_run.is_some_and(|run| run.id() == id) {
+                tab.presented_run = None;
             }
-            if tab.recorded_response == Some(id) {
-                tab.recorded_response = None;
+            // A snapshot existed only because its entry did; the draft it
+            // replayed stays.
+            if matches!(
+                tab.origin,
+                DocumentOrigin::Snapshot { entry, .. } if entry == id
+            ) {
+                tab.origin = DocumentOrigin::new();
+                tab.revert_available = false;
             }
         }
         self.schedule_session_write(cx);
@@ -5623,8 +5812,7 @@ impl AppState {
             self.open_saved_request(source, cx);
             // The open transition clears the history presentation; the clicked
             // entry stays marked as the run being viewed.
-            self.shell_mut().select_history(Some(id));
-            self.active_tab_mut().recorded_response = None;
+            self.active_tab_mut().presented_run = Some(PresentedRun::Selected(id));
             self.show_stored_outcome(&entry, cx);
             self.schedule_session_write(cx);
             cx.notify();
@@ -5641,30 +5829,24 @@ impl AppState {
     fn open_history_replay(&mut self, entry: &HistoryEntry, cx: &mut Context<Self>) {
         let reusable = {
             let tab = self.active_tab();
-            tab.is_untouched_blank(
-                tab.shell.selected_history().is_some(),
-                tab.edited_since_open,
-            )
+            tab.is_untouched_blank(tab.selected_history().is_some(), tab.edited_since_open)
         };
         if !reusable {
             self.flush_edits(cx);
             self.push_blank_tab(cx);
         }
         self.shell_mut().select_collection(None);
-        self.shell_mut().select_request(None);
         {
             let tab = self.active_tab_mut();
-            tab.opened_baseline = None;
-            tab.opened_request = None;
+            tab.origin = DocumentOrigin::snapshot(entry);
+            tab.presented_run = Some(PresentedRun::Selected(entry.id));
             tab.revert_confirmation_open = false;
             tab.revert_available = false;
             tab.edited_since_open = false;
-            tab.recorded_response = None;
             tab.save_state = RequestSaveState::NoTarget;
         }
         self.shell_mut().set_draft(entry.request.replay_spec());
         self.load_editor(cx);
-        self.shell_mut().select_history(Some(entry.id));
         self.show_stored_outcome(entry, cx);
         self.schedule_session_write(cx);
         cx.notify();
@@ -5679,7 +5861,7 @@ impl AppState {
             return;
         };
         let active = index == self.active;
-        let selected = self.tabs[index].shell.selected_request() == Some(spec.id);
+        let selected = self.tabs[index].opened_request() == Some(spec.id);
         // The accent a request-scoped surface shows is resolved from the pair,
         // so a protocol change recolors it just as a method change does.
         let previous = self.tabs[index].shell.draft();
@@ -5899,7 +6081,7 @@ impl AppState {
         let mut drafts = BTreeMap::new();
         if !self.autosave_enabled {
             for index in 0..self.tabs.len() {
-                let Some(id) = self.tabs[index].shell.selected_request() else {
+                let Some(id) = self.tabs[index].opened_request() else {
                     continue;
                 };
                 if !ids.contains(&id) {
@@ -5966,8 +6148,7 @@ impl AppState {
             return;
         }
         let has_target = self
-            .shell()
-            .selected_request()
+            .opened_request()
             .is_some_and(|id| self.workspace.find_request(id).is_some());
         if !has_target {
             self.open_save_picker(cx);
@@ -6194,11 +6375,9 @@ impl AppState {
         let editor = {
             let tab = &mut self.tabs[index];
             tab.shell.select_collection(Some(slug.to_owned()));
-            tab.shell.select_request(Some(draft.id));
-            tab.shell.select_history(None);
             tab.shell.set_draft(draft.clone());
-            tab.opened_baseline = Some(draft.clone());
-            tab.opened_request = Some(draft.id);
+            tab.origin = DocumentOrigin::promote(&draft);
+            tab.presented_run = None;
             tab.save_state = RequestSaveState::Clean;
             // The draft and its restore point are the same version.
             tab.revert_available = false;
@@ -6248,17 +6427,18 @@ impl AppState {
         if !self.active_tab().revert_confirmation_open {
             return;
         }
-        let Some(mut restored) = self.active_tab().opened_baseline.clone() else {
+        let Some((id, mut restored)) = self
+            .active_tab()
+            .origin
+            .saved()
+            .map(|(id, baseline)| (id, baseline.clone()))
+        else {
             self.active_tab_mut().revert_confirmation_open = false;
             cx.notify();
             return;
         };
         self.active_tab_mut().revert_confirmation_open = false;
-        let Some(id) = self.shell_mut().selected_request() else {
-            cx.notify();
-            return;
-        };
-        if restored.id != id || self.workspace.find_request(id).is_none() {
+        if self.workspace.find_request(id).is_none() {
             cx.notify();
             return;
         }
@@ -6408,9 +6588,11 @@ impl AppState {
                 };
                 SessionTab {
                     draft: tab.shell.draft().clone(),
-                    opened_request: tab.opened_request,
-                    selected_history: tab.shell.selected_history(),
-                    recorded_response: tab.recorded_response,
+                    opened_request: tab.opened_request(),
+                    // The one presentation splits back into the two session
+                    // fields on capture, so restore can rebuild each variant.
+                    selected_history: tab.selected_history(),
+                    recorded_response: tab.recorded_run(),
                     blank_number: tab.blank_number,
                     execution,
                 }
@@ -6936,8 +7118,7 @@ impl AppState {
         };
         let mut editors = Vec::new();
         for tab in &mut self.tabs {
-            let shows_request =
-                tab.shell.selected_request() == Some(id) || tab.opened_request == Some(id);
+            let shows_request = tab.opened_request() == Some(id);
             if !shows_request {
                 continue;
             }
@@ -6950,7 +7131,7 @@ impl AppState {
             if let Some(pending) = tab.pending_save.as_mut() {
                 pending.name = name.clone();
             }
-            if let Some(baseline) = tab.opened_baseline.as_mut() {
+            if let Some(baseline) = tab.origin.baseline_mut() {
                 baseline.name = name.clone();
             }
             // A rename changes no restore field: revert keeps the name. The
@@ -7015,11 +7196,8 @@ impl AppState {
         self.tabs
             .iter()
             .filter(|tab| {
-                tab.opened_request.is_some_and(|id| affected.contains(&id))
-                    || tab
-                        .shell
-                        .selected_request()
-                        .is_some_and(|id| affected.contains(&id))
+                tab.opened_request()
+                    .is_some_and(|id| affected.contains(&id))
             })
             .count()
     }
@@ -7080,17 +7258,25 @@ impl AppState {
             .collect();
         let had_affected = !affected.is_empty();
         for index in affected {
+            let saved_missing = self.tabs[index]
+                .opened_request()
+                .is_some_and(|id| self.workspace.find_request(id).is_none());
             let tab = &mut self.tabs[index];
-            tab.shell.select_request(None);
-            tab.opened_request = None;
-            tab.opened_baseline = None;
-            tab.revert_confirmation_open = false;
-            tab.revert_available = false;
-            tab.edited_since_open = false;
-            // A scheduled write still targets the deleted request.
-            tab.edit_generation = tab.edit_generation.wrapping_add(1);
-            tab.pending_save = None;
-            tab.save_state = RequestSaveState::NoTarget;
+            if saved_missing {
+                tab.origin = tab.origin.detached();
+                tab.revert_confirmation_open = false;
+                tab.revert_available = false;
+                tab.edited_since_open = false;
+                // A scheduled write still targets the deleted request.
+                tab.edit_generation = tab.edit_generation.wrapping_add(1);
+                tab.pending_save = None;
+                tab.save_state = RequestSaveState::NoTarget;
+            } else if let DocumentOrigin::Snapshot { source, .. } = &mut tab.origin
+                && source.is_some_and(|id| self.workspace.find_request(id).is_none())
+            {
+                // The entry survives; only the request it names is gone.
+                *source = None;
+            }
         }
         if let Some(slug) = self.shell_mut().selected_collection().map(str::to_owned)
             && self.workspace.collection(&slug).is_none()
@@ -7107,10 +7293,17 @@ impl AppState {
         }
     }
 
-    /// Whether a tab's opened or selected request is no longer in the workspace.
+    /// Whether a tab's saved request or a snapshot's source is no longer in
+    /// the workspace.
     fn tab_target_missing(&self, tab: &RequestTab) -> bool {
         let missing = |id| self.workspace.find_request(id).is_none();
-        tab.opened_request.is_some_and(missing) || tab.shell.selected_request().is_some_and(missing)
+        match &tab.origin {
+            DocumentOrigin::Saved { id, .. } => missing(*id),
+            DocumentOrigin::Snapshot {
+                source: Some(id), ..
+            } => missing(*id),
+            DocumentOrigin::New | DocumentOrigin::Snapshot { source: None, .. } => false,
+        }
     }
 
     /// Drops expansion for folders that no longer exist, so a deleted subtree
@@ -7188,7 +7381,7 @@ impl AppState {
             return;
         }
 
-        let source_request_id = self.shell_mut().selected_request();
+        let source_request_id = self.active_tab().send_source();
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (cancel, cancel_rx) = oneshot::channel();
         let generation = self.active_tab_mut().ws.begin_connect(
@@ -7318,7 +7511,7 @@ impl AppState {
         }
         self.flush_edits(cx);
         // A new run replaces whatever completed response the pane presented.
-        self.active_tab_mut().recorded_response = None;
+        self.active_tab_mut().presented_run = None;
 
         let spec = self.shell().draft().clone();
         let active = self.active_environment.clone();
@@ -7367,10 +7560,8 @@ impl AppState {
         // A retried send takes the marker back from any failure mark at once.
         self.active_tab_mut().failed_flash = None;
 
-        // Read before clearing the history selection: a replay draft has no
-        // saved request, so it records no source.
-        let source_request_id = self.shell_mut().selected_request();
-        self.shell_mut().select_history(None);
+        // A replay draft has no saved request, so it records no source.
+        let source_request_id = self.active_tab().send_source();
         self.active_tab_mut().in_flight = Some(InFlight {
             spec: spec.clone(),
             started: Instant::now(),
@@ -7446,7 +7637,7 @@ impl AppState {
             }
             // The partial body is discarded, not kept as a response.
             self.arm_stream_flush(None);
-            self.tabs[index].recorded_response = None;
+            self.tabs[index].presented_run = None;
             let viewer = self.tabs[index].response.clone();
             viewer.update(cx, |viewer, cx| viewer.clear_streaming(cx));
             tracing::debug!(?request, "request cancelled");
@@ -7772,9 +7963,9 @@ impl AppState {
                         HistoryEntry::completed(flight.started_ms, &flight.spec, &response)
                             .with_source(flight.source_request_id),
                     );
-                    self.tabs[index].recorded_response = Some(recorded);
+                    self.tabs[index].presented_run = Some(PresentedRun::Recorded(recorded));
                 } else {
-                    self.tabs[index].recorded_response = None;
+                    self.tabs[index].presented_run = None;
                 }
                 let headers = response.headers.clone();
                 let cookies = response.cookies.clone();
@@ -7798,7 +7989,7 @@ impl AppState {
                     );
                 }
                 self.tabs[index].shell.cancel_request();
-                self.tabs[index].recorded_response = None;
+                self.tabs[index].presented_run = None;
                 let viewer = self.tabs[index].response.clone();
                 viewer.update(cx, |viewer, cx| viewer.clear_streaming(cx));
             }
@@ -7816,7 +8007,7 @@ impl AppState {
                     );
                 }
                 self.tabs[index].shell.fail_request(message);
-                self.tabs[index].recorded_response = None;
+                self.tabs[index].presented_run = None;
                 // Only a request that actually left the app marks its tab; a
                 // local rejection stays in `reject_request`.
                 self.next_flash_generation = self.next_flash_generation.wrapping_add(1);
@@ -8135,7 +8326,7 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn begin_test_websocket(&mut self) -> u64 {
         let spec = self.shell().draft().clone();
-        let source = self.shell().selected_request();
+        let source = self.active_tab().send_source();
         let (commands, _commands_rx) = mpsc::unbounded_channel();
         let (cancel, _cancel_rx) = oneshot::channel();
         let generation = self.active_tab_mut().ws.begin_connect(
@@ -8198,7 +8389,7 @@ impl AppState {
                 spec: self.tabs[index].shell.draft().clone(),
                 started: Instant::now(),
                 started_ms: unix_millis_now(),
-                source_request_id: self.tabs[index].shell.selected_request(),
+                source_request_id: self.tabs[index].send_source(),
             });
         }
         self.apply_event(HttpEvent::Finished { request, outcome }, cx);
@@ -8236,19 +8427,110 @@ mod tests {
     }
 
     #[test]
-    fn selection_transitions_are_independent() {
-        let mut shell = ShellState::default();
-        let request = RequestId::new();
+    fn origin_transitions_keep_the_baseline_and_the_presentation_independent() {
+        let mut saved = RequestSpec::new("Saved");
+        saved.id = RequestId::new();
 
-        shell.select_collection(Some("demo".into()));
-        shell.select_request(Some(request));
+        let origin = DocumentOrigin::open(&saved);
+        assert_eq!(origin.saved().map(|(id, _)| id), Some(saved.id));
+        assert_eq!(
+            origin.detached(),
+            DocumentOrigin::New,
+            "deleting the request keeps the draft but drops the baseline"
+        );
 
-        assert_eq!(shell.selected_collection(), Some("demo"));
-        assert_eq!(shell.selected_request(), Some(request));
+        let snapshot = DocumentOrigin::snapshot(&HistoryEntry::cancelled(0, 0, &saved));
+        assert_eq!(snapshot.detached(), snapshot, "a snapshot has no baseline");
+    }
 
-        shell.select_request(None);
-        assert_eq!(shell.selected_request(), None);
-        assert_eq!(shell.selected_collection(), Some("demo"));
+    #[gpui::test]
+    async fn origin_projections_cover_every_tab_shape(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let state = cx.update(|cx| cx.new(|cx| AppState::new_with_store(cx, store)));
+        let entry = HistoryEntry::completed(
+            1_700_000_000_000,
+            &RequestSpec::new("Run"),
+            &response(200, "ok"),
+        );
+
+        cx.update(|app| {
+            state.update(app, |state, _| {
+                // A fresh draft is not content.
+                let tab = state.active_tab();
+                assert_eq!(tab.opened_request(), None);
+                assert_eq!(tab.selected_history(), None);
+                assert_eq!(tab.draft_origin(), DraftOrigin::Ordinary);
+                assert_eq!(tab.save_action(), None);
+                assert!(!tab.can_revert());
+                assert_eq!(tab.send_source(), None);
+
+                // A new draft with content offers the destination dialog.
+                let mut draft = RequestSpec::new("Untitled request");
+                draft.url = "https://new.test/".into();
+                let tab = state.active_tab_mut();
+                tab.shell.set_draft(draft);
+                tab.save_state = RequestSaveState::NoTarget;
+                assert_eq!(tab.save_action(), Some(TabSaveAction::SaveAs));
+
+                // A clean saved request has nothing to write but is sendable.
+                let mut saved = RequestSpec::new("Saved");
+                saved.id = RequestId::new();
+                saved.url = "https://saved.test/".into();
+                let tab = state.active_tab_mut();
+                tab.origin = DocumentOrigin::open(&saved);
+                tab.presented_run = None;
+                tab.save_state = RequestSaveState::Clean;
+                assert_eq!(tab.opened_request(), Some(saved.id));
+                assert_eq!(tab.selected_history(), None);
+                assert_eq!(tab.draft_origin(), DraftOrigin::Ordinary);
+                assert_eq!(tab.save_action(), None);
+                assert!(!tab.can_revert());
+                assert_eq!(tab.send_source(), Some(saved.id));
+
+                // An edited saved request offers to save, and a linked run
+                // keeps that origin.
+                tab.save_state = RequestSaveState::Edited;
+                assert_eq!(tab.save_action(), Some(TabSaveAction::Save));
+                tab.presented_run = Some(PresentedRun::Selected(entry.id));
+                assert_eq!(tab.opened_request(), Some(saved.id));
+                assert_eq!(tab.selected_history(), Some(entry.id));
+                assert_eq!(tab.recorded_run(), None);
+                assert_eq!(tab.draft_origin(), DraftOrigin::LinkedHistory);
+                assert_eq!(tab.save_action(), Some(TabSaveAction::Save));
+                assert_eq!(tab.send_source(), Some(saved.id));
+
+                // A snapshot is unsaved, presents its entry, and records no
+                // source in either variant.
+                tab.origin = DocumentOrigin::snapshot(&entry);
+                tab.save_state = RequestSaveState::NoTarget;
+                assert_eq!(tab.opened_request(), None);
+                assert_eq!(tab.selected_history(), Some(entry.id));
+                assert_eq!(tab.draft_origin(), DraftOrigin::UnlinkedHistory);
+                assert_eq!(tab.save_action(), Some(TabSaveAction::SaveAs));
+                assert_eq!(tab.send_source(), None);
+
+                tab.origin = DocumentOrigin::Snapshot {
+                    entry: entry.id,
+                    source: Some(saved.id),
+                };
+                assert_eq!(tab.draft_origin(), DraftOrigin::UnlinkedHistory);
+                assert_eq!(tab.send_source(), None);
+
+                // A run this tab recorded is a completion, not a selection: it
+                // leaves the footer ordinary and the tab still offers save-as.
+                tab.origin = DocumentOrigin::new();
+                tab.presented_run = Some(PresentedRun::Recorded(entry.id));
+                assert_eq!(tab.selected_history(), None);
+                assert_eq!(tab.recorded_run(), Some(entry.id));
+                assert_eq!(tab.draft_origin(), DraftOrigin::Ordinary);
+                assert_eq!(tab.save_action(), Some(TabSaveAction::SaveAs));
+                assert_eq!(tab.send_source(), None);
+            });
+        });
     }
 
     #[gpui::test]
@@ -9734,7 +10016,9 @@ mod tests {
 
         let saved = cx.update(|app| {
             state.update(app, |state, _| {
-                state.shell_mut().select_request(Some(RequestId::new()));
+                let mut baseline = state.shell().draft().clone();
+                baseline.id = RequestId::new();
+                state.active_tab_mut().origin = DocumentOrigin::open(&baseline);
             });
             state
                 .read(app)
@@ -9770,7 +10054,9 @@ mod tests {
             state.update(app, |state, cx| {
                 let id = state.push_test_tab(ShellState::default(), cx);
                 let request = state.tabs[1].shell.draft().id;
-                state.tabs[1].shell.select_request(Some(request));
+                let baseline = state.tabs[1].shell.draft().clone();
+                debug_assert_eq!(baseline.id, request);
+                state.tabs[1].origin = DocumentOrigin::open(&baseline);
                 state.tabs[1].save_state = RequestSaveState::Clean;
                 id
             })
@@ -9864,9 +10150,9 @@ mod tests {
         let (first_selected, first_response, second_selected, second_response) = cx.update(|app| {
             let state = state.read(app);
             (
-                state.tabs[0].shell.selected_history(),
+                state.tabs[0].selected_history(),
                 state.tabs[0].response.read(app).has_response(),
-                state.tabs[1].shell.selected_history(),
+                state.tabs[1].selected_history(),
                 state.tabs[1].response.read(app).has_response(),
             )
         });
@@ -9879,7 +10165,7 @@ mod tests {
             state.update(app, |state, cx| state.activate_tab(1, cx));
         });
         assert_eq!(
-            cx.update(|app| state.read(app).shell().selected_history()),
+            cx.update(|app| state.read(app).selected_history()),
             None,
             "the second tab keeps its own presentation"
         );
@@ -9889,7 +10175,7 @@ mod tests {
             state.update(app, |state, cx| state.activate_tab(0, cx));
         });
         assert_eq!(
-            cx.update(|app| state.read(app).shell().selected_history()),
+            cx.update(|app| state.read(app).selected_history()),
             Some(entry_id),
             "returning to the first tab restores its presentation"
         );
@@ -9982,8 +10268,8 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.tabs.len(), 1, "the blank tab is reused");
             assert_eq!(state.active_tab().id, boot_tab);
-            assert_eq!(state.shell().selected_request(), Some(request.id));
-            assert_eq!(state.active_tab().opened_request, Some(request.id));
+            assert_eq!(state.opened_request(), Some(request.id));
+            assert_eq!(state.active_tab().opened_request(), Some(request.id));
         });
     }
 
@@ -10013,10 +10299,10 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.tabs.len(), 2, "the working tab is not replaced");
             assert_eq!(state.active, 1);
-            assert_eq!(state.tabs[0].shell.selected_request(), Some(first.id));
-            assert_eq!(state.tabs[1].shell.selected_request(), Some(second.id));
-            assert_eq!(state.tabs[0].opened_request, Some(first.id));
-            assert_eq!(state.tabs[1].opened_request, Some(second.id));
+            assert_eq!(state.tabs[0].opened_request(), Some(first.id));
+            assert_eq!(state.tabs[1].opened_request(), Some(second.id));
+            assert_eq!(state.tabs[0].opened_request(), Some(first.id));
+            assert_eq!(state.tabs[1].opened_request(), Some(second.id));
         });
     }
 
@@ -10047,7 +10333,7 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.tabs.len(), 2, "the request is not duplicated");
             assert_eq!(state.active, 0, "its tab becomes active");
-            assert_eq!(state.shell().selected_request(), Some(first.id));
+            assert_eq!(state.opened_request(), Some(first.id));
         });
     }
 
@@ -10080,9 +10366,8 @@ mod tests {
             assert_eq!(state.tabs.len(), 2);
             assert_eq!(state.active, 1);
             let tab = state.active_tab();
-            assert_eq!(tab.opened_request, None);
-            assert_eq!(tab.shell.selected_request(), None);
-            assert_eq!(tab.shell.selected_history(), None);
+            assert_eq!(tab.opened_request(), None);
+            assert_eq!(tab.selected_history(), None);
             assert_eq!(tab.save_state, RequestSaveState::NoTarget);
             assert!(is_default_draft(tab.shell.draft()));
             assert_ne!(
@@ -10091,7 +10376,7 @@ mod tests {
                 "a new tab gets a fresh request identifier"
             );
             assert_eq!(
-                state.tabs[0].shell.selected_request(),
+                state.tabs[0].opened_request(),
                 Some(request.id),
                 "the previously active tab keeps its request"
             );
@@ -10174,7 +10459,7 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.tabs.len(), 1, "one tab is always open");
             assert_eq!(state.active, 0);
-            assert_eq!(state.shell().selected_request(), None);
+            assert_eq!(state.opened_request(), None);
             assert!(is_default_draft(state.shell().draft()));
             assert_eq!(state.save_state(), &RequestSaveState::NoTarget);
             assert_eq!(
@@ -10196,7 +10481,7 @@ mod tests {
                 1,
                 "the parked draft became the request's tab"
             );
-            assert_eq!(state.shell().selected_request(), Some(request.id));
+            assert_eq!(state.opened_request(), Some(request.id));
         });
 
         // Closing it again and taking the new-tab shortcut is still one tab.
@@ -10487,7 +10772,7 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             assert!(!state.save_picker_open(), "confirming closes the dialog");
-            assert_eq!(state.tabs[0].shell.selected_request(), Some(alpha.id));
+            assert_eq!(state.tabs[0].opened_request(), Some(alpha.id));
             assert_eq!(
                 state.tabs[0].shell.selected_collection(),
                 Some(slug.as_str())
@@ -10495,7 +10780,7 @@ mod tests {
             assert_eq!(state.tabs[0].shell.draft().url, alpha.url);
             assert_eq!(state.tabs[0].save_state, RequestSaveState::Clean);
             assert_eq!(
-                state.tabs[1].shell.selected_request(),
+                state.tabs[1].opened_request(),
                 None,
                 "the shown tab is not saved into"
             );
@@ -10533,7 +10818,7 @@ mod tests {
             let state = state.read(app);
             assert!(!state.save_picker_open(), "the orphaned dialog closes");
             assert_eq!(
-                state.tabs[0].shell.selected_request(),
+                state.tabs[0].opened_request(),
                 Some(alpha.id),
                 "the remaining tab is untouched"
             );
@@ -10814,7 +11099,7 @@ mod tests {
     fn begin_test_flight(state: &mut AppState, request: RequestId) {
         assert!(state.shell_mut().begin_request(request));
         let draft = state.shell_mut().draft().clone();
-        let source_request_id = state.shell_mut().selected_request();
+        let source_request_id = state.active_tab().send_source();
         state.active_tab_mut().in_flight = Some(InFlight {
             spec: draft,
             started: Instant::now(),
@@ -11250,9 +11535,9 @@ mod tests {
                 .find(|header| header.key == "X-Trace")
                 .expect("trace row");
             assert!(trace.enabled);
-            assert_eq!(shell.selected_request(), None);
+            assert_eq!(app.opened_request(), None);
             assert_eq!(shell.selected_collection(), None);
-            assert_eq!(app.shell().selected_history(), Some(entry_id));
+            assert_eq!(app.selected_history(), Some(entry_id));
         });
         let viewer = cx.update(|app| state.read(app).response_viewer().clone());
         assert!(cx.update(|app| viewer.read(app).has_tree()));
@@ -13061,7 +13346,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.shell().selected_history(), Some(entry.id));
+            assert_eq!(state.selected_history(), Some(entry.id));
             let presented = crate::views::response_pane::view(state.shell(), Some(&entry), None);
             let crate::views::response_pane::ResponseView::History {
                 outcome:
@@ -13122,7 +13407,7 @@ mod tests {
                 state.set_draft_url("http://127.0.0.1:1/dead");
                 state.select_history(entry_id, cx);
                 assert_eq!(state.shell().draft().url, server.url());
-                assert_eq!(state.shell().selected_history(), Some(entry_id));
+                assert_eq!(state.selected_history(), Some(entry_id));
             });
         });
         let viewer = cx.update(|app| state.read(app).response_viewer().clone());
@@ -13150,7 +13435,7 @@ mod tests {
                 Some(200)
             );
             assert_eq!(
-                state.shell().selected_history(),
+                state.selected_history(),
                 None,
                 "Send clears history display"
             );
@@ -13272,12 +13557,12 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             assert_eq!(
-                state.shell().selected_request(),
+                state.opened_request(),
                 Some(request.id),
                 "the run links back to its saved request"
             );
             assert_eq!(
-                state.shell().selected_history(),
+                state.selected_history(),
                 Some(entry_id),
                 "the entry stays marked in the history list"
             );
@@ -13298,7 +13583,7 @@ mod tests {
                 state.edit_active_draft(edited.clone(), cx);
                 state.save_now(cx);
                 assert!(!state.save_picker_open());
-                assert_eq!(state.shell().selected_request(), Some(request.id));
+                assert_eq!(state.opened_request(), Some(request.id));
             });
         });
         let loaded = store.load().expect("reload");
@@ -13347,11 +13632,11 @@ mod tests {
         let draft_id = cx.update(|app| {
             let state = state.read(app);
             assert_eq!(
-                state.shell().selected_request(),
+                state.opened_request(),
                 None,
                 "a changed request does not link"
             );
-            assert_eq!(state.shell().selected_history(), Some(entry_id));
+            assert_eq!(state.selected_history(), Some(entry_id));
             assert_eq!(state.shell().draft().url, saved.url, "stored fields replay");
             assert_ne!(state.shell().draft().id, request.id);
             state.shell().draft().id
@@ -13417,8 +13702,8 @@ mod tests {
 
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.shell().selected_request(), None);
-            assert_eq!(state.shell().selected_history(), Some(entry_id));
+            assert_eq!(state.opened_request(), None);
+            assert_eq!(state.selected_history(), Some(entry_id));
             assert_eq!(state.shell().draft().url, saved.url);
             assert_ne!(state.shell().draft().id, request.id);
         });
@@ -13457,10 +13742,11 @@ mod tests {
             let state = state.read(app);
             let tab = state.active_tab();
             assert_eq!(
-                tab.opened_request, None,
+                tab.opened_request(),
+                None,
                 "the tab no longer opens a request"
             );
-            assert_eq!(tab.shell.selected_request(), None);
+            assert_eq!(tab.opened_request(), None);
             assert_eq!(tab.save_state, RequestSaveState::NoTarget);
             assert_eq!(
                 tab.shell.draft().name,
@@ -13479,7 +13765,7 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             let tab = state.active_tab();
-            assert_eq!(tab.opened_request, Some(request.id));
+            assert_eq!(tab.opened_request(), Some(request.id));
             assert_eq!(tab.save_state, RequestSaveState::Clean);
             assert_eq!(state.shell().draft().name, "Ping copied");
         });
@@ -13490,6 +13776,153 @@ mod tests {
             .map(|saved| saved.name())
             .collect();
         assert_eq!(names, ["Ping copied"], "the draft was written back");
+    }
+
+    #[gpui::test]
+    async fn promoting_a_snapshot_saves_it_without_touching_its_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let (slug, source) = saved_request(&store, "Source", "https://source.test/");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let history_dir = tempfile::tempdir().expect("history dir");
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                AppState::new_with_store_session_and_history(
+                    cx,
+                    store.clone(),
+                    SessionStore::at(&session_dir.path().join("session.json")),
+                    HistoryStore::at(history_dir.path()),
+                )
+            })
+        });
+
+        let replay_spec = RequestSpec::new("Replayed");
+        let linked = HistoryEntry::completed(1_700_000_000_000, &replay_spec, &response(200, "ok"))
+            .with_source(Some(source.id));
+        let linked_id = linked.id;
+        let other_spec = RequestSpec::new("Other replay");
+        let unlinked =
+            HistoryEntry::completed(1_700_000_001_000, &other_spec, &response(200, "ok"));
+        let unlinked_id = unlinked.id;
+
+        cx.update(|app| {
+            state.update(app, |state, cx| {
+                state.record_test_history(linked);
+                state.record_test_history(unlinked);
+
+                // A snapshot that names a source still replays unsaved.
+                state.select_history(linked_id, cx);
+                assert!(matches!(
+                    state.active_tab().origin,
+                    DocumentOrigin::Snapshot { entry, source: Some(id) }
+                        if entry == linked_id && id == source.id
+                ));
+                assert_eq!(state.active_tab().selected_history(), Some(linked_id));
+
+                assert!(state.save_draft_to(cx, &slug, None, "Promoted linked"));
+                let promoted = state.opened_request().expect("a new saved request");
+                assert_ne!(promoted, source.id, "promotion creates a new request");
+                assert!(matches!(
+                    state.active_tab().origin,
+                    DocumentOrigin::Saved { id, .. } if id == promoted
+                ));
+                assert_eq!(
+                    state.history().entries.len(),
+                    2,
+                    "promotion records nothing"
+                );
+
+                // The snapshot without a source promotes the same way.
+                state.select_history(unlinked_id, cx);
+                assert!(matches!(
+                    state.active_tab().origin,
+                    DocumentOrigin::Snapshot {
+                        entry,
+                        source: None
+                    } if entry == unlinked_id
+                ));
+                assert!(state.save_draft_to(cx, &slug, None, "Promoted unlinked"));
+                let promoted_unlinked = state.opened_request().expect("a new saved request");
+                assert_ne!(promoted_unlinked, promoted);
+                assert!(matches!(
+                    state.active_tab().origin,
+                    DocumentOrigin::Saved { id, .. } if id == promoted_unlinked
+                ));
+                assert_eq!(state.history().entries.len(), 2, "history is left alone");
+            });
+        });
+
+        let loaded = store.load().expect("reload");
+        let source_now = loaded.collections[0]
+            .requests
+            .iter()
+            .find(|request| request.id() == source.id)
+            .expect("the source request still exists");
+        assert_eq!(source_now.name(), "Source");
+        assert_eq!(source_now.url(), "https://source.test/");
+    }
+
+    #[gpui::test]
+    async fn closing_a_tab_keeps_the_saved_request_and_its_history_entry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let (_slug, source) = saved_request(&store, "Saved", "https://saved.test/");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let history_dir = tempfile::tempdir().expect("history dir");
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                AppState::new_with_store_session_and_history(
+                    cx,
+                    store.clone(),
+                    SessionStore::at(&session_dir.path().join("session.json")),
+                    HistoryStore::at(history_dir.path()),
+                )
+            })
+        });
+        let entry = HistoryEntry::completed(1_700_000_000_000, &source, &response(200, "ok"));
+        let entry_id = entry.id;
+
+        cx.update(|app| {
+            state.update(app, |state, cx| {
+                state.record_test_history(entry);
+                state.open_saved_request(source.id, cx);
+                state.select_history(entry_id, cx);
+                assert_eq!(state.opened_request(), Some(source.id));
+                assert_eq!(state.selected_history(), Some(entry_id));
+
+                let tab_id = state.active_tab().id;
+                state.close_tab(tab_id, cx);
+
+                assert!(
+                    state
+                        .history()
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == entry_id),
+                    "closing a tab does not delete its history entry"
+                );
+            });
+        });
+        let loaded = store.load().expect("reload");
+        assert!(
+            loaded.collections[0]
+                .requests
+                .iter()
+                .any(|request| request.id() == source.id),
+            "closing a tab does not delete its saved request"
+        );
     }
 
     #[gpui::test]
@@ -13522,7 +13955,7 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             assert_eq!(
-                state.shell().selected_request(),
+                state.opened_request(),
                 None,
                 "an entry recorded before source linking replays",
             );
@@ -13591,7 +14024,7 @@ mod tests {
         });
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.shell().selected_request(), Some(request.id));
+            assert_eq!(state.opened_request(), Some(request.id));
             assert_eq!(state.shell().draft().name, "Sales API");
         });
     }
@@ -13638,7 +14071,7 @@ mod tests {
         cx.update(|app| {
             let state = state.read(app);
             assert_eq!(
-                state.shell().selected_request(),
+                state.opened_request(),
                 None,
                 "an unresolvable request does not link",
             );
@@ -13980,7 +14413,7 @@ mod tests {
                 assert_eq!(state.shell().selected_collection(), Some("billing"));
                 assert!(state.collection_expanded("billing"));
                 assert!(!state.collection_expanded("demo"));
-                assert_eq!(state.shell().selected_request(), Some(request.id));
+                assert_eq!(state.opened_request(), Some(request.id));
             });
         });
 
@@ -14188,10 +14621,7 @@ mod tests {
 
         cx.update(|app| {
             state.update(app, |state, cx| {
-                state
-                    .shell_mut()
-                    .select_collection(Some(collection.id.clone()));
-                state.shell_mut().select_request(Some(request.id));
+                state.select_request(cx, Some(request.id));
                 state.request_delete(
                     DeleteTarget::Request {
                         slug: collection.id.clone(),
@@ -14219,7 +14649,7 @@ mod tests {
                     cx,
                 );
                 assert!(state.confirm_delete(cx));
-                assert_eq!(state.shell().selected_request(), None);
+                assert_eq!(state.opened_request(), None);
                 assert_eq!(
                     state.shell().draft().name,
                     "Untitled request",
@@ -14299,8 +14729,7 @@ mod tests {
         };
         cx.update(|app| {
             state.update(app, |state, cx| {
-                state.shell_mut().select_collection(Some(slug.clone()));
-                state.shell_mut().select_request(Some(request.id));
+                state.select_request(cx, Some(request.id));
                 state.request_delete(delete_target.clone(), cx);
                 assert_eq!(state.workspace().delete_target, Some(delete_target.clone()));
                 assert_eq!(
@@ -14319,7 +14748,7 @@ mod tests {
             let workspace = state.read(app).workspace();
             assert!(workspace.collection(&slug).unwrap().folder(auth).is_none());
             assert!(workspace.collection(&slug).unwrap().requests.is_empty());
-            assert_eq!(state.read(app).shell().selected_request(), None);
+            assert_eq!(state.read(app).opened_request(), None);
         });
         assert!(
             !store
@@ -14476,7 +14905,7 @@ mod tests {
                 shell.selected_collection().map(str::to_owned),
                 Some(collection.id.clone())
             );
-            assert_eq!(shell.selected_request(), Some(request.id));
+            assert_eq!(state.read(app).opened_request(), Some(request.id));
             assert_eq!(shell.draft().id, request.id);
             assert_eq!(shell.draft().name, "Saved request");
             assert!(shell.draft().url.is_empty());
@@ -14503,7 +14932,7 @@ mod tests {
                     cx,
                 );
                 assert!(state.confirm_delete(cx));
-                assert_eq!(state.shell().selected_request(), None);
+                assert_eq!(state.opened_request(), None);
                 assert_eq!(
                     state.shell().draft().name,
                     "Saved request",
@@ -14674,14 +15103,14 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.tabs.len(), 2, "the replay opens beside the request");
             assert_eq!(state.active, 1);
-            assert_eq!(state.tabs[0].shell.selected_request(), Some(request.id));
-            assert_eq!(state.tabs[0].shell.selected_history(), None);
+            assert_eq!(state.tabs[0].opened_request(), Some(request.id));
+            assert_eq!(state.tabs[0].selected_history(), None);
             assert_eq!(
                 state.tabs[0].shell.draft().url,
                 "https://example.test/saved"
             );
-            assert_eq!(state.tabs[1].shell.selected_request(), None);
-            assert_eq!(state.tabs[1].shell.selected_history(), Some(id));
+            assert_eq!(state.tabs[1].opened_request(), None);
+            assert_eq!(state.tabs[1].selected_history(), Some(id));
             assert_eq!(
                 state.tabs[1].shell.draft().url,
                 "https://example.test/replay"
@@ -15043,7 +15472,7 @@ mod tests {
                 !state.save_picker_open(),
                 "choosing a destination closes it"
             );
-            assert_eq!(state.shell().selected_request(), Some(draft.id));
+            assert_eq!(state.opened_request(), Some(draft.id));
             assert_eq!(state.save_state(), &RequestSaveState::Clean);
             assert!(state.collection_expanded(&slug));
             assert!(state.folder_expanded(auth));
@@ -15116,7 +15545,7 @@ mod tests {
             };
             assert_eq!(status_sentence, &reason);
             assert_eq!(state.shell().draft().url, "https://example.test/probe");
-            assert_eq!(state.shell().selected_request(), None);
+            assert_eq!(state.opened_request(), None);
         });
         assert!(
             !store.request_file(&slug, draft.id).unwrap().exists(),
@@ -15268,7 +15697,7 @@ mod tests {
 
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.shell().selected_request(), None);
+            assert_eq!(state.opened_request(), None);
             assert_eq!(state.shell().execution(), &ExecutionState::Idle);
             assert_eq!(state.save_state(), &RequestSaveState::NoTarget);
             assert_eq!(state.shell().draft().name, "Untitled request");
@@ -15312,7 +15741,13 @@ mod tests {
 
         // Selecting captures the opened version, but nothing has changed yet.
         assert!(
-            cx.update(|app| state.read(app).active_tab().opened_baseline.as_ref() == Some(&request)),
+            cx.update(|app| state
+                .read(app)
+                .active_tab()
+                .origin
+                .saved()
+                .map(|(_, baseline)| baseline)
+                == Some(&request)),
             "selecting captures the version that was opened"
         );
         assert!(!cx.update(|app| state.read(app).can_revert()));
@@ -15367,7 +15802,7 @@ mod tests {
 
         // Clearing the selection drops both the restore point and the action.
         cx.update(|app| state.update(app, |state, cx| state.select_request(cx, None)));
-        assert!(cx.update(|app| state.read(app).active_tab().opened_baseline.is_none()));
+        assert!(cx.update(|app| state.read(app).active_tab().origin.saved().is_none()));
         assert!(!cx.update(|app| state.read(app).can_revert()));
     }
 
@@ -16149,12 +16584,12 @@ mod tests {
 
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.shell().selected_request(), Some(copy.id));
+            assert_eq!(state.opened_request(), Some(copy.id));
             assert_eq!(state.tabs.len(), 3);
             let source_tab = state
                 .tabs
                 .iter()
-                .find(|tab| tab.opened_request == Some(source_id))
+                .find(|tab| tab.opened_request() == Some(source_id))
                 .expect("source tab");
             assert_eq!(source_tab.shell.draft().url, edited_url);
             assert_eq!(source_tab.pending_save, None);
@@ -16162,7 +16597,7 @@ mod tests {
             let other_tab = state
                 .tabs
                 .iter()
-                .find(|tab| tab.opened_request == Some(other.id))
+                .find(|tab| tab.opened_request() == Some(other.id))
                 .expect("other tab");
             assert_eq!(
                 other_tab.shell.draft().url,
@@ -16248,7 +16683,7 @@ mod tests {
             let source_tab = state
                 .tabs
                 .iter()
-                .find(|tab| tab.opened_request == Some(source.id))
+                .find(|tab| tab.opened_request() == Some(source.id))
                 .expect("source tab");
             assert_eq!(
                 source_tab.shell.draft().url,
@@ -16256,7 +16691,7 @@ mod tests {
                 "the source tab keeps the live draft"
             );
             assert_eq!(source_tab.pending_save, None);
-            assert_eq!(state.shell().selected_request(), Some(copy.id));
+            assert_eq!(state.opened_request(), Some(copy.id));
         });
     }
 
@@ -16325,7 +16760,7 @@ mod tests {
                 "the copied folder is expanded"
             );
             assert_eq!(
-                state.shell().selected_request(),
+                state.opened_request(),
                 Some(ping.id),
                 "folder duplication leaves the selected request alone"
             );
@@ -16413,7 +16848,7 @@ mod tests {
                     folders_before
                 );
                 assert_eq!(state.tabs.len(), tabs_before);
-                assert_eq!(state.shell().selected_request(), Some(source.id));
+                assert_eq!(state.opened_request(), Some(source.id));
                 assert_eq!(state.reveal(), None);
                 assert!(state.workspace.issues.is_empty());
             });
@@ -16462,7 +16897,7 @@ mod tests {
                     "a failed copy adds no row"
                 );
                 assert_eq!(state.tabs.len(), tabs_before, "a failed copy opens no tab");
-                assert_eq!(state.shell().selected_request(), Some(source.id));
+                assert_eq!(state.opened_request(), Some(source.id));
                 assert_eq!(state.reveal(), None);
                 assert!(matches!(state.workspace.save_status, SaveStatus::Failed(_)));
                 assert!(state.workspace.needs_resync);
@@ -16626,8 +17061,8 @@ mod tests {
         state.apply_synthetic_event(request, Ok(response(200, "ok")), cx);
         state
             .active_tab()
-            .recorded_response
-            .expect("a completed send records its history entry")
+            .recorded_run()
+            .expect("a completed send presents its history entry")
     }
 
     #[gpui::test]
@@ -16648,10 +17083,13 @@ mod tests {
                 let first = complete_active_send(state, cx, "https://first.test/");
 
                 assert_ne!(first, second, "each run gets its own entry");
-                assert_eq!(state.tabs[0].recorded_response, Some(first));
                 assert_eq!(
-                    state.tabs[1].recorded_response,
-                    Some(second),
+                    state.tabs[0].presented_run,
+                    Some(PresentedRun::Recorded(first))
+                );
+                assert_eq!(
+                    state.tabs[1].presented_run,
+                    Some(PresentedRun::Recorded(second)),
                     "the other tab's reference is untouched"
                 );
                 let entries = &state.history().entries;
@@ -16688,12 +17126,15 @@ mod tests {
         cx.update(|app| {
             state.update(app, |state, cx| {
                 let recorded = complete_active_send(state, cx, "https://old.test/");
-                assert_eq!(state.active_tab().recorded_response, Some(recorded));
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Recorded(recorded))
+                );
 
                 state.set_draft_url("http://127.0.0.1:1/");
                 state.send(cx);
 
-                assert_eq!(state.active_tab().recorded_response, None);
+                assert_eq!(state.active_tab().presented_run, None);
                 assert!(matches!(
                     state.shell().execution(),
                     ExecutionState::InFlight { .. }
@@ -16718,23 +17159,29 @@ mod tests {
         cx.update(|app| {
             state.update(app, |state, cx| {
                 let recorded = complete_active_send(state, cx, "https://old.test/");
-                assert_eq!(state.active_tab().recorded_response, Some(recorded));
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Recorded(recorded))
+                );
                 state.select_request(cx, None);
                 assert_eq!(
-                    state.active_tab().recorded_response,
+                    state.active_tab().presented_run,
                     None,
                     "a blank draft replaces the response"
                 );
 
                 let recorded = complete_active_send(state, cx, "https://again.test/");
-                assert_eq!(state.active_tab().recorded_response, Some(recorded));
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Recorded(recorded))
+                );
                 state.open_saved_request(saved.id, cx);
                 assert_eq!(
-                    state.active_tab().recorded_response,
+                    state.active_tab().presented_run,
                     None,
                     "a saved request replaces the response"
                 );
-                assert_eq!(state.shell().selected_request(), Some(saved.id));
+                assert_eq!(state.opened_request(), Some(saved.id));
             });
         });
     }
@@ -16759,8 +17206,104 @@ mod tests {
 
                 state.select_history(id, cx);
 
-                assert_eq!(state.active_tab().recorded_response, None);
-                assert_eq!(state.shell().selected_history(), Some(id));
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Selected(id)),
+                    "a selected entry replaces the tab's own recorded run"
+                );
+                assert_eq!(state.selected_history(), Some(id));
+                assert_eq!(state.recorded_run(), None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn a_completed_send_presents_the_live_completion(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let state = cx.update(|cx| cx.new(|cx| AppState::new_with_store(cx, store)));
+
+        cx.update(|app| {
+            state.update(app, |state, cx| {
+                let recorded = complete_active_send(state, cx, "https://live.test/");
+
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Recorded(recorded))
+                );
+                assert_eq!(
+                    state.selected_history(),
+                    None,
+                    "the tab did not select a stored run"
+                );
+                assert_eq!(state.recorded_run(), Some(recorded));
+                let view = crate::views::response_pane::view(
+                    state.shell(),
+                    state.selected_history_entry(),
+                    None,
+                );
+                assert!(
+                    matches!(
+                        view,
+                        crate::views::response_pane::ResponseView::Completed { .. }
+                    ),
+                    "a completed send shows the live readout, not the history banner"
+                );
+
+                let document = state.capture_session();
+                assert_eq!(document.tabs[0].recorded_response, Some(recorded));
+                assert_eq!(document.tabs[0].selected_history, None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn selecting_the_run_a_send_recorded_presents_it_as_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let state = cx.update(|cx| cx.new(|cx| AppState::new_with_store(cx, store)));
+
+        cx.update(|app| {
+            state.update(app, |state, cx| {
+                let recorded = complete_active_send(state, cx, "https://stored.test/");
+                state.select_history(recorded, cx);
+
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Selected(recorded))
+                );
+                assert_eq!(state.selected_history(), Some(recorded));
+                assert_eq!(
+                    state.recorded_run(),
+                    None,
+                    "selecting the run turns it into a stored presentation"
+                );
+                let view = crate::views::response_pane::view(
+                    state.shell(),
+                    state.selected_history_entry(),
+                    None,
+                );
+                assert!(
+                    matches!(
+                        view,
+                        crate::views::response_pane::ResponseView::History { id, .. }
+                            if id == recorded
+                    ),
+                    "a selected run shows its history banner"
+                );
+
+                let document = state.capture_session();
+                let active = &document.tabs[document.active_tab];
+                assert_eq!(active.selected_history, Some(recorded));
+                assert_eq!(active.recorded_response, None);
             });
         });
     }
@@ -16781,16 +17324,19 @@ mod tests {
                 let recorded = complete_active_send(state, cx, "https://first.test/");
                 state.delete_history(recorded, cx);
                 assert_eq!(
-                    state.active_tab().recorded_response,
+                    state.active_tab().presented_run,
                     None,
                     "deleting the backing entry clears the reference"
                 );
 
                 let recorded = complete_active_send(state, cx, "https://second.test/");
-                assert_eq!(state.active_tab().recorded_response, Some(recorded));
+                assert_eq!(
+                    state.active_tab().presented_run,
+                    Some(PresentedRun::Recorded(recorded))
+                );
                 state.clear_history(cx);
                 assert_eq!(
-                    state.active_tab().recorded_response,
+                    state.active_tab().presented_run,
                     None,
                     "clearing history clears every reference"
                 );
@@ -16812,7 +17358,7 @@ mod tests {
                 complete_active_send(state, cx, "https://old.test/");
                 state.open_new_request(cx);
 
-                assert_eq!(state.active_tab().recorded_response, None);
+                assert_eq!(state.active_tab().presented_run, None);
                 assert!(matches!(state.shell().execution(), ExecutionState::Idle));
             });
         });
@@ -16841,16 +17387,16 @@ mod tests {
         draft.folder_id = Some(FolderId::new());
         let opened = RequestId::new();
         let selected = HistoryId::new();
-        let recorded = HistoryId::new();
 
         cx.update(|app| {
             state.update(app, |state, cx| {
                 state.shell_mut().set_draft(draft.clone());
                 {
+                    let mut baseline = draft.clone();
+                    baseline.id = opened;
                     let tab = &mut state.tabs[0];
-                    tab.opened_request = Some(opened);
-                    tab.shell.select_history(Some(selected));
-                    tab.recorded_response = Some(recorded);
+                    tab.origin = DocumentOrigin::open(&baseline);
+                    tab.presented_run = Some(PresentedRun::Selected(selected));
                     tab.blank_number = 4;
                     tab.shell.execution = ExecutionState::Completed {
                         request: draft.id,
@@ -16881,7 +17427,10 @@ mod tests {
                 assert_eq!(first.draft, draft, "the draft is recorded verbatim");
                 assert_eq!(first.opened_request, Some(opened));
                 assert_eq!(first.selected_history, Some(selected));
-                assert_eq!(first.recorded_response, Some(recorded));
+                assert_eq!(
+                    first.recorded_response, None,
+                    "the one presented run is captured once"
+                );
                 assert_eq!(first.blank_number, 4);
                 assert_eq!(
                     first.execution,
@@ -17005,6 +17554,7 @@ mod tests {
             document.tabs[0].recorded_response.is_some(),
             "a completed run is referenced by its history entry"
         );
+        assert_eq!(document.tabs[0].selected_history, None);
         assert_eq!(document.tabs[0].execution, SessionExecution::Idle);
 
         // Saving an untargeted draft rebinds it to a request.
@@ -17033,7 +17583,7 @@ mod tests {
                 let id = entry.id;
                 state.record_test_history(entry);
                 state.select_history(id, cx);
-                assert_eq!(state.shell().selected_history(), Some(id));
+                assert_eq!(state.selected_history(), Some(id));
             });
         });
         flush_session(cx);
@@ -17300,7 +17850,7 @@ mod tests {
     /// generation. Test events are then applied through the real dispatcher.
     fn begin_test_ws(state: &mut AppState) -> u64 {
         let spec = state.shell().draft().clone();
-        let source = state.shell().selected_request();
+        let source = state.opened_request();
         let (commands, _commands_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel, _cancel_rx) = tokio::sync::oneshot::channel();
         state.active_tab_mut().ws.begin_connect(
@@ -17328,7 +17878,7 @@ mod tests {
         state: &mut AppState,
     ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<WsCommand>) {
         let spec = state.shell().draft().clone();
-        let source = state.shell().selected_request();
+        let source = state.opened_request();
         let (commands, commands_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel, _cancel_rx) = tokio::sync::oneshot::channel();
         let generation = state.active_tab_mut().ws.begin_connect(
@@ -18240,12 +18790,12 @@ mod tests {
             assert_eq!(state.active_tab_position().1, 2);
 
             let restored = &state.tabs[0];
-            assert_eq!(restored.opened_request, Some(saved.id));
+            assert_eq!(restored.opened_request(), Some(saved.id));
             assert_eq!(
                 restored
-                    .opened_baseline
-                    .as_ref()
-                    .map(|spec| spec.url.as_str()),
+                    .origin
+                    .saved()
+                    .map(|(_, baseline)| baseline.url.as_str()),
                 Some("https://saved.test/a")
             );
             assert_eq!(restored.shell.selected_collection(), Some(slug.as_str()));
@@ -18254,14 +18804,14 @@ mod tests {
             assert_eq!(restored.shell.draft(), &saved);
 
             let detached = &state.tabs[1];
-            assert_eq!(detached.opened_request, None);
-            assert_eq!(detached.opened_baseline, None);
+            assert_eq!(detached.opened_request(), None);
+            assert_eq!(detached.origin.saved(), None);
             assert_eq!(detached.save_state, RequestSaveState::NoTarget);
             assert!(detached.edited_since_open);
             assert_eq!(detached.shell.draft(), &gone_draft);
 
             let unsaved_tab = &state.tabs[2];
-            assert_eq!(unsaved_tab.opened_request, None);
+            assert_eq!(unsaved_tab.opened_request(), None);
             assert_eq!(unsaved_tab.save_state, RequestSaveState::NoTarget);
             assert!(unsaved_tab.edited_since_open);
             assert_eq!(unsaved_tab.shell.draft(), &unsaved);
@@ -18281,7 +18831,7 @@ mod tests {
             state.update(app, |state, cx| {
                 state.activate_tab(1, cx);
                 assert!(state.save_draft_to(cx, &slug, None, "Recovered"));
-                assert_eq!(state.shell().selected_request(), Some(gone.id));
+                assert_eq!(state.opened_request(), Some(gone.id));
             });
         });
         let recovered = store.load().expect("reload").collections;
@@ -18455,11 +19005,16 @@ mod tests {
             assert!(state.tabs.iter().all(|tab| tab.in_flight.is_none()));
 
             let selected = &state.tabs[0];
-            assert_eq!(selected.shell.selected_history(), Some(selected_entry.id));
+            assert_eq!(selected.selected_history(), Some(selected_entry.id));
+            assert_eq!(selected.recorded_run(), None);
             assert_eq!(selected.shell.draft(), &selected_spec);
 
             let completed = &state.tabs[1];
-            assert_eq!(completed.recorded_response, Some(completed_entry.id));
+            assert_eq!(
+                completed.presented_run,
+                Some(PresentedRun::Recorded(completed_entry.id))
+            );
+            assert_eq!(completed.selected_history(), None);
             match completed.shell.execution() {
                 ExecutionState::Completed { response, .. } => {
                     assert_eq!(response.status, 201);
@@ -18469,6 +19024,10 @@ mod tests {
             }
 
             let limited = &state.tabs[2];
+            assert_eq!(
+                limited.presented_run,
+                Some(PresentedRun::Recorded(limited_entry.id))
+            );
             match limited.shell.execution() {
                 ExecutionState::Completed { response, .. } => {
                     assert_eq!(response.status, 200);
@@ -18479,7 +19038,7 @@ mod tests {
             }
 
             let missing = &state.tabs[3];
-            assert_eq!(missing.recorded_response, None);
+            assert_eq!(missing.presented_run, None);
             assert!(matches!(missing.shell.execution(), ExecutionState::Idle));
 
             match state.tabs[4].shell.execution() {
@@ -18547,6 +19106,94 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn restore_clears_deleted_snapshot_sources_and_entries(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use posthaste_core::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap workspace");
+        let (_slug, source) = saved_request(&store, "Source", "https://source.test/");
+        let history = HistoryStore::at(dir.path().join("history"));
+        let replay_spec = RequestSpec::new("Replay");
+        let linked = HistoryEntry::completed(1_700_000_000_000, &replay_spec, &response(200, "ok"))
+            .with_source(Some(source.id));
+        let linked_id = linked.id;
+        let dangling_spec = RequestSpec::new("Dangling replay");
+        let dangling =
+            HistoryEntry::completed(1_700_000_001_000, &dangling_spec, &response(200, "ok"))
+                .with_source(Some(RequestId::new()));
+        let dangling_id = dangling.id;
+        history.append(&linked).expect("append linked history");
+        history.append(&dangling).expect("append dangling history");
+
+        let kept = RequestSpec::new("Kept replay draft");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let path = session_dir.path().join("workspace-test.json");
+        let mut linked_tab = session_tab(replay_spec.clone());
+        linked_tab.selected_history = Some(linked_id);
+        let mut dangling_tab = session_tab(dangling_spec.clone());
+        dangling_tab.selected_history = Some(dangling_id);
+        let mut missing_tab = session_tab(kept.clone());
+        missing_tab.selected_history = Some(HistoryId::new());
+        write_session(
+            &path,
+            &SessionDocument {
+                schema_version: SCHEMA_VERSION,
+                workspace_root: String::new(),
+                active_tab: 0,
+                active_environment: None,
+                tabs: vec![linked_tab, dangling_tab, missing_tab],
+            },
+        );
+
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                AppState::new_with_store_session_and_history(
+                    cx,
+                    store,
+                    SessionStore::at(&path),
+                    history,
+                )
+            })
+        });
+        cx.update(|app| {
+            let state = state.read(app);
+            assert!(matches!(
+                state.tabs[0].origin,
+                DocumentOrigin::Snapshot { entry, source: Some(id) }
+                    if entry == linked_id && id == source.id
+            ));
+            assert_eq!(
+                state.tabs[0].presented_run,
+                Some(PresentedRun::Selected(linked_id))
+            );
+            assert_eq!(state.tabs[0].shell.draft(), &replay_spec);
+
+            assert!(matches!(
+                state.tabs[1].origin,
+                DocumentOrigin::Snapshot {
+                    entry,
+                    source: None
+                } if entry == dangling_id
+            ));
+            assert_eq!(
+                state.tabs[1].presented_run,
+                Some(PresentedRun::Selected(dangling_id))
+            );
+            assert_eq!(state.tabs[1].shell.draft(), &dangling_spec);
+
+            assert_eq!(state.tabs[2].origin, DocumentOrigin::New);
+            assert_eq!(state.tabs[2].presented_run, None);
+            assert_eq!(
+                state.tabs[2].shell.draft(),
+                &kept,
+                "a gone entry keeps the recorded draft"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn a_restored_edited_draft_is_protected_and_resolves_through_the_existing_paths(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -18581,7 +19228,7 @@ mod tests {
         });
         cx.update(|app| {
             let state = state.read(app);
-            assert_eq!(state.tabs[0].opened_request, Some(saved.id));
+            assert_eq!(state.tabs[0].opened_request(), Some(saved.id));
             assert_eq!(state.tabs[0].save_state, RequestSaveState::Edited);
             assert!(state.tabs[0].edited_since_open);
             assert_eq!(state.tabs[0].shell.draft().url, "https://saved.test/edited");
@@ -18702,14 +19349,18 @@ mod tests {
             assert_eq!(state.active_tab_position().1, 2, "the active tab survives");
 
             let attached = &state.tabs[0];
-            assert_eq!(attached.opened_request, Some(saved.id));
-            assert_eq!(attached.shell.selected_request(), Some(saved.id));
+            assert_eq!(attached.opened_request(), Some(saved.id));
+            assert!(matches!(
+                attached.origin,
+                DocumentOrigin::Saved { id, .. } if id == saved.id
+            ));
             assert_eq!(attached.shell.selected_collection(), Some(slug.as_str()));
             assert_eq!(attached.shell.draft(), &saved);
             assert_eq!(attached.save_state, RequestSaveState::Clean);
 
             let draft = &state.tabs[1];
-            assert_eq!(draft.opened_request, None);
+            assert_eq!(draft.opened_request(), None);
+            assert_eq!(draft.origin, DocumentOrigin::New);
             assert_eq!(draft.save_state, RequestSaveState::NoTarget);
             assert_eq!(draft.shell.draft(), &sensitive);
             assert_eq!(
@@ -18726,7 +19377,14 @@ mod tests {
             assert_eq!(draft.shell.draft().auth, sensitive.auth);
 
             let replay = &state.tabs[2];
-            assert_eq!(replay.shell.selected_history(), Some(entry_id));
+            assert_eq!(replay.selected_history(), Some(entry_id));
+            assert!(matches!(
+                replay.origin,
+                DocumentOrigin::Snapshot {
+                    entry,
+                    source: None
+                } if entry == entry_id
+            ));
             assert_eq!(replay.shell.draft().name, replayed_name);
             assert_eq!(replay.shell.draft().url, replayed_url);
             assert_eq!(replay.shell.draft().method, replayed_method);

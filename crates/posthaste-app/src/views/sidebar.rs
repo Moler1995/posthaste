@@ -81,7 +81,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     let selected_slug = shell.selected_collection().map(str::to_owned);
     let active_environment = app.active_environment().map(str::to_owned);
 
-    let selected_request = shell.selected_request();
+    let selected_request = app.opened_request();
     let save_state = app.save_state();
     // A delete that removes a request open in a tab states that consequence on
     // its confirmation. The count comes from the same tab links the delete
@@ -970,7 +970,7 @@ fn history_list(state: Entity<AppState>, app: &AppState, rows: &[NavHistoryRow])
                 state.clone(),
                 entry,
                 row.linked_name.as_deref(),
-                app.shell().selected_history() == Some(entry.id),
+                app.selected_history() == Some(entry.id),
             ))
         }));
     }

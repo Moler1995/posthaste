@@ -1725,7 +1725,7 @@ mod tests {
             Some(collection.id.clone())
         );
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(request.id)
         );
         assert!(
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(cx.update(|_, app| state.read(app).collection_expanded(&beta.id)));
         click_row(cx, beta_request_selector);
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(beta_request.id)
         );
         assert!(
@@ -2526,7 +2526,7 @@ mod tests {
 
         cx.update(|_, app| {
             let app = state.read(app);
-            assert_eq!(app.shell().selected_history(), Some(entry_id));
+            assert_eq!(app.selected_history(), Some(entry_id));
             assert_eq!(app.shell().draft().url, "http://example.test/items");
             assert_eq!(app.shell().draft().method, HttpMethod::Post);
         });
@@ -2552,7 +2552,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert!(app.history().entries.is_empty());
-            assert_eq!(app.shell().selected_history(), None);
+            assert_eq!(app.selected_history(), None);
         });
         assert!(cx.debug_bounds("history-empty").is_some());
         assert!(
@@ -2632,7 +2632,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![kept_id]
             );
-            assert_eq!(app.shell().selected_history(), Some(kept_id));
+            assert_eq!(app.selected_history(), Some(kept_id));
             assert!(history.error.is_none());
             let store = history.store.as_ref().expect("store");
             assert!(!store.entry_file(removed_id).exists());
@@ -2644,7 +2644,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert!(app.history().entries.is_empty());
-            assert_eq!(app.shell().selected_history(), None);
+            assert_eq!(app.selected_history(), None);
         });
         assert!(cx.debug_bounds("history-empty").is_some());
     }
@@ -2825,7 +2825,7 @@ mod tests {
         cx.update(|_, app| {
             let state = state.read(app);
             assert!(!state.save_picker_open(), "Save closes the dialog");
-            assert_eq!(state.shell().selected_request(), Some(draft_id));
+            assert_eq!(state.opened_request(), Some(draft_id));
             assert_eq!(state.save_state(), &RequestSaveState::Clean);
             assert_eq!(state.shell().draft().url, "https://example.test/probe");
         });
@@ -3038,6 +3038,11 @@ mod tests {
         click(cx, "send-button");
         wait_for(&state, cx, |shell| shell.current_response().is_some());
         redraw(cx);
+        assert!(
+            cx.debug_bounds("response-history-banner").is_none(),
+            "a completed send keeps the live readout, not the history banner"
+        );
+        assert!(cx.debug_bounds("response-completed").is_some());
 
         let entry_id = cx.update(|_, app| {
             let history = state.read(app).history();
@@ -3055,7 +3060,7 @@ mod tests {
             let state = state.read(app);
             assert_eq!(state.shell().draft().url, server.url());
             assert_eq!(state.shell().selected_collection(), None);
-            assert_eq!(state.shell().selected_request(), None);
+            assert_eq!(state.opened_request(), None);
         });
         assert!(cx.debug_bounds("response-history-banner").is_some());
         assert!(cx.debug_bounds("response-completed").is_some());
@@ -3083,7 +3088,7 @@ mod tests {
         click_row(cx, leaked(format!("collection-row-{}", collection.id)));
         click_row(cx, leaked(format!("request-row-{}", request.id)));
         cx.update(|_, app| {
-            assert_eq!(state.read(app).shell().selected_request(), Some(request.id));
+            assert_eq!(state.read(app).opened_request(), Some(request.id));
             assert_eq!(state.read(app).shell().draft().name, "Ping");
         });
     }
@@ -4539,7 +4544,7 @@ mod tests {
             .expect("first request");
         assert_eq!(saved_first.url(), "https://example.test/flushed");
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(second.id)
         );
     }
@@ -5115,7 +5120,7 @@ mod tests {
         cx.update(|_, app| state.update(app, |state, cx| state.select_history(linked_id, cx)));
         cx.update(|_, app| {
             assert_eq!(
-                state.read(app).shell().selected_request(),
+                state.read(app).opened_request(),
                 Some(request.id),
                 "the recorded run links to its request"
             );
@@ -9148,7 +9153,7 @@ mod tests {
         let nested_request = request_named(&state, cx, &slug, "New Request");
         assert_eq!(nested_request.folder_id, Some(auth.id));
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(nested_request.id)
         );
         assert_eq!(
@@ -9182,7 +9187,7 @@ mod tests {
         });
         assert_ne!(root_request.id, nested_request.id);
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(root_request.id)
         );
     }
@@ -9364,7 +9369,7 @@ mod tests {
         let moved = request_named(&state, cx, &slug, "Login");
         assert_eq!(moved.folder_id, Some(auth.id));
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(login.id),
             "a move keeps the selected request"
         );
@@ -10058,7 +10063,7 @@ mod tests {
                 .is_some()
         }));
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(inside.id)
         );
 
@@ -10088,10 +10093,7 @@ mod tests {
                 .request(&slug, inside.id)
                 .is_none()
         }));
-        assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
-            None
-        );
+        assert_eq!(cx.update(|_, app| state.read(app).opened_request()), None);
         assert!(
             !cx.update(|_, app| state.read(app).folder_expanded(mixed.id)),
             "deleting a folder prunes its expansion state"
@@ -10886,7 +10888,7 @@ mod tests {
         let (_dir, view, cx, _store, collection, _request) = seeded_shell(cx, "Demo", "Ping");
         let state = shell_state(&view, cx);
         let slug = collection.id.clone();
-        let selected_before = cx.update(|_, app| state.read(app).shell().selected_request());
+        let selected_before = cx.update(|_, app| state.read(app).opened_request());
 
         right_click(cx, leaked(format!("collection-row-{slug}")));
 
@@ -10910,7 +10912,7 @@ mod tests {
                 "right-clicking a collection does not expand it"
             );
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 selected_before,
                 "right-clicking a collection does not select a request"
             );
@@ -10936,7 +10938,7 @@ mod tests {
         expand_tree(&state, cx, &slug, &[auth.id]);
         click_row(cx, leaked(format!("request-row-{}", login.id)));
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(login.id)
         );
 
@@ -10957,7 +10959,7 @@ mod tests {
                 "right-clicking a folder leaves its branch open"
             );
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 Some(login.id),
                 "right-clicking a folder leaves the selected request alone"
             );
@@ -10989,7 +10991,7 @@ mod tests {
             (app.active_tab_position().0, app.tab_summaries().len())
         });
         assert_eq!(
-            cx.update(|_, app| state.read(app).shell().selected_request()),
+            cx.update(|_, app| state.read(app).opened_request()),
             Some(login.id)
         );
 
@@ -11006,7 +11008,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 Some(login.id),
                 "right-clicking a request does not select it"
             );
@@ -11042,7 +11044,7 @@ mod tests {
                 }),
                 "the menu action applies to the right-clicked request"
             );
-            assert_eq!(app.shell().selected_request(), Some(login.id));
+            assert_eq!(app.opened_request(), Some(login.id));
             assert_eq!(app.active_tab_position().0, active_before);
             assert_eq!(app.tab_summaries().len(), tabs_before);
         });
@@ -11244,7 +11246,7 @@ mod tests {
             let app = state.read(app);
             assert_eq!(app.sidebar_filter(), "Ping", "the search text is unchanged");
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 None,
                 "right-clicking a search result does not select it"
             );
@@ -11272,7 +11274,7 @@ mod tests {
             let app = state.read(app);
             assert!(app.tab_menu().is_some());
             assert!(app.row_menu().is_none());
-            assert_eq!(app.shell().selected_request(), None);
+            assert_eq!(app.opened_request(), None);
         });
 
         let tabs_before = cx.update(|_, app| state.read(app).tab_summaries().len());
@@ -11287,7 +11289,7 @@ mod tests {
             );
             assert_eq!(app.tab_menu(), None);
             assert_eq!(app.tab_summaries().len(), tabs_before);
-            assert_eq!(app.shell().selected_request(), None);
+            assert_eq!(app.opened_request(), None);
         });
 
         right_click(cx, "request-tab-chip-0");
@@ -11403,7 +11405,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 Some(copy.id),
                 "the copy becomes selected"
             );
@@ -11430,7 +11432,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 Some(source.id),
                 "the source tab still shows the source request"
             );
@@ -11503,7 +11505,7 @@ mod tests {
         cx.update(|_, app| {
             let app = state.read(app);
             assert_eq!(
-                app.shell().selected_request(),
+                app.opened_request(),
                 Some(ping.id),
                 "folder duplication leaves the selected request alone"
             );
@@ -11914,7 +11916,7 @@ mod tests {
                 state.select_request(cx, Some(broken.id));
             });
             let app = state.read(app);
-            assert_eq!(app.shell().selected_request(), None, "selection is cleared");
+            assert_eq!(app.opened_request(), None, "selection is cleared");
             assert_eq!(app.shell().draft().url, "", "the pane shows a blank draft");
             assert!(
                 app.workspace().request_entry(&slug, broken.id).is_none(),
@@ -12345,7 +12347,7 @@ mod tests {
                 1,
                 "the parked draft became the request's tab"
             );
-            assert_eq!(app.shell().selected_request(), Some(request.id));
+            assert_eq!(app.opened_request(), Some(request.id));
         });
         assert!(cx.debug_bounds("request-region").is_some());
     }
