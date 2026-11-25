@@ -1024,10 +1024,13 @@ fn build_tab(
     let overlay_state = cx.weak_entity();
     let script_state = cx.weak_entity();
     let viewer_for_cookies = response.clone();
+    let workspace_owner = cx.weak_entity();
     let editor = cx.new(move |cx| {
         let mut editor = RequestEditor::new_with_cookies(cx, cookies);
         editor.load(&draft, cx);
         editor.set_workspace(workspace, cx);
+        // The tab snapshots report the workspace generation the shell owns.
+        editor.set_workspace_owner(workspace_owner);
         editor.set_on_change(move |spec, _window, cx| {
             if let Some(state) = weak_state.upgrade() {
                 state.update(cx, |state, cx| {

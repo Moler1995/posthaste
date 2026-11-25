@@ -2410,6 +2410,25 @@ mod tests {
         }
     }
 
+    /// The navigation cache compares this value; a mutation advances it and a
+    /// read (a repaint of the sidebar) does not.
+    #[test]
+    fn navigation_generation_advances_only_on_mutation() {
+        let (_dir, mut state) = workspace();
+        let before = state.navigation_generation();
+        state.touch_navigation();
+        let after = state.navigation_generation();
+        assert_ne!(
+            after, before,
+            "a workspace mutation advances the generation"
+        );
+        assert_eq!(
+            state.navigation_generation(),
+            after,
+            "reading it for a repaint does not advance it"
+        );
+    }
+
     #[test]
     fn variable_catalog_merges_defaults_with_the_active_environment() {
         use posthaste_core::variables::VariableScope;

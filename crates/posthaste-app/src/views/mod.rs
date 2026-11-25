@@ -7,6 +7,8 @@ mod editor_suite;
 pub(crate) mod environment_panel;
 mod event_stream;
 mod json_syntax;
+#[cfg(test)]
+mod line_budget;
 pub(crate) mod navigation;
 mod new_workspace;
 pub(crate) mod request_editor;

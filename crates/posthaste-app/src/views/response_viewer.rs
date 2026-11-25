@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gpui::{
-    AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity,
+    AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
     FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyBinding,
     ListHorizontalSizingBehavior, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, Rgba, ScrollStrategy, ScrollWheelEvent, SharedString,
@@ -913,6 +913,16 @@ pub struct ResponseViewer {
     /// selection.
     cookies_focus: FocusHandle,
     completed: Option<Completed>,
+    /// Bumped whenever the presented response is set, replaced, appended to,
+    /// or cleared. Derived display facts key their cache on it.
+    response_generation: u64,
+    /// The JSON-looking answer for `response_generation`, computed once when the
+    /// preview changes so a repaint does not rescan the body.
+    json_like: Option<(u64, bool)>,
+    /// Derived facts rebuilt for the current response. Debug-only, so a test can
+    /// prove a repaint does not scan the preview again.
+    #[cfg(debug_assertions)]
+    derivations_built: usize,
     /// The response still arriving. Mutually exclusive with `completed`: a new
     /// stream replaces the previous response, and completion replaces the
     /// stream.
@@ -1066,6 +1076,10 @@ impl ResponseViewer {
             cookies_selecting: false,
             cookies_focus: cx.focus_handle(),
             completed: None,
+            response_generation: 0,
+            json_like: None,
+            #[cfg(debug_assertions)]
+            derivations_built: 0,
             streaming: None,
             save_feedback: None,
             parsed: ParsedState::Unparsed,
@@ -1249,6 +1263,13 @@ impl ResponseViewer {
             preview,
             body,
         });
+        // The arrival already decided whether the preview looks like JSON; the
+        // snapshot reuses that answer instead of scanning the body again.
+        self.json_like = Some((self.response_generation, json_like));
+        #[cfg(debug_assertions)]
+        {
+            self.derivations_built = self.derivations_built.wrapping_add(1);
+        }
 
         if event_stream {
             // An event stream opens as frames, prepared inline for a small
@@ -1420,6 +1441,10 @@ impl ResponseViewer {
     fn reset_transient(&mut self, method: HttpMethod, cx: &mut Context<Self>) {
         let accent = theme::http_method(method);
 
+        // The presented response is replaced: derived display facts keyed on
+        // the previous generation are stale.
+        self.response_generation = self.response_generation.wrapping_add(1);
+        self.json_like = None;
         self.copied = None;
         self.copy_generation = self.copy_generation.wrapping_add(1);
         self.save_feedback = None;
@@ -1591,6 +1616,10 @@ impl ResponseViewer {
             }
         }
         stream.limited |= stream.received > STREAMING_LIMIT;
+        if appended > 0 {
+            // The displayed body changed, so derived facts are stale.
+            self.response_generation = self.response_generation.wrapping_add(1);
+        }
         true
     }
 
@@ -1619,6 +1648,8 @@ impl ResponseViewer {
     pub fn clear_streaming(&mut self, cx: &mut Context<Self>) -> bool {
         let cleared = self.streaming.take().is_some();
         if cleared {
+            self.response_generation = self.response_generation.wrapping_add(1);
+            self.json_like = None;
             cx.notify();
         }
         cleared
@@ -1740,11 +1771,39 @@ impl ResponseViewer {
         }
     }
 
-    /// A JSON-looking body offers the view selector even before it is parsed.
-    fn looks_json(&self) -> bool {
-        self.completed
+    /// Recomputes the preview facts when the response generation moved. The
+    /// JSON-looking answer is the only derivation that scans the body, so a
+    /// repaint between generations reuses it.
+    fn refresh_snapshot_facts(&mut self) {
+        if self
+            .json_like
+            .is_some_and(|(generation, _)| generation == self.response_generation)
+        {
+            return;
+        }
+        let looks_json = self
+            .completed
             .as_ref()
-            .is_some_and(|completed| starts_json(&completed.preview.text))
+            .is_some_and(|completed| starts_json(&completed.preview.text));
+        self.json_like = Some((self.response_generation, looks_json));
+        #[cfg(debug_assertions)]
+        {
+            self.derivations_built = self.derivations_built.wrapping_add(1);
+        }
+    }
+
+    /// The derived JSON-looking answer for the current generation.
+    fn looks_json(&self) -> bool {
+        self.json_like.is_some_and(|(generation, looks_json)| {
+            generation == self.response_generation && looks_json
+        })
+    }
+
+    /// Derived facts rebuilt for the current response. Test-only.
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    pub(crate) fn derivations_built(&self) -> usize {
+        self.derivations_built
     }
 
     fn has_table(&self) -> bool {
@@ -3933,10 +3992,77 @@ fn cookies_view(
     }
 
     let floors = cookie_column_floors();
+    let values_kept = cookies.iter().any(|cookie| cookie.value.is_some());
+    // One card per domain, in the order the response set them.
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, cookie) in cookies.iter().enumerate() {
+        match groups.last_mut() {
+            Some((domain, indices)) if domain.eq_ignore_ascii_case(&cookie.domain) => {
+                indices.push(index);
+            }
+            _ => groups.push((cookie.domain.as_str(), vec![index])),
+        }
+    }
+    // The domain usually is the request's own host, so the common single-domain
+    // response needs no title saying so. A cookie can name a parent domain, or
+    // a response can mix domains, and then the title carries information the
+    // request's host does not.
+    let single_domain = groups.len() == 1;
+    let cards = groups.into_iter().map(|(domain, indices)| {
+        let mut card = div()
+            .debug_selector(|| "response-cookies-card".to_owned())
+            .flex()
+            .flex_col()
+            .w_full()
+            .bg(theme::surface::raised())
+            .rounded(radius::CONTROL)
+            .overflow_hidden();
+        if !single_domain {
+            card = card.child(cookie_group_header(domain, indices.len()));
+        }
+        card.children(indices.iter().map(|&index| {
+            cookie_row(
+                cookies, jar, selection, focus, viewer, accent, &floors, index,
+            )
+        }))
+    });
+    let mut content = div()
+        .flex()
+        .flex_col()
+        .gap(space::S8)
+        .w_full()
+        .child(cookie_column_labels())
+        .children(cards);
+    if !values_kept {
+        content = content.child(
+            div()
+                .debug_selector(|| "response-cookies-values-note".to_owned())
+                .px(space::S4)
+                .py(space::S4)
+                .text_role(type_role::META)
+                .text_color(theme::text::tertiary())
+                .child(i18n::t(Key::CookiesHistoryValuesNote)),
+        );
+    }
+    scroll.child(content).into_any_element()
+}
+
+/// One cookie row: six selectable cells sharing the table's selection state.
+#[allow(clippy::too_many_arguments)]
+fn cookie_row(
+    cookies: &[ResponseCookie],
+    jar: &CookieJar,
+    selection: Option<CookieSelection>,
+    focus: &FocusHandle,
+    viewer: &Entity<ResponseViewer>,
+    accent: Rgba,
+    floors: &[f32; COOKIE_COLUMNS],
+    index: usize,
+) -> AnyElement {
     // One cell: clipped to its column, selectable as part of the table's
     // rectangle, and carrying a tooltip with exactly its own text rather than
     // the whole row's.
-    let cell = |index: usize, column: usize, color: Rgba, width: Option<f32>, role: TypeRole| {
+    let cell = |column: usize, color: Rgba, width: Option<f32>, role: TypeRole| {
         let text = cookie_cell_text(&cookies[index], jar, column);
         let selected = selection.is_some_and(|selection| selection.contains(index, column));
         let tooltip = text.clone();
@@ -3988,113 +4114,57 @@ fn cookies_view(
             .into_any_element()
     };
 
-    let values_kept = cookies.iter().any(|cookie| cookie.value.is_some());
-    // One card per domain, in the order the response set them.
-    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-    for (index, cookie) in cookies.iter().enumerate() {
-        match groups.last_mut() {
-            Some((domain, indices)) if domain.eq_ignore_ascii_case(&cookie.domain) => {
-                indices.push(index);
-            }
-            _ => groups.push((cookie.domain.as_str(), vec![index])),
-        }
-    }
-    // The domain usually is the request's own host, so the common single-domain
-    // response needs no title saying so. A cookie can name a parent domain, or
-    // a response can mix domains, and then the title carries information the
-    // request's host does not.
-    let single_domain = groups.len() == 1;
-    let cards = groups.into_iter().map(|(domain, indices)| {
-        let mut card = div()
-            .debug_selector(|| "response-cookies-card".to_owned())
-            .flex()
-            .flex_col()
-            .w_full()
-            .bg(theme::surface::raised())
-            .rounded(radius::CONTROL)
-            .overflow_hidden();
-        if !single_domain {
-            card = card.child(cookie_group_header(domain, indices.len()));
-        }
-        card.children(indices.iter().map(|&index| {
-            let cookie = &cookies[index];
-            let state = cookie_state(cookie, jar);
-            div()
-                .id(("response-cookie-row", index))
-                .debug_selector({
-                    let selector = format!("response-cookie-row-{index}");
-                    move || selector.clone()
-                })
-                .flex()
-                .items_center()
-                .gap(space::S6)
-                .h(layout::CONTROL)
-                .px(space::S4)
-                .hover(|style| style.bg(theme::interaction::hover_wash()))
-                .child(cell(
-                    index,
-                    0,
-                    theme::text::primary(),
-                    Some(COOKIE_NAME_WIDTH),
-                    type_role::CODE_COMPACT,
-                ))
-                .child(cell(
-                    index,
-                    1,
-                    theme::text::secondary(),
-                    None,
-                    type_role::CODE_COMPACT,
-                ))
-                .child(cell(
-                    index,
-                    2,
-                    theme::text::tertiary(),
-                    Some(COOKIE_PATH_WIDTH),
-                    type_role::CODE_COMPACT,
-                ))
-                .child(cell(
-                    index,
-                    3,
-                    theme::text::tertiary(),
-                    Some(COOKIE_EXPIRY_WIDTH),
-                    type_role::MICRO,
-                ))
-                .child(cell(
-                    index,
-                    4,
-                    theme::text::tertiary(),
-                    Some(COOKIE_FLAGS_WIDTH),
-                    type_role::MICRO,
-                ))
-                .child(cell(
-                    index,
-                    5,
-                    state.color(),
-                    Some(COOKIE_STATE_WIDTH),
-                    type_role::MICRO,
-                ))
-                .into_any_element()
-        }))
-    });
-    let mut content = div()
+    let cookie = &cookies[index];
+    let state = cookie_state(cookie, jar);
+    div()
+        .id(("response-cookie-row", index))
+        .debug_selector({
+            let selector = format!("response-cookie-row-{index}");
+            move || selector.clone()
+        })
         .flex()
-        .flex_col()
-        .gap(space::S8)
-        .w_full()
-        .child(cookie_column_labels())
-        .children(cards);
-    if !values_kept {
-        content = content.child(
-            div()
-                .debug_selector(|| "response-cookies-values-note".to_owned())
-                .px(space::S4)
-                .py(space::S4)
-                .text_role(type_role::META)
-                .text_color(theme::text::tertiary())
-                .child(i18n::t(Key::CookiesHistoryValuesNote)),
-        );
-    }
-    scroll.child(content).into_any_element()
+        .items_center()
+        .gap(space::S6)
+        .h(layout::CONTROL)
+        .px(space::S4)
+        .hover(|style| style.bg(theme::interaction::hover_wash()))
+        .child(cell(
+            0,
+            theme::text::primary(),
+            Some(COOKIE_NAME_WIDTH),
+            type_role::CODE_COMPACT,
+        ))
+        .child(cell(
+            1,
+            theme::text::secondary(),
+            None,
+            type_role::CODE_COMPACT,
+        ))
+        .child(cell(
+            2,
+            theme::text::tertiary(),
+            Some(COOKIE_PATH_WIDTH),
+            type_role::CODE_COMPACT,
+        ))
+        .child(cell(
+            3,
+            theme::text::tertiary(),
+            Some(COOKIE_EXPIRY_WIDTH),
+            type_role::MICRO,
+        ))
+        .child(cell(
+            4,
+            theme::text::tertiary(),
+            Some(COOKIE_FLAGS_WIDTH),
+            type_role::MICRO,
+        ))
+        .child(cell(
+            5,
+            state.color(),
+            Some(COOKIE_STATE_WIDTH),
+            type_role::MICRO,
+        ))
+        .into_any_element()
 }
 
 /// The attributes a cookie carries, as one compact label.
@@ -4119,6 +4189,56 @@ pub(crate) fn cookie_flags(cookie: &ResponseCookie) -> String {
         "—".to_owned()
     } else {
         flags.join(", ")
+    }
+}
+
+/// The completed response's display facts, derived once per render.
+///
+/// The chrome, notices, find bar, and section content each used to reread the
+/// viewer and rederive `looks_json`, the binary state, and the section
+/// visibility at every use. The snapshot reads them once and borrows the
+/// response, so a renderer cannot see two different answers in one frame.
+pub(crate) struct ResponseSnapshot<'a> {
+    completed: &'a Completed,
+    section: ResponseSection,
+    mode: ViewMode,
+    event_stream: bool,
+    looks_json: bool,
+    offers_table: bool,
+    binary: bool,
+    text_view: bool,
+    body_section: bool,
+    shows_view_controls: bool,
+    shows_find: bool,
+    generation: u64,
+}
+
+impl<'a> ResponseSnapshot<'a> {
+    fn build(viewer: &'a ResponseViewer) -> Self {
+        let Some(completed) = viewer.completed.as_ref() else {
+            unreachable!("the snapshot is built after render checks for a response");
+        };
+        let looks_json = viewer.looks_json();
+        let binary = completed.preview.binary.is_some();
+        let body_section = viewer.section == ResponseSection::Body;
+        let text_view = matches!(
+            viewer.mode,
+            ViewMode::Pretty | ViewMode::Raw | ViewMode::Frames
+        );
+        Self {
+            completed,
+            section: viewer.section,
+            mode: viewer.mode,
+            event_stream: viewer.event_stream,
+            offers_table: viewer.offers_table(),
+            looks_json,
+            binary,
+            text_view,
+            body_section,
+            shows_view_controls: body_section && (looks_json || viewer.event_stream),
+            shows_find: body_section && viewer.find_open,
+            generation: viewer.response_generation,
+        }
     }
 }
 
@@ -4231,7 +4351,63 @@ impl ResponseViewer {
                     .into_any_element()
             });
 
-        let content: AnyElement = match self.section {
+        let content = self.render_streaming_content(stream, viewer.clone(), focused, cx);
+
+        // Only the shown text is capped, so the notice describes the preview
+        // rather than a failure.
+        let mut notices: Vec<AnyElement> = Vec::new();
+        if stream.limited {
+            notices.push(notice_block(
+                "response-streaming-limited",
+                i18n::t(Key::NoticeLimit),
+                i18n::t(Key::StreamPreviewLimited).to_owned(),
+            ));
+        }
+        if stream.view == ViewMode::Frames
+            && stream
+                .frames
+                .as_ref()
+                .is_some_and(|frames| frames.limited())
+        {
+            notices.push(notice_block(
+                "response-frames-limited",
+                i18n::t(Key::NoticeLimit),
+                i18n::msg(
+                    MessageKey::FramesLiveLimited,
+                    &[
+                        &format_count(MAX_FRAMES),
+                        &(FRAMES_TEXT_LIMIT / (1024 * 1024)),
+                    ],
+                ),
+            ));
+        }
+
+        div()
+            .id("response-streaming")
+            .debug_selector(|| "response-streaming".to_owned())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(space::S8)
+            .children(notices)
+            .child(strip)
+            .children(toolbar)
+            .child(content)
+            .into_any_element()
+    }
+
+    /// The streaming body for the active section. Kept apart from the chrome so
+    /// neither function outgrows the structural line budget.
+    fn render_streaming_content(
+        &self,
+        stream: &Streaming,
+        viewer: Entity<ResponseViewer>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let accent = theme::http_method(self.method);
+        match self.section {
             ResponseSection::Body => {
                 let raw_body = || {
                     code_view(
@@ -4344,50 +4520,7 @@ impl ResponseViewer {
             // The headers may set cookies, but the jar only reports them once
             // the response ends, so the tab explains the wait.
             ResponseSection::Cookies => cookies_waiting_view(),
-        };
-
-        // Only the shown text is capped, so the notice describes the preview
-        // rather than a failure.
-        let mut notices: Vec<AnyElement> = Vec::new();
-        if stream.limited {
-            notices.push(notice_block(
-                "response-streaming-limited",
-                i18n::t(Key::NoticeLimit),
-                i18n::t(Key::StreamPreviewLimited).to_owned(),
-            ));
         }
-        if stream.view == ViewMode::Frames
-            && stream
-                .frames
-                .as_ref()
-                .is_some_and(|frames| frames.limited())
-        {
-            notices.push(notice_block(
-                "response-frames-limited",
-                i18n::t(Key::NoticeLimit),
-                i18n::msg(
-                    MessageKey::FramesLiveLimited,
-                    &[
-                        &format_count(MAX_FRAMES),
-                        &(FRAMES_TEXT_LIMIT / (1024 * 1024)),
-                    ],
-                ),
-            ));
-        }
-
-        div()
-            .id("response-streaming")
-            .debug_selector(|| "response-streaming".to_owned())
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(space::S8)
-            .children(notices)
-            .child(strip)
-            .children(toolbar)
-            .child(content)
-            .into_any_element()
     }
 }
 
@@ -4413,11 +4546,53 @@ impl Render for ResponseViewer {
                 });
             }
         }
-        let Some(completed) = &self.completed else {
+        if self.completed.is_none() {
             return div().into_any_element();
-        };
+        }
+        // The chrome and each section read one snapshot, so they see the same
+        // derived facts for the whole frame.
+        self.refresh_snapshot_facts();
         let viewer = cx.entity();
+        let view = ResponseSnapshot::build(self);
+        debug_assert_eq!(view.generation, self.response_generation);
+        debug_assert_eq!(view.binary, view.completed.preview.binary.is_some());
 
+        let notices = self.render_notices(&view);
+        let strip = self.render_strip(&view, viewer.clone());
+        let toolbar = self.render_toolbar(&view, viewer.clone());
+        let find_bar = self.render_find(&view, viewer.clone());
+        let content = self.render_section(&view, viewer.clone(), focused, cx);
+
+        div()
+            .id("response-completed")
+            .debug_selector(|| "response-completed".to_owned())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(space::S8)
+            .children(notices)
+            .child(strip)
+            .children(toolbar)
+            // The body area is the overlay's containing block, so the find
+            // widget floats above the content without entering the column.
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(content)
+                    .children(find_bar),
+            )
+            .into_any_element()
+    }
+}
+
+impl ResponseViewer {
+    /// The section strip: tabs and, for a text body, Copy body.
+    fn render_strip(&self, view: &ResponseSnapshot<'_>, viewer: Entity<ResponseViewer>) -> Div {
         let body_tab_viewer = viewer.clone();
         let headers_tab_viewer = viewer.clone();
         let cookies_tab_viewer = viewer.clone();
@@ -4434,7 +4609,7 @@ impl Render for ResponseViewer {
             .child(
                 super::ui::tab(
                     i18n::t(Key::TabBody),
-                    self.section == ResponseSection::Body,
+                    view.section == ResponseSection::Body,
                     accent,
                 )
                 .id("response-tab-body")
@@ -4448,7 +4623,7 @@ impl Render for ResponseViewer {
             .child(
                 super::ui::tab(
                     i18n::t(Key::TabResponseHeaders),
-                    self.section == ResponseSection::Headers,
+                    view.section == ResponseSection::Headers,
                     accent,
                 )
                 .id("response-tab-headers")
@@ -4462,7 +4637,7 @@ impl Render for ResponseViewer {
             .child(
                 super::ui::tab(
                     i18n::t(Key::CookiesTitle),
-                    self.section == ResponseSection::Cookies,
+                    view.section == ResponseSection::Cookies,
                     accent,
                 )
                 .id("response-tab-cookies")
@@ -4476,7 +4651,7 @@ impl Render for ResponseViewer {
             .child(div().flex_1());
 
         // A binary body has no text to copy; the card offers Save instead.
-        if self.section == ResponseSection::Body && completed.preview.binary.is_none() {
+        if view.body_section && !view.binary {
             let label: &'static str = if self.copied == Some(CopyTarget::Body) {
                 i18n::t(Key::CommonCopied)
             } else {
@@ -4484,197 +4659,209 @@ impl Render for ResponseViewer {
             };
             strip = strip.child(body_copy_button(viewer.clone(), label));
         }
+        strip
+    }
 
+    /// The view selector row under the tabs.
+    fn render_toolbar(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+    ) -> Option<AnyElement> {
         // The view controls get their own row under the tabs. Keeping them out
         // of the strip leaves a narrow pane room for the tabs and Copy body.
         // Only the view selector lives here; the find field is a floating
         // overlay, so a text body without a selector has no extra row at all.
-        let text_view = matches!(
-            self.mode,
-            ViewMode::Pretty | ViewMode::Raw | ViewMode::Frames
-        );
-        let toolbar = (self.section == ResponseSection::Body
-            && (self.looks_json() || self.event_stream))
-            .then(|| {
-                let active = self.mode;
-                let mut row = div()
-                    .debug_selector(|| "response-view-controls".to_owned())
-                    .flex()
-                    .items_center()
-                    .gap(space::S8)
-                    .px(layout::PANE_PADDING)
-                    .py(space::S4);
-                if self.event_stream {
-                    // An event stream offers Frames and Raw only; a frame is
-                    // expanded from its own row.
-                    row = row.child(super::ui::segmented_control(false, accent).children([
-                        view_button(ViewMode::Frames, active == ViewMode::Frames, viewer.clone()),
-                        view_button(ViewMode::Raw, active == ViewMode::Raw, viewer.clone()),
-                    ]));
-                    row = row.child(div().flex_1());
-                } else if self.looks_json() {
-                    let mut modes = vec![ViewMode::Pretty, ViewMode::Tree];
-                    // A parsed preview knows whether it has a table. A large
-                    // unparsed array offers the segment provisionally so Table
-                    // can start the parse, as Pretty and Tree already do.
-                    if self.offers_table() {
-                        modes.push(ViewMode::Table);
-                    }
-                    modes.push(ViewMode::Raw);
-                    // The control is mouse-driven, so it hands no focus state
-                    // to the shared builder and paints no ring.
-                    row = row.child(
-                        super::ui::segmented_control(false, accent).children(
-                            modes
-                                .into_iter()
-                                .map(|mode| view_button(mode, mode == active, viewer.clone())),
-                        ),
-                    );
-                    // Tree keeps its expansion controls on the trailing edge.
-                    row = row.child(div().flex_1());
+        view.shows_view_controls.then(|| {
+            let active = view.mode;
+            let accent = theme::http_method(self.method);
+            let mut row = div()
+                .debug_selector(|| "response-view-controls".to_owned())
+                .flex()
+                .items_center()
+                .gap(space::S8)
+                .px(layout::PANE_PADDING)
+                .py(space::S4);
+            if view.event_stream {
+                // An event stream offers Frames and Raw only; a frame is
+                // expanded from its own row.
+                row = row.child(super::ui::segmented_control(false, accent).children([
+                    view_button(ViewMode::Frames, active == ViewMode::Frames, viewer.clone()),
+                    view_button(ViewMode::Raw, active == ViewMode::Raw, viewer.clone()),
+                ]));
+                row = row.child(div().flex_1());
+            } else if view.looks_json {
+                let mut modes = vec![ViewMode::Pretty, ViewMode::Tree];
+                // A parsed preview knows whether it has a table. A large
+                // unparsed array offers the segment provisionally so Table
+                // can start the parse, as Pretty and Tree already do.
+                if view.offers_table {
+                    modes.push(ViewMode::Table);
                 }
+                modes.push(ViewMode::Raw);
+                // The control is mouse-driven, so it hands no focus state
+                // to the shared builder and paints no ring.
+                row = row.child(
+                    super::ui::segmented_control(false, accent).children(
+                        modes
+                            .into_iter()
+                            .map(|mode| view_button(mode, mode == active, viewer.clone())),
+                    ),
+                );
+                // Tree keeps its expansion controls on the trailing edge.
+                row = row.child(div().flex_1());
+            }
 
-                if active == ViewMode::Tree {
-                    // A search temporarily owns the expansion state, so the
-                    // expansion controls step aside until it is cleared.
-                    if self.search.is_empty() {
-                        let expand_viewer = viewer.clone();
-                        let collapse_viewer = viewer.clone();
-                        row = row
-                            .child(
-                                super::ui::ghost_button(
-                                    "response-expand-all",
-                                    i18n::t(Key::ResponseExpandAll),
-                                )
-                                .debug_selector(|| "response-expand-all".to_owned())
-                                .h(px(24.))
-                                .px(space::S8)
-                                .text_role(type_role::MICRO)
-                                .on_click(move |_, _, cx| {
-                                    expand_viewer.update(cx, |viewer, cx| viewer.expand_all(cx));
-                                }),
+            if active == ViewMode::Tree {
+                // A search temporarily owns the expansion state, so the
+                // expansion controls step aside until it is cleared.
+                if self.search.is_empty() {
+                    let expand_viewer = viewer.clone();
+                    let collapse_viewer = viewer.clone();
+                    row = row
+                        .child(
+                            super::ui::ghost_button(
+                                "response-expand-all",
+                                i18n::t(Key::ResponseExpandAll),
                             )
-                            .child(
-                                super::ui::ghost_button(
-                                    "response-collapse-all",
-                                    i18n::t(Key::ResponseCollapseAll),
-                                )
-                                .debug_selector(|| "response-collapse-all".to_owned())
-                                .h(px(24.))
-                                .px(space::S8)
-                                .text_role(type_role::MICRO)
-                                .on_click(move |_, _, cx| {
-                                    collapse_viewer.update(cx, |viewer, cx| {
-                                        viewer.collapse_all(cx);
-                                    });
-                                }),
-                            );
-                    }
-                }
-                row.into_any_element()
-            });
-
-        // Ctrl+F summons a floating find widget rather than a layout row. The
-        // bar hangs over the top of the body, so opening and closing it never
-        // moves the text under the reader.
-        let find_bar: Option<AnyElement> =
-            (self.section == ResponseSection::Body && self.find_open).then(|| {
-                // A definite width gives the search field real room; a
-                // shrink-to-fit bar would leave it at its minimum and strand
-                // the count beside a sliver of a field. `max_w` keeps the bar
-                // inside a narrow pane's body.
-                let body = div()
-                    .debug_selector(|| "response-find-bar".to_owned())
-                    .w(px(300.))
-                    .max_w(gpui::relative(1.))
-                    .flex()
-                    .items_center()
-                    .gap(space::S6)
-                    .px(space::S8)
-                    .py(space::S4)
-                    .bg(theme::surface::overlay())
-                    .rounded(radius::CONTROL)
-                    .border_1()
-                    .border_color(theme::border::subtle())
-                    .shadow(vec![gpui::BoxShadow {
-                        color: theme::surface::floating_shadow().into(),
-                        offset: gpui::point(px(0.), px(6.)),
-                        blur_radius: px(16.),
-                        spread_radius: px(0.),
-                    }]);
-
-                let mut body = if text_view {
-                    let mut body = body.child(
-                        div()
-                            .flex_1()
-                            .min_w(px(60.))
-                            .debug_selector(|| "response-body-search".to_owned())
-                            .child(self.body_search.clone()),
-                    );
-                    // The count appears with the query, so the field keeps the
-                    // whole bar until there is something to report.
-                    if !self.body_query.is_empty() {
-                        body = body.child(
-                            div()
-                                .flex_none()
-                                .debug_selector(|| "response-body-search-count".to_owned())
-                                .text_role(type_role::MICRO)
-                                .text_color(theme::text::secondary())
-                                .child(self.body_match_label()),
+                            .debug_selector(|| "response-expand-all".to_owned())
+                            .h(px(24.))
+                            .px(space::S8)
+                            .text_role(type_role::MICRO)
+                            .on_click(move |_, _, cx| {
+                                expand_viewer.update(cx, |viewer, cx| viewer.expand_all(cx));
+                            }),
+                        )
+                        .child(
+                            super::ui::ghost_button(
+                                "response-collapse-all",
+                                i18n::t(Key::ResponseCollapseAll),
+                            )
+                            .debug_selector(|| "response-collapse-all".to_owned())
+                            .h(px(24.))
+                            .px(space::S8)
+                            .text_role(type_role::MICRO)
+                            .on_click(move |_, _, cx| {
+                                collapse_viewer.update(cx, |viewer, cx| {
+                                    viewer.collapse_all(cx);
+                                });
+                            }),
                         );
-                    }
-                    body
-                } else if self.mode == ViewMode::Tree {
-                    body.child(
-                        div()
-                            .flex_1()
-                            .min_w(px(60.))
-                            .debug_selector(|| "response-tree-search".to_owned())
-                            .child(self.tree_search.clone()),
-                    )
-                } else {
-                    body
-                };
-
-                if text_view {
-                    let prev_viewer = viewer.clone();
-                    let next_viewer = viewer.clone();
-                    body = body
-                        .child(super::ui::icon_button("response-find-prev", "↑").on_click(
-                            move |_, _, cx| {
-                                prev_viewer.update(cx, |viewer, cx| {
-                                    viewer.advance_body_match(-1, cx);
-                                });
-                            },
-                        ))
-                        .child(super::ui::icon_button("response-find-next", "↓").on_click(
-                            move |_, _, cx| {
-                                next_viewer.update(cx, |viewer, cx| {
-                                    viewer.advance_body_match(1, cx);
-                                });
-                            },
-                        ));
                 }
+            }
+            row.into_any_element()
+        })
+    }
 
-                let close_viewer = viewer.clone();
-                body = body.child(super::ui::icon_button("response-find-close", "×").on_click(
-                    move |_, _, cx| {
-                        close_viewer.update(cx, |viewer, cx| viewer.close_find(cx));
-                    },
-                ));
+    /// Ctrl+F summons a floating find widget rather than a layout row. The
+    /// bar hangs over the top of the body, so opening and closing it never
+    /// moves the text under the reader.
+    fn render_find(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+    ) -> Option<AnyElement> {
+        view.shows_find.then(|| {
+            // A definite width gives the search field real room; a
+            // shrink-to-fit bar would leave it at its minimum and strand
+            // the count beside a sliver of a field. `max_w` keeps the bar
+            // inside a narrow pane's body.
+            let body = div()
+                .debug_selector(|| "response-find-bar".to_owned())
+                .w(px(300.))
+                .max_w(gpui::relative(1.))
+                .flex()
+                .items_center()
+                .gap(space::S6)
+                .px(space::S8)
+                .py(space::S4)
+                .bg(theme::surface::overlay())
+                .rounded(radius::CONTROL)
+                .border_1()
+                .border_color(theme::border::subtle())
+                .shadow(vec![gpui::BoxShadow {
+                    color: theme::surface::floating_shadow().into(),
+                    offset: gpui::point(px(0.), px(6.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                }]);
 
-                div()
-                    .debug_selector(|| "response-find".to_owned())
-                    .absolute()
-                    .top(space::S8)
-                    .left(layout::PANE_PADDING + space::S8)
-                    .right(layout::PANE_PADDING + space::S8)
-                    .flex()
-                    .justify_end()
-                    .child(body)
-                    .into_any_element()
-            });
+            let mut body = if view.text_view {
+                let mut body = body.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(60.))
+                        .debug_selector(|| "response-body-search".to_owned())
+                        .child(self.body_search.clone()),
+                );
+                // The count appears with the query, so the field keeps the
+                // whole bar until there is something to report.
+                if !self.body_query.is_empty() {
+                    body = body.child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "response-body-search-count".to_owned())
+                            .text_role(type_role::MICRO)
+                            .text_color(theme::text::secondary())
+                            .child(self.body_match_label()),
+                    );
+                }
+                body
+            } else if view.mode == ViewMode::Tree {
+                body.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(60.))
+                        .debug_selector(|| "response-tree-search".to_owned())
+                        .child(self.tree_search.clone()),
+                )
+            } else {
+                body
+            };
 
+            if view.text_view {
+                let prev_viewer = viewer.clone();
+                let next_viewer = viewer.clone();
+                body = body
+                    .child(super::ui::icon_button("response-find-prev", "↑").on_click(
+                        move |_, _, cx| {
+                            prev_viewer.update(cx, |viewer, cx| {
+                                viewer.advance_body_match(-1, cx);
+                            });
+                        },
+                    ))
+                    .child(super::ui::icon_button("response-find-next", "↓").on_click(
+                        move |_, _, cx| {
+                            next_viewer.update(cx, |viewer, cx| {
+                                viewer.advance_body_match(1, cx);
+                            });
+                        },
+                    ));
+            }
+
+            let close_viewer = viewer.clone();
+            body = body.child(super::ui::icon_button("response-find-close", "×").on_click(
+                move |_, _, cx| {
+                    close_viewer.update(cx, |viewer, cx| viewer.close_find(cx));
+                },
+            ));
+
+            div()
+                .debug_selector(|| "response-find".to_owned())
+                .absolute()
+                .top(space::S8)
+                .left(layout::PANE_PADDING + space::S8)
+                .right(layout::PANE_PADDING + space::S8)
+                .flex()
+                .justify_end()
+                .child(body)
+                .into_any_element()
+        })
+    }
+
+    /// The warning and limit notices above the strip.
+    fn render_notices(&self, view: &ResponseSnapshot<'_>) -> Vec<AnyElement> {
+        let completed = view.completed;
         let mut notices: Vec<AnyElement> = Vec::new();
         // A shortened preview is a warning about what is shown, not a failed
         // request, so it leaves `danger` to the failure states.
@@ -4685,8 +4872,8 @@ impl Render for ResponseViewer {
                 i18n::t(notice).to_owned(),
             ));
         }
-        if self.section == ResponseSection::Body
-            && self.mode == ViewMode::Frames
+        if view.section == ResponseSection::Body
+            && view.mode == ViewMode::Frames
             && self.frames_body().is_some_and(|frames| frames.limited())
         {
             notices.push(notice_block(
@@ -4701,10 +4888,10 @@ impl Render for ResponseViewer {
                 ),
             ));
         }
-        if self.section == ResponseSection::Body
-            && self.mode == ViewMode::Raw
+        if view.section == ResponseSection::Body
+            && view.mode == ViewMode::Raw
             && self.invalid_json
-            && !self.event_stream
+            && !view.event_stream
         {
             if self.preview_limited {
                 let message: &'static str = if completed.preview.history_limited {
@@ -4725,8 +4912,8 @@ impl Render for ResponseViewer {
                 ));
             }
         }
-        if self.section == ResponseSection::Body
-            && self.mode == ViewMode::Raw
+        if view.section == ResponseSection::Body
+            && view.mode == ViewMode::Raw
             && self.table_unavailable
         {
             notices.push(notice_block(
@@ -4735,8 +4922,8 @@ impl Render for ResponseViewer {
                 i18n::t(Key::TableUnavailable).to_owned(),
             ));
         }
-        if self.section == ResponseSection::Body {
-            match (self.mode, self.parsed_body()) {
+        if view.section == ResponseSection::Body {
+            match (view.mode, self.parsed_body()) {
                 (ViewMode::Pretty, Some(parsed)) if parsed.formatted_limited => {
                     notices.push(notice_block(
                         "response-formatted-limited",
@@ -4780,285 +4967,272 @@ impl Render for ResponseViewer {
                 _ => {}
             }
         }
+        notices
+    }
 
-        let content: AnyElement = match self.section {
-            ResponseSection::Body => {
-                // Shared scroll container for views that render a bounded
-                // column of rows. The code views scroll inside their own
-                // virtualized list instead.
-                let body_scroll = || {
-                    div()
-                        .id("response-body")
-                        .debug_selector(|| "response-body".to_owned())
-                        .flex_1()
-                        .min_h_0()
-                        // Both axes scroll: a wide table stays reachable
-                        // instead of being clipped at the pane edge.
-                        .overflow_scroll()
-                        .flex()
-                        .flex_col()
-                        .gap(space::S2)
-                        .px(space::S12)
-                        .py(space::S4)
-                };
-
-                let body: AnyElement = if let Some(meta) = &completed.preview.binary {
-                    // A binary body is never decoded: the card states what it
-                    // is and offers to save the retained bytes.
-                    self.binary_card(
-                        meta,
-                        completed.preview.size,
-                        completed.preview.truncated,
-                        false,
-                        cx,
-                    )
-                } else if completed.body.is_empty() {
-                    // A truly empty body gets a composed block. A body that is
-                    // only whitespace still renders as text, because spaces are
-                    // its content.
-                    let title: &'static str = if self.event_stream {
-                        i18n::t(Key::FramesEmpty)
-                    } else {
-                        i18n::t(Key::ResponseBodyEmpty)
-                    };
-                    body_scroll()
-                        .child(
-                            empty_state("response-body-empty", EmptyStateScale::Table)
-                                .title(title)
-                                .into_any_element(),
-                        )
-                        .into_any_element()
-                } else if matches!(self.parsed, ParsedState::Parsing)
-                    || matches!(self.frames, FramesState::Preparing)
-                {
-                    body_scroll()
-                        .child(
-                            div()
-                                .id("response-parsing")
-                                .debug_selector(|| "response-parsing".to_owned())
-                                .h(px(22.))
-                                .px(space::S4)
-                                .flex()
-                                .items_center()
-                                .text_role(type_role::META)
-                                .text_color(theme::text::secondary())
-                                .child(i18n::t(Key::ResponseParsing)),
-                        )
-                        .into_any_element()
-                } else {
-                    match (self.mode, self.parsed_body()) {
-                        (ViewMode::Frames, _) => match self.frames_body() {
-                            Some(frames) if frames.count() == 0 => body_scroll()
-                                .child(
-                                    empty_state("response-frames-empty", EmptyStateScale::Table)
-                                        .title(i18n::t(Key::FramesEmpty))
-                                        .into_any_element(),
-                                )
-                                .into_any_element(),
-                            Some(frames) => code_view(
-                                "response-frames-body",
-                                self.frames_lines()
-                                    .expect("a ready frames body has display rows"),
-                                Some(frames.row_labels()),
-                                self.code_search(),
-                                false,
-                                self.frames_scroll.clone(),
-                                self.hscrollbar(
-                                    ScrollTarget::Frames,
-                                    &self.frames_scroll,
-                                    viewer.clone(),
-                                ),
-                                Some(self.code_interaction(
-                                    ScrollTarget::Frames,
-                                    viewer.clone(),
-                                    focused,
-                                )),
-                            ),
-                            None => body_scroll().into_any_element(),
-                        },
-                        (ViewMode::Pretty, Some(parsed)) => code_view(
-                            "response-pretty-body",
-                            self.pretty_display_lines(parsed),
-                            None,
-                            self.code_search(),
-                            true,
-                            self.pretty_scroll.clone(),
-                            self.hscrollbar(
-                                ScrollTarget::Pretty,
-                                &self.pretty_scroll,
-                                viewer.clone(),
-                            ),
-                            Some(self.code_interaction(
-                                ScrollTarget::Pretty,
-                                viewer.clone(),
-                                focused,
-                            )),
-                        ),
-                        (ViewMode::Tree, Some(parsed)) => {
-                            let rows = parsed.tree.filtered_rows(&self.search, &self.expanded);
-                            if rows.is_empty() {
-                                body_scroll()
-                                    .child(
-                                        div()
-                                            .id("response-tree-no-matches")
-                                            .debug_selector(|| {
-                                                "response-tree-no-matches".to_owned()
-                                            })
-                                            .h(px(22.))
-                                            .px(space::S4)
-                                            .flex()
-                                            .items_center()
-                                            .text_role(type_role::META)
-                                            .text_color(theme::text::tertiary())
-                                            .child(i18n::t(Key::CommonNoMatches)),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                tree_view(rows, viewer.clone(), self.copied)
-                            }
-                        }
-                        (ViewMode::Table, Some(parsed)) => match &parsed.table {
-                            Some(table) => table_view(
-                                table.clone(),
-                                self.table_scroll.clone(),
-                                self.hscrollbar(
-                                    ScrollTarget::Table,
-                                    &self.table_scroll,
-                                    viewer.clone(),
-                                ),
-                            ),
-                            None => code_view(
-                                "response-raw-body",
-                                self.raw_display_lines(),
-                                None,
-                                self.code_search(),
-                                false,
-                                self.raw_scroll.clone(),
-                                self.hscrollbar(
-                                    ScrollTarget::Raw,
-                                    &self.raw_scroll,
-                                    viewer.clone(),
-                                ),
-                                Some(self.code_interaction(
-                                    ScrollTarget::Raw,
-                                    viewer.clone(),
-                                    focused,
-                                )),
-                            ),
-                        },
-                        _ => code_view(
-                            "response-raw-body",
-                            self.raw_display_lines(),
-                            None,
-                            self.code_search(),
-                            false,
-                            self.raw_scroll.clone(),
-                            self.hscrollbar(ScrollTarget::Raw, &self.raw_scroll, viewer.clone()),
-                            Some(self.code_interaction(ScrollTarget::Raw, viewer.clone(), focused)),
-                        ),
-                    }
-                };
-
-                let prepaint_viewer = viewer.clone();
-                let drag_viewer = viewer.clone();
-                let wheel_viewer = viewer.clone();
-                div()
-                    .id("response-body-region")
-                    .debug_selector(|| "response-body-region".to_owned())
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .px(layout::PANE_PADDING)
-                    .child(
-                        div()
-                            .on_children_prepainted(move |_, _, cx| {
-                                let viewer = prepaint_viewer.clone();
-                                cx.defer(move |cx| {
-                                    viewer.update(cx, |viewer, cx| {
-                                        viewer.refresh_hscroll(cx);
-                                    });
-                                });
-                            })
-                            .id("response-viewport")
-                            .debug_selector(|| "response-viewport".to_owned())
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .rounded(radius::CONTROL)
-                            .bg(theme::surface::input())
-                            .on_drag_move::<HScrollDrag>(move |event, window, cx| {
-                                drag_viewer.update(cx, |viewer, cx| {
-                                    viewer.drag_hscroll(event, window, cx);
-                                });
-                            })
-                            .on_scroll_wheel(move |event, window, cx| {
-                                wheel_viewer.update(cx, |viewer, cx| {
-                                    viewer.wheel_hscroll(event, window, cx);
-                                });
-                            })
-                            .on_action({
-                                let copy_viewer = viewer.clone();
-                                move |action: &CopySelection, window, cx| {
-                                    copy_viewer.update(cx, |viewer, cx| {
-                                        viewer.copy_selection(action, window, cx);
-                                    });
-                                }
-                            })
-                            .on_action({
-                                let select_all_viewer = viewer.clone();
-                                move |action: &SelectAllBody, window, cx| {
-                                    select_all_viewer.update(cx, |viewer, cx| {
-                                        viewer.select_all_body(action, window, cx);
-                                    });
-                                }
-                            })
-                            .child(body),
-                    )
-                    .into_any_element()
-            }
+    /// The active section's content.
+    fn render_section(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match view.section {
+            ResponseSection::Body => self.render_body_content(view, viewer, focused, cx),
             ResponseSection::Headers => headers_view(
-                &completed.headers,
+                &view.completed.headers,
                 theme::http_method(self.method),
                 self.copied,
                 viewer.clone(),
             ),
             ResponseSection::Cookies => cookies_view(
-                &completed.cookies,
+                &view.completed.cookies,
                 &self.cookies,
                 self.method,
                 self.cookies_selection,
                 &self.cookies_focus,
                 &viewer,
             ),
+        }
+    }
+
+    /// The Body section: the binary card, empty and parsing states, or the
+    /// active view inside the scrolling viewport.
+    fn render_body_content(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Shared scroll container for views that render a bounded
+        // column of rows. The code views scroll inside their own
+        // virtualized list instead.
+        let body_scroll = || {
+            div()
+                .id("response-body")
+                .debug_selector(|| "response-body".to_owned())
+                .flex_1()
+                .min_h_0()
+                // Both axes scroll: a wide table stays reachable
+                // instead of being clipped at the pane edge.
+                .overflow_scroll()
+                .flex()
+                .flex_col()
+                .gap(space::S2)
+                .px(space::S12)
+                .py(space::S4)
         };
 
+        let body: AnyElement = if let Some(meta) = &view.completed.preview.binary {
+            // A binary body is never decoded: the card states what it
+            // is and offers to save the retained bytes.
+            self.binary_card(
+                meta,
+                view.completed.preview.size,
+                view.completed.preview.truncated,
+                false,
+                cx,
+            )
+        } else if view.completed.body.is_empty() {
+            // A truly empty body gets a composed block. A body that is
+            // only whitespace still renders as text, because spaces are
+            // its content.
+            let title: &'static str = if view.event_stream {
+                i18n::t(Key::FramesEmpty)
+            } else {
+                i18n::t(Key::ResponseBodyEmpty)
+            };
+            body_scroll()
+                .child(
+                    empty_state("response-body-empty", EmptyStateScale::Table)
+                        .title(title)
+                        .into_any_element(),
+                )
+                .into_any_element()
+        } else if matches!(self.parsed, ParsedState::Parsing)
+            || matches!(self.frames, FramesState::Preparing)
+        {
+            body_scroll()
+                .child(
+                    div()
+                        .id("response-parsing")
+                        .debug_selector(|| "response-parsing".to_owned())
+                        .h(px(22.))
+                        .px(space::S4)
+                        .flex()
+                        .items_center()
+                        .text_role(type_role::META)
+                        .text_color(theme::text::secondary())
+                        .child(i18n::t(Key::ResponseParsing)),
+                )
+                .into_any_element()
+        } else {
+            self.render_body_modes(view, viewer.clone(), focused)
+        };
+
+        let prepaint_viewer = viewer.clone();
+        let drag_viewer = viewer.clone();
+        let wheel_viewer = viewer.clone();
         div()
-            .id("response-completed")
-            .debug_selector(|| "response-completed".to_owned())
+            .id("response-body-region")
+            .debug_selector(|| "response-body-region".to_owned())
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(space::S8)
-            .children(notices)
-            .child(strip)
-            .children(toolbar)
-            // The body area is the overlay's containing block, so the find
-            // widget floats above the content without entering the column.
+            .px(layout::PANE_PADDING)
             .child(
                 div()
-                    .relative()
+                    .on_children_prepainted(move |_, _, cx| {
+                        let viewer = prepaint_viewer.clone();
+                        cx.defer(move |cx| {
+                            viewer.update(cx, |viewer, cx| {
+                                viewer.refresh_hscroll(cx);
+                            });
+                        });
+                    })
+                    .id("response-viewport")
+                    .debug_selector(|| "response-viewport".to_owned())
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(content)
-                    .children(find_bar),
+                    .overflow_hidden()
+                    .rounded(radius::CONTROL)
+                    .bg(theme::surface::input())
+                    .on_drag_move::<HScrollDrag>(move |event, window, cx| {
+                        drag_viewer.update(cx, |viewer, cx| {
+                            viewer.drag_hscroll(event, window, cx);
+                        });
+                    })
+                    .on_scroll_wheel(move |event, window, cx| {
+                        wheel_viewer.update(cx, |viewer, cx| {
+                            viewer.wheel_hscroll(event, window, cx);
+                        });
+                    })
+                    .on_action({
+                        let copy_viewer = viewer.clone();
+                        move |action: &CopySelection, window, cx| {
+                            copy_viewer.update(cx, |viewer, cx| {
+                                viewer.copy_selection(action, window, cx);
+                            });
+                        }
+                    })
+                    .on_action({
+                        let select_all_viewer = viewer.clone();
+                        move |action: &SelectAllBody, window, cx| {
+                            select_all_viewer.update(cx, |viewer, cx| {
+                                viewer.select_all_body(action, window, cx);
+                            });
+                        }
+                    })
+                    .child(body),
             )
             .into_any_element()
+    }
+
+    /// The active body view. A new mode adds one arm here.
+    fn render_body_modes(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+        focused: bool,
+    ) -> AnyElement {
+        // The Frames cases reuse the same bounded scroll container as the
+        // other non-code views.
+        let body_scroll = || {
+            div()
+                .id("response-body")
+                .debug_selector(|| "response-body".to_owned())
+                .flex_1()
+                .min_h_0()
+                .overflow_scroll()
+                .flex()
+                .flex_col()
+                .gap(space::S2)
+                .px(space::S12)
+                .py(space::S4)
+        };
+        match (view.mode, self.parsed_body()) {
+            (ViewMode::Frames, _) => match self.frames_body() {
+                Some(frames) if frames.count() == 0 => body_scroll()
+                    .child(
+                        empty_state("response-frames-empty", EmptyStateScale::Table)
+                            .title(i18n::t(Key::FramesEmpty))
+                            .into_any_element(),
+                    )
+                    .into_any_element(),
+                Some(frames) => code_view(
+                    "response-frames-body",
+                    self.frames_lines()
+                        .expect("a ready frames body has display rows"),
+                    Some(frames.row_labels()),
+                    self.code_search(),
+                    false,
+                    self.frames_scroll.clone(),
+                    self.hscrollbar(ScrollTarget::Frames, &self.frames_scroll, viewer.clone()),
+                    Some(self.code_interaction(ScrollTarget::Frames, viewer.clone(), focused)),
+                ),
+                None => body_scroll().into_any_element(),
+            },
+            (ViewMode::Pretty, Some(parsed)) => code_view(
+                "response-pretty-body",
+                self.pretty_display_lines(parsed),
+                None,
+                self.code_search(),
+                true,
+                self.pretty_scroll.clone(),
+                self.hscrollbar(ScrollTarget::Pretty, &self.pretty_scroll, viewer.clone()),
+                Some(self.code_interaction(ScrollTarget::Pretty, viewer.clone(), focused)),
+            ),
+            (ViewMode::Tree, Some(parsed)) => {
+                let rows = parsed.tree.filtered_rows(&self.search, &self.expanded);
+                if rows.is_empty() {
+                    div()
+                        .id("response-tree-no-matches")
+                        .debug_selector(|| "response-tree-no-matches".to_owned())
+                        .h(px(22.))
+                        .px(space::S4)
+                        .flex()
+                        .items_center()
+                        .text_role(type_role::META)
+                        .text_color(theme::text::tertiary())
+                        .child(i18n::t(Key::CommonNoMatches))
+                        .into_any_element()
+                } else {
+                    tree_view(rows, viewer.clone(), self.copied)
+                }
+            }
+            (ViewMode::Table, Some(parsed)) => match &parsed.table {
+                Some(table) => table_view(
+                    table.clone(),
+                    self.table_scroll.clone(),
+                    self.hscrollbar(ScrollTarget::Table, &self.table_scroll, viewer.clone()),
+                ),
+                None => code_view(
+                    "response-raw-body",
+                    self.raw_display_lines(),
+                    None,
+                    self.code_search(),
+                    false,
+                    self.raw_scroll.clone(),
+                    self.hscrollbar(ScrollTarget::Raw, &self.raw_scroll, viewer.clone()),
+                    Some(self.code_interaction(ScrollTarget::Raw, viewer.clone(), focused)),
+                ),
+            },
+            _ => code_view(
+                "response-raw-body",
+                self.raw_display_lines(),
+                None,
+                self.code_search(),
+                false,
+                self.raw_scroll.clone(),
+                self.hscrollbar(ScrollTarget::Raw, &self.raw_scroll, viewer.clone()),
+                Some(self.code_interaction(ScrollTarget::Raw, viewer.clone(), focused)),
+            ),
+        }
     }
 }
 
@@ -8915,6 +9089,72 @@ mod tests {
         assert!(
             cx.debug_bounds("response-save-feedback").is_some(),
             "the confirmation states that the file is partial"
+        );
+    }
+
+    /// The JSON-looking answer is the one derivation that scans the preview.
+    /// The arrival seeds it, and a repaint must reuse it rather than scan the
+    /// body again.
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    async fn a_repaint_reuses_the_derived_preview_facts(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show(&viewer, cx, br#"{"a":1}"#, false);
+        let built = cx.update(|_, app| viewer.read(app).derivations_built());
+        redraw(cx);
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).derivations_built()),
+            built,
+            "a repaint reuses the facts instead of rescanning the preview"
+        );
+        assert_eq!(built, 1, "one response derives the preview facts once");
+    }
+
+    /// Setting, streaming, appending, and clearing each present different
+    /// content; a repaint of the same content does not.
+    #[gpui::test]
+    async fn response_changes_advance_the_generation(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let initial = cx.update(|_, app| viewer.read(app).response_generation);
+        show(&viewer, cx, b"first", false);
+        let after_set = cx.update(|_, app| viewer.read(app).response_generation);
+        assert_ne!(
+            after_set, initial,
+            "setting a response advances the generation"
+        );
+
+        redraw(cx);
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).response_generation),
+            after_set,
+            "a plain repaint does not advance the generation"
+        );
+
+        start_streaming(&viewer, cx, 200, Vec::new());
+        let after_stream = cx.update(|_, app| viewer.read(app).response_generation);
+        assert_ne!(
+            after_stream, after_set,
+            "replacing the response with a stream advances it"
+        );
+
+        append(&viewer, cx, b"chunk");
+        let after_append = cx.update(|_, app| viewer.read(app).response_generation);
+        assert_ne!(
+            after_append, after_stream,
+            "appending advances the generation"
+        );
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| {
+                viewer.clear_streaming(cx);
+            });
+        });
+        assert_ne!(
+            cx.update(|_, app| viewer.read(app).response_generation),
+            after_append,
+            "clearing the stream advances the generation"
         );
     }
 }
