@@ -698,8 +698,8 @@ the tree and raw views, naming the media type (or an unknown-type label), the
 retained size, and the suggested file name taken from `Content-Disposition`
 (falling back to `response.<ext>`, then `response.bin`). When the type is absent
 or `application/octet-stream`, the block also names the format recognized from
-the leading bytes, such as PNG or PDF, and the suggested name uses that
-extension. The block offers **Save body…**, **Save to Downloads**, and **View as
+the leading bytes, such as PNG or PDF, and the suggested name falls back to that
+extension when `Content-Disposition` names no file. The block offers **Save body…**, **Save to Downloads**, and **View as
 text**; **Copy base64** sits in the section strip beside the tabs. The
 `Tree / Raw` and **Find in body** controls and **Copy body** are hidden; the
 Headers and Cookies tabs are unchanged. When the body was truncated at the

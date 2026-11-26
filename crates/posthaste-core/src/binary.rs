@@ -652,7 +652,8 @@ mod tests {
         let headers = headers(&[("Content-Type", "image/jpeg")]);
         let meta = classify(&headers, b"\x89PNG\r\n\x1a\n", 8).expect("jpeg is binary");
         assert_eq!(meta.detected, None);
-        assert_eq!(meta.file_name.as_deref(), Some("response.jpg"));
+        // `mime_guess` lists `jpeg` first for `image/jpeg`.
+        assert_eq!(meta.file_name.as_deref(), Some("response.jpeg"));
     }
 
     #[test]
