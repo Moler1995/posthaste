@@ -323,6 +323,12 @@ text_table! {
     ResponseBinaryTruncated => "The response was truncated; a saved file will be incomplete." / "响应已被截断，保存的文件将不完整。",
     ResponseBinaryNotStored => "History keeps binary metadata only, so this body is not available." / "历史记录仅保留二进制元数据，无法提供正文。",
     ResponseSaveBody => "Save body…" / "保存正文…",
+    ResponseSaveToDownloads => "Save to Downloads" / "保存到下载目录",
+    ResponseReveal => "Reveal" / "在文件夹中显示",
+    ResponseCopyPath => "Copy path" / "复制路径",
+    ResponseCopyBase64 => "Copy base64" / "复制 Base64",
+    ResponseViewAsText => "View as text" / "以文本查看",
+    ResponseShowBinaryInfo => "Show binary info" / "显示二进制信息",
     FramesEmpty => "This event stream has no frames" / "此事件流没有帧",
     ResponseParsing => "Parsing large response…" / "正在解析较大的响应…",
 
@@ -520,9 +526,11 @@ message_table! {
     ResponseBinaryMediaType => "Media type: {}" / "类型：{}",
     ResponseBinarySize => "Size: {}" / "大小：{}",
     ResponseBinaryFileName => "Suggested name: {}" / "建议文件名：{}",
+    ResponseDetectedFormat => "Detected format: {}" / "识别格式：{}",
+    ResponseTextFallbackNotice => "At most the first {} of the retained bytes is shown as lossy UTF-8 text; invalid bytes are replaced." / "最多显示保留的前 {} 字节（有损 UTF-8 文本），无效字节已替换。",
     ResponseBodySaved => "Saved to {}" / "已保存到 {}",
     ResponseBodySavedPartial => "Saved the retained prefix to {}; the response was truncated." / "已保存保留的前缀到 {}；响应已被截断。",
-    ResponseBodySaveFailed => "Could not save: {}" / "保存失败：{}",
+    ResponseBodySaveFailed => "Could not save to {}: {}" / "无法保存到 {}：{}",
 
     // The request editor's dialogs and validation.
     CookiesSummarySent => "{} stored · {} sent with this request" / "已存储 {} · 本请求将发送 {}",

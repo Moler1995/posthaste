@@ -37,7 +37,9 @@ no telemetry.
 ## Features
 
 - **Native HTTP and WebSocket** — real requests through reqwest and rustls, a
-  collapsible JSON tree, raw text, headers, timing, size, and binary-body save.
+  collapsible JSON tree, raw text, headers, timing, size, and binary responses
+  with save-to-file, save-to-Downloads, copy-as-base64, and a bounded
+  view-as-text fallback.
 - **Git-friendly workspace** — collections, folders, requests, environments,
   and uploaded files are plain JSON and files, written atomically with stable
   names.

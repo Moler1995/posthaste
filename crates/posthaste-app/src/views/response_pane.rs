@@ -121,6 +121,7 @@ pub fn preview_stored_body(stored: &StoredResponse) -> BodyPreview {
             media_type: meta.media_type.clone(),
             file_name: meta.file_name.clone(),
             body_stored: false,
+            detected: None,
         }),
     }
 }

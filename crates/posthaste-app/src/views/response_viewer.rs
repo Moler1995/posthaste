@@ -9,11 +9,13 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use gpui::{
     AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
@@ -91,6 +93,11 @@ const BODY_MATCH_LIMIT: usize = 10_000;
 /// with the completed record; this only bounds what a stream can hold.
 pub const STREAMING_LIMIT: usize = 512 * 1024;
 
+/// Most retained binary bytes the explicit View as text action decodes. The
+/// fallback is for inspecting a small mislabeled body, not for reading a
+/// download, so it stays far below the retained-body cap.
+pub const BINARY_TEXT_FALLBACK_LIMIT: usize = 1024 * 1024;
+
 actions!(posthaste_response_body, [CopySelection, SelectAllBody]);
 
 /// Copies the selected body text while the body has focus.
@@ -117,6 +124,9 @@ enum ScrollTarget {
     Frames,
     Streaming,
     StreamingFrames,
+    /// The lossy text fallback of a binary body, shown only while View as text
+    /// is active.
+    BinaryText,
 }
 
 /// The selected text of one body view. Ranges index that view's [`CodeLines`],
@@ -654,6 +664,9 @@ pub enum ResponseSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyTarget {
     Body,
+    Base64,
+    /// The path of a just-saved binary body.
+    SavePath,
     Header(usize),
     TreeValue(usize),
     TreePath(usize),
@@ -689,7 +702,7 @@ pub struct StreamingMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SaveFeedback {
     Saved { path: PathBuf, partial: bool },
-    Failed(String),
+    Failed { path: PathBuf, error: String },
 }
 
 /// Whether a live body has been identified as an event stream.
@@ -930,6 +943,21 @@ pub struct ResponseViewer {
     /// The last Save body… outcome, shown under the binary card until another
     /// response replaces it.
     save_feedback: Option<SaveFeedback>,
+    /// The directory of the last successful Save body… dialog, reused by the
+    /// next one. Save to Downloads does not change it.
+    last_save_dir: Option<PathBuf>,
+    /// Whether the reader asked to inspect a binary body as text. The response
+    /// stays classified as binary; this only changes the Body section.
+    binary_as_text: bool,
+    /// Display rows of the lossy fallback, capped at
+    /// [`BINARY_TEXT_FALLBACK_LIMIT`] and built when the action activates.
+    binary_text_lines: Rc<CodeLines>,
+    wrapped_binary_text: Option<WrappedView>,
+    binary_text_scroll: UniformListScrollHandle,
+    /// Test seam: the directory Save to Downloads writes to instead of the
+    /// machine's downloads directory.
+    #[cfg(test)]
+    save_directory: Option<PathBuf>,
     parsed: ParsedState,
     expanded: BTreeSet<usize>,
     mode: ViewMode,
@@ -1082,6 +1110,13 @@ impl ResponseViewer {
             derivations_built: 0,
             streaming: None,
             save_feedback: None,
+            last_save_dir: None,
+            binary_as_text: false,
+            binary_text_lines: Rc::new(CodeLines::new("")),
+            wrapped_binary_text: None,
+            binary_text_scroll: UniformListScrollHandle::new(),
+            #[cfg(test)]
+            save_directory: None,
             parsed: ParsedState::Unparsed,
             expanded: BTreeSet::new(),
             mode: ViewMode::Raw,
@@ -1147,6 +1182,7 @@ impl ResponseViewer {
         self.wrap_long_lines = enabled;
         self.wrapped_raw = None;
         self.wrapped_pretty = None;
+        self.wrapped_binary_text = None;
         self.hscroll = None;
         cx.notify();
     }
@@ -1158,6 +1194,7 @@ impl ResponseViewer {
         if !self.wrap_long_lines {
             self.wrapped_raw = None;
             self.wrapped_pretty = None;
+            self.wrapped_binary_text = None;
             return false;
         }
         let Some(width) = self.wrap_width else {
@@ -1173,20 +1210,42 @@ impl ResponseViewer {
             window,
         );
         self.wrapped_raw = Some(wrapped_raw);
-        if let Some(parsed) = self.parsed_body() {
-            let pretty = parsed.pretty.clone();
-            let (wrapped_pretty, pretty_changed) = wrap_source(
-                pretty.clone(),
-                self.wrapped_pretty.take(),
+        // The fallback is wrapped like Raw, so a wide lossy line stays legible
+        // without a horizontal scrollbar.
+        let binary_changed = if self.binary_as_text {
+            let text = self.binary_text_lines.clone();
+            let (wrapped, changed) = wrap_source(
+                text.clone(),
+                self.wrapped_binary_text.take(),
                 width,
                 font_size,
                 window,
             );
-            self.wrapped_pretty = Some(wrapped_pretty);
-            return raw_changed || pretty_changed;
-        }
-        self.wrapped_pretty = None;
-        raw_changed
+            self.wrapped_binary_text = Some(wrapped);
+            changed
+        } else {
+            self.wrapped_binary_text = None;
+            false
+        };
+        let pretty_changed = match self.parsed_body() {
+            Some(parsed) => {
+                let pretty = parsed.pretty.clone();
+                let (wrapped_pretty, changed) = wrap_source(
+                    pretty.clone(),
+                    self.wrapped_pretty.take(),
+                    width,
+                    font_size,
+                    window,
+                );
+                self.wrapped_pretty = Some(wrapped_pretty);
+                changed
+            }
+            None => {
+                self.wrapped_pretty = None;
+                false
+            }
+        };
+        raw_changed || pretty_changed || binary_changed
     }
 
     /// The wrapped rows for `source` when the cache matches it, otherwise the
@@ -1209,6 +1268,11 @@ impl ResponseViewer {
     fn pretty_display_lines(&self, parsed: &ParsedBody) -> Rc<CodeLines> {
         self.wrapped_lines(&self.wrapped_pretty, &parsed.pretty)
             .unwrap_or_else(|| parsed.pretty.clone())
+    }
+
+    fn binary_display_lines(&self) -> Rc<CodeLines> {
+        self.wrapped_lines(&self.wrapped_binary_text, &self.binary_text_lines)
+            .unwrap_or_else(|| self.binary_text_lines.clone())
     }
 
     /// Replaces the presented response, discarding the parse result and
@@ -1448,6 +1512,11 @@ impl ResponseViewer {
         self.copied = None;
         self.copy_generation = self.copy_generation.wrapping_add(1);
         self.save_feedback = None;
+        // The inspection fallback belongs to the previous body; a new response
+        // always starts from the binary presentation.
+        self.binary_as_text = false;
+        self.binary_text_lines = Rc::new(CodeLines::new(""));
+        self.wrapped_binary_text = None;
         self.find_open = false;
         self.expanded.clear();
         self.cancel_parse();
@@ -1487,6 +1556,7 @@ impl ResponseViewer {
             &self.raw_scroll,
             &self.table_scroll,
             &self.frames_scroll,
+            &self.binary_text_scroll,
         ] {
             scroll
                 .0
@@ -1949,6 +2019,11 @@ impl ResponseViewer {
         {
             return None;
         }
+        if completed.preview.binary.is_some() {
+            return self
+                .binary_as_text
+                .then(|| (ScrollTarget::BinaryText, self.binary_text_scroll.clone()));
+        }
         match (self.mode, self.parsed_body()) {
             (ViewMode::Pretty, Some(_)) => Some((ScrollTarget::Pretty, self.pretty_scroll.clone())),
             (ViewMode::Frames, _) => self
@@ -1978,6 +2053,7 @@ impl ResponseViewer {
                 .as_ref()
                 .and_then(|stream| stream.frames.as_ref())
                 .map(|frames| frames.lines()),
+            ScrollTarget::BinaryText => Some(self.binary_display_lines()),
             ScrollTarget::Table => None,
         }
     }
@@ -1994,6 +2070,7 @@ impl ResponseViewer {
                 .streaming
                 .as_ref()
                 .map(|stream| stream.frames_scroll.clone()),
+            ScrollTarget::BinaryText => Some(self.binary_text_scroll.clone()),
         }
     }
 
@@ -2021,9 +2098,11 @@ impl ResponseViewer {
         // text list's width; a resize repaints so the next render re-splits
         // the rows at the new width.
         let wrap_width = match measured {
-            Some((ScrollTarget::Pretty | ScrollTarget::Raw, viewport, _)) if viewport > px(0.) => {
-                Some(viewport)
-            }
+            Some((
+                ScrollTarget::Pretty | ScrollTarget::Raw | ScrollTarget::BinaryText,
+                viewport,
+                _,
+            )) if viewport > px(0.) => Some(viewport),
             _ => self.wrap_width,
         };
         let width_changed = self.wrap_long_lines && wrap_width != self.wrap_width;
@@ -2047,7 +2126,12 @@ impl ResponseViewer {
         // Wrapped rows fit the viewport by construction, so the Pretty and Raw
         // views offer no horizontal bar while wrapping is on. Table keeps its
         // own bar because its columns do not wrap.
-        if self.wrap_long_lines && matches!(target, ScrollTarget::Pretty | ScrollTarget::Raw) {
+        if self.wrap_long_lines
+            && matches!(
+                target,
+                ScrollTarget::Pretty | ScrollTarget::Raw | ScrollTarget::BinaryText
+            )
+        {
             return None;
         }
         let metrics = self.hscroll.filter(|metrics| metrics.target == target)?;
@@ -2194,7 +2278,12 @@ impl ResponseViewer {
         let Some((target, scroll)) = self.active_hscroll() else {
             return;
         };
-        if self.wrap_long_lines && matches!(target, ScrollTarget::Pretty | ScrollTarget::Raw) {
+        if self.wrap_long_lines
+            && matches!(
+                target,
+                ScrollTarget::Pretty | ScrollTarget::Raw | ScrollTarget::BinaryText
+            )
+        {
             return;
         }
         if self.hscroll.map(|metrics| metrics.target) != Some(target) {
@@ -2330,7 +2419,10 @@ impl ResponseViewer {
         let Some((target, _)) = self.active_hscroll() else {
             return;
         };
-        if !matches!(target, ScrollTarget::Pretty | ScrollTarget::Raw) {
+        if !matches!(
+            target,
+            ScrollTarget::Pretty | ScrollTarget::Raw | ScrollTarget::BinaryText
+        ) {
             return;
         }
         let Some(lines) = self.code_lines_for(target) else {
@@ -2712,9 +2804,10 @@ impl ResponseViewer {
     }
 
     /// Asks where to save a binary body and writes the retained bytes there.
-    /// The write runs off the UI thread; its outcome is shown under the card
-    /// until another response replaces it. A metadata-only history entry has
-    /// no bytes to save and offers no action.
+    /// The dialog opens in the directory of the last successful save, and the
+    /// write runs off the UI thread; its outcome is shown under the card until
+    /// another response replaces it. A metadata-only history entry has no bytes
+    /// to save and offers no action.
     pub fn save_body(&mut self, cx: &mut Context<Self>) {
         let Some(completed) = &self.completed else {
             return;
@@ -2729,7 +2822,10 @@ impl ResponseViewer {
             .file_name
             .clone()
             .unwrap_or_else(|| "response.bin".to_owned());
-        let directory = crate::app::export_directory();
+        let directory = self
+            .last_save_dir
+            .clone()
+            .unwrap_or_else(crate::app::export_directory);
         let dialog = cx.prompt_for_new_path(&directory, Some(&suggested));
         let bytes = completed.body.clone();
         let partial = completed.preview.truncated;
@@ -2746,8 +2842,13 @@ impl ResponseViewer {
                 .await;
             this.update(cx, |viewer, cx| {
                 viewer.save_feedback = Some(match result {
-                    Ok(()) => SaveFeedback::Saved { path, partial },
-                    Err(error) => SaveFeedback::Failed(error),
+                    Ok(()) => {
+                        // Only a successful dialog save is remembered; a quick
+                        // save must not move the next dialog.
+                        viewer.last_save_dir = path.parent().map(Path::to_path_buf);
+                        SaveFeedback::Saved { path, partial }
+                    }
+                    Err(error) => SaveFeedback::Failed { path, error },
                 });
                 cx.notify();
             })
@@ -2757,11 +2858,151 @@ impl ResponseViewer {
         cx.notify();
     }
 
-    /// The card that replaces text for a binary body. It names the media type
-    /// and retained size, suggests a save name, states any limitation, and —
-    /// for a live response whose bytes are available — offers Save body… and
-    /// reports the last outcome. A history entry keeps metadata only, so it
-    /// offers neither Save nor Copy.
+    /// Writes a binary body to the downloads directory without a dialog. An
+    /// existing file is never overwritten: the first free ` (n)` name wins.
+    pub fn save_body_to_downloads(&mut self, cx: &mut Context<Self>) {
+        let Some(completed) = &self.completed else {
+            return;
+        };
+        let Some(meta) = &completed.preview.binary else {
+            return;
+        };
+        if !meta.body_stored {
+            return;
+        }
+        let suggested = meta
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "response.bin".to_owned());
+        let directory = self.quick_save_directory();
+        let bytes = completed.body.clone();
+        let partial = completed.preview.truncated;
+        self.save_feedback = None;
+        let failed_path = directory.join(&suggested);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let target = unique_save_target(&directory, &suggested);
+                    std::fs::write(&target, &bytes)
+                        .map(|()| target)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |viewer, cx| {
+                viewer.save_feedback = Some(match result {
+                    Ok(path) => SaveFeedback::Saved { path, partial },
+                    Err(error) => SaveFeedback::Failed {
+                        path: failed_path,
+                        error,
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The directory Save to Downloads writes to. Tests point it at a
+    /// temporary directory instead of the machine's downloads.
+    fn quick_save_directory(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.save_directory {
+            return directory.clone();
+        }
+        crate::app::export_directory()
+    }
+
+    /// Copies the full retained binary bytes as standard base64. The encoding
+    /// runs when the action activates, never on a frame.
+    fn copy_base64(&mut self, cx: &mut Context<Self>) {
+        let Some(completed) = &self.completed else {
+            return;
+        };
+        if !completed
+            .preview
+            .binary
+            .as_ref()
+            .is_some_and(|meta| meta.body_stored)
+        {
+            return;
+        }
+        let encoded = BASE64.encode(&completed.body);
+        self.copy(CopyTarget::Base64, encoded, cx);
+    }
+
+    /// Switches the Body section to the lossy text fallback, decoding at most
+    /// [`BINARY_TEXT_FALLBACK_LIMIT`] of the retained bytes. The response stays
+    /// classified as binary; Find and Copy body stay unavailable.
+    pub fn view_binary_as_text(&mut self, cx: &mut Context<Self>) {
+        let Some(completed) = &self.completed else {
+            return;
+        };
+        if !completed
+            .preview
+            .binary
+            .as_ref()
+            .is_some_and(|meta| meta.body_stored)
+            || self.binary_as_text
+        {
+            return;
+        }
+        let retained = &completed.body[..completed.body.len().min(BINARY_TEXT_FALLBACK_LIMIT)];
+        let text = String::from_utf8_lossy(retained).into_owned();
+        self.binary_as_text = true;
+        self.binary_text_lines = Rc::new(CodeLines::new(text.as_str()));
+        self.wrapped_binary_text = None;
+        self.hscroll = None;
+        self.clear_body_selection();
+        self.binary_text_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
+        self.binary_text_scroll
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Returns to the binary information block from the text fallback.
+    pub fn show_binary_info(&mut self, cx: &mut Context<Self>) {
+        if !self.binary_as_text {
+            return;
+        }
+        self.binary_as_text = false;
+        self.binary_text_lines = Rc::new(CodeLines::new(""));
+        self.wrapped_binary_text = None;
+        self.hscroll = None;
+        self.clear_body_selection();
+        cx.notify();
+    }
+
+    /// Opens the containing folder of a saved file. A missing file manager is
+    /// ignored: the path stays visible and copyable.
+    fn reveal_in_file_manager(path: &Path) {
+        #[cfg(target_os = "windows")]
+        let command = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let command = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let command = std::process::Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(path))
+            .spawn();
+        let _ = command;
+    }
+
+    /// The information block that replaces text for a binary body, anchored to
+    /// the top of the Body section. It names the media type (and any detected
+    /// format), retained size, and suggested save name, states any limitation,
+    /// and — for a live response whose bytes are available — offers the save
+    /// and inspection actions with the last save outcome. A history entry keeps
+    /// metadata only, so it offers no action.
     fn binary_card(
         &self,
         meta: &BinaryMeta,
@@ -2779,12 +3020,7 @@ impl ResponseViewer {
             .flex()
             .flex_col()
             .gap(space::S8)
-            .p(space::S12)
-            .max_w(px(440.))
-            .rounded(radius::CONTROL)
-            .border_1()
-            .border_color(theme::border::subtle())
-            .bg(theme::surface::overlay())
+            .max_w(px(560.))
             .child(
                 div()
                     .debug_selector(|| "response-binary-title".to_owned())
@@ -2804,6 +3040,18 @@ impl ResponseViewer {
                 MessageKey::ResponseBinarySize,
                 &[&format_bytes(size)],
             )));
+        if let Some(detected) = &meta.detected {
+            card = card.child(
+                div()
+                    .debug_selector(|| "response-binary-detected".to_owned())
+                    .text_role(type_role::META)
+                    .text_color(theme::text::secondary())
+                    .child(i18n::msg(
+                        MessageKey::ResponseDetectedFormat,
+                        &[&detected.label],
+                    )),
+            );
+        }
         if !streaming && let Some(name) = &meta.file_name {
             card = card.child(binary_fact(i18n::msg(
                 MessageKey::ResponseBinaryFileName,
@@ -2824,46 +3072,189 @@ impl ResponseViewer {
         }
         if !streaming && meta.body_stored {
             let viewer = cx.entity();
-            card = card.child(
-                super::ui::ghost_button("response-save-body", i18n::t(Key::ResponseSaveBody))
-                    .debug_selector(|| "response-save-body".to_owned())
+            let save_body_viewer = viewer.clone();
+            let downloads_viewer = viewer.clone();
+            let text_viewer = viewer;
+            let mut actions = div()
+                .debug_selector(|| "response-binary-actions".to_owned())
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(space::S4)
+                .child(
+                    super::ui::ghost_button("response-save-body", i18n::t(Key::ResponseSaveBody))
+                        .debug_selector(|| "response-save-body".to_owned())
+                        .on_click(move |_, _, cx| {
+                            save_body_viewer.update(cx, |viewer, cx| viewer.save_body(cx));
+                        }),
+                )
+                .child(
+                    super::ui::ghost_button(
+                        "response-save-downloads",
+                        i18n::t(Key::ResponseSaveToDownloads),
+                    )
+                    .debug_selector(|| "response-save-downloads".to_owned())
                     .on_click(move |_, _, cx| {
-                        viewer.update(cx, |viewer, cx| viewer.save_body(cx));
+                        downloads_viewer.update(cx, |viewer, cx| {
+                            viewer.save_body_to_downloads(cx);
+                        });
                     }),
-            );
+                );
+            if size > 0 {
+                actions = actions.child(
+                    super::ui::ghost_button(
+                        "response-view-as-text",
+                        i18n::t(Key::ResponseViewAsText),
+                    )
+                    .debug_selector(|| "response-view-as-text".to_owned())
+                    .on_click(move |_, _, cx| {
+                        text_viewer.update(cx, |viewer, cx| {
+                            viewer.view_binary_as_text(cx);
+                        });
+                    }),
+                );
+            }
+            card = card.child(actions);
         }
         if !streaming && let Some(feedback) = self.save_feedback.clone() {
-            let (selector, color, text) = match feedback {
-                SaveFeedback::Saved { path, partial } => (
-                    "response-save-feedback",
-                    theme::text::secondary(),
-                    if partial {
-                        i18n::msg(MessageKey::ResponseBodySavedPartial, &[&path.display()])
-                    } else {
-                        i18n::msg(MessageKey::ResponseBodySaved, &[&path.display()])
-                    },
-                ),
-                SaveFeedback::Failed(error) => (
-                    "response-save-error",
-                    theme::status::danger(),
-                    i18n::msg(MessageKey::ResponseBodySaveFailed, &[&error]),
-                ),
-            };
-            card = card.child(
-                div()
-                    .debug_selector(move || selector.to_owned())
-                    .text_role(type_role::META)
-                    .text_color(color)
-                    .child(text),
-            );
+            card = card.child(self.save_feedback_row(feedback, cx));
         }
         div()
+            .id("response-binary")
+            .debug_selector(|| "response-binary".to_owned())
             .flex_1()
+            .min_h_0()
+            .overflow_scroll()
             .flex()
+            .flex_col()
             .items_start()
-            .justify_center()
             .p(space::S16)
             .child(card)
+            .into_any_element()
+    }
+
+    /// The saved-row confirmation with its Reveal and Copy path actions, or the
+    /// failure message naming the path that could not be written.
+    fn save_feedback_row(&self, feedback: SaveFeedback, cx: &mut Context<Self>) -> AnyElement {
+        match feedback {
+            SaveFeedback::Saved { path, partial } => {
+                let text = if partial {
+                    i18n::msg(MessageKey::ResponseBodySavedPartial, &[&path.display()])
+                } else {
+                    i18n::msg(MessageKey::ResponseBodySaved, &[&path.display()])
+                };
+                let reveal_path = path.clone();
+                let copy_path = path.display().to_string();
+                let viewer = cx.entity();
+                let label: &'static str = if self.copied == Some(CopyTarget::SavePath) {
+                    i18n::t(Key::CommonCopied)
+                } else {
+                    i18n::t(Key::ResponseCopyPath)
+                };
+                div()
+                    .debug_selector(|| "response-save-feedback".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(space::S4)
+                    .child(
+                        div()
+                            .text_role(type_role::META)
+                            .text_color(theme::text::secondary())
+                            .child(text),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S4)
+                            .child(
+                                super::ui::ghost_button(
+                                    "response-reveal",
+                                    i18n::t(Key::ResponseReveal),
+                                )
+                                .debug_selector(|| "response-reveal".to_owned())
+                                .on_click(move |_, _, _| {
+                                    Self::reveal_in_file_manager(&reveal_path);
+                                }),
+                            )
+                            .child(
+                                super::ui::ghost_button("response-copy-path", label)
+                                    .debug_selector(|| "response-copy-path".to_owned())
+                                    .on_click(move |_, _, cx| {
+                                        let contents = copy_path.clone();
+                                        viewer.update(cx, |viewer, cx| {
+                                            viewer.copy(CopyTarget::SavePath, contents, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            SaveFeedback::Failed { path, error } => div()
+                .debug_selector(|| "response-save-error".to_owned())
+                .text_role(type_role::META)
+                .text_color(theme::status::danger())
+                .child(i18n::msg(
+                    MessageKey::ResponseBodySaveFailed,
+                    &[&path.display(), &error],
+                ))
+                .into_any_element(),
+        }
+    }
+
+    /// The lossy text fallback of a binary body: the bounded Raw presentation
+    /// with a notice naming the cap and a way back to the binary information.
+    fn binary_text_fallback(&self, viewer: Entity<ResponseViewer>, focused: bool) -> AnyElement {
+        let info_viewer = viewer.clone();
+        let notice = div()
+            .debug_selector(|| "response-binary-text-notice".to_owned())
+            .flex()
+            .items_center()
+            .gap(space::S8)
+            .px(space::S12)
+            .py(space::S4)
+            .child(
+                div()
+                    .flex_1()
+                    .text_role(type_role::META)
+                    .text_color(theme::text::secondary())
+                    .child(i18n::msg(
+                        MessageKey::ResponseTextFallbackNotice,
+                        &[&format_bytes(BINARY_TEXT_FALLBACK_LIMIT)],
+                    )),
+            )
+            .child(
+                super::ui::ghost_button(
+                    "response-show-binary",
+                    i18n::t(Key::ResponseShowBinaryInfo),
+                )
+                .debug_selector(|| "response-show-binary".to_owned())
+                .on_click(move |_, _, cx| {
+                    info_viewer.update(cx, |viewer, cx| viewer.show_binary_info(cx));
+                }),
+            );
+        div()
+            .id("response-binary-text")
+            .debug_selector(|| "response-binary-text".to_owned())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(notice)
+            .child(code_view(
+                "response-binary-text-body",
+                self.binary_display_lines(),
+                None,
+                None,
+                false,
+                self.binary_text_scroll.clone(),
+                self.hscrollbar(
+                    ScrollTarget::BinaryText,
+                    &self.binary_text_scroll,
+                    viewer.clone(),
+                ),
+                Some(self.code_interaction(ScrollTarget::BinaryText, viewer, focused)),
+            ))
             .into_any_element()
     }
 
@@ -2900,6 +3291,20 @@ impl ResponseViewer {
     #[cfg(test)]
     pub(crate) fn copied(&self) -> Option<CopyTarget> {
         self.copied
+    }
+
+    /// Whether the Body section is showing the lossy text fallback instead of
+    /// the binary information block.
+    #[cfg(test)]
+    pub(crate) fn binary_as_text(&self) -> bool {
+        self.binary_as_text
+    }
+
+    /// The directory the last successful Save body… wrote to, which the next
+    /// dialog opens in.
+    #[cfg(test)]
+    pub(crate) fn last_save_directory(&self) -> Option<PathBuf> {
+        self.last_save_dir.clone()
     }
 
     #[cfg(test)]
@@ -3141,9 +3546,11 @@ fn copy_button(
 ) -> AnyElement {
     let id_label: SharedString = label.into();
     let width = match target {
-        CopyTarget::Body => layout::COPY_BODY,
+        CopyTarget::Body | CopyTarget::Base64 => layout::COPY_BODY,
         CopyTarget::Header(_) => layout::COPY_HEADER,
-        CopyTarget::TreeValue(_) | CopyTarget::TreePath(_) => layout::CONTROL_COMPACT,
+        CopyTarget::TreeValue(_) | CopyTarget::TreePath(_) | CopyTarget::SavePath => {
+            layout::CONTROL_COMPACT
+        }
     };
     super::ui::ghost_button(element_id, id_label)
         .debug_selector(move || selector.clone())
@@ -3174,6 +3581,51 @@ fn body_copy_button(viewer: Entity<ResponseViewer>, label: &'static str) -> AnyE
             viewer.update(cx, |viewer, cx| viewer.copy_body(cx));
         })
         .into_any_element()
+}
+
+/// The Copy base64 control of a live binary body. The encoding happens when the
+/// action runs, so a multi-megabyte body is not encoded on every frame.
+fn base64_copy_button(viewer: Entity<ResponseViewer>, label: &'static str) -> AnyElement {
+    super::ui::ghost_button(("response-copy-base64", 0_usize), label)
+        .debug_selector(|| "response-copy-base64".to_owned())
+        .h(px(24.))
+        .w(layout::COPY_BODY)
+        .justify_center()
+        .px(space::S8)
+        .text_role(type_role::MICRO)
+        .on_click(move |_, _, cx| {
+            viewer.update(cx, |viewer, cx| viewer.copy_base64(cx));
+        })
+        .into_any_element()
+}
+
+/// The first free quick-save path: `name (n).ext` when `name.ext` is taken, so
+/// an existing file is never overwritten.
+fn unique_save_target(directory: &Path, file_name: &str) -> PathBuf {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "response".to_owned());
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned());
+    let mut n = 1;
+    loop {
+        let name = match &extension {
+            Some(extension) => format!("{stem} ({n}).{extension}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// One metadata line on the binary card.
@@ -4650,14 +5102,31 @@ impl ResponseViewer {
             )
             .child(div().flex_1());
 
-        // A binary body has no text to copy; the card offers Save instead.
-        if view.body_section && !view.binary {
-            let label: &'static str = if self.copied == Some(CopyTarget::Body) {
-                i18n::t(Key::CommonCopied)
-            } else {
-                i18n::t(Key::ResponseCopyBody)
-            };
-            strip = strip.child(body_copy_button(viewer.clone(), label));
+        // A binary body has no text to copy; it offers base64 of its bytes
+        // instead, while a live response still retains them.
+        if view.body_section {
+            let live_binary = view.binary
+                && view
+                    .completed
+                    .preview
+                    .binary
+                    .as_ref()
+                    .is_some_and(|meta| meta.body_stored);
+            if live_binary {
+                let label: &'static str = if self.copied == Some(CopyTarget::Base64) {
+                    i18n::t(Key::CommonCopied)
+                } else {
+                    i18n::t(Key::ResponseCopyBase64)
+                };
+                strip = strip.child(base64_copy_button(viewer.clone(), label));
+            } else if !view.binary {
+                let label: &'static str = if self.copied == Some(CopyTarget::Body) {
+                    i18n::t(Key::CommonCopied)
+                } else {
+                    i18n::t(Key::ResponseCopyBody)
+                };
+                strip = strip.child(body_copy_button(viewer.clone(), label));
+            }
         }
         strip
     }
@@ -5026,15 +5495,20 @@ impl ResponseViewer {
         };
 
         let body: AnyElement = if let Some(meta) = &view.completed.preview.binary {
-            // A binary body is never decoded: the card states what it
-            // is and offers to save the retained bytes.
-            self.binary_card(
-                meta,
-                view.completed.preview.size,
-                view.completed.preview.truncated,
-                false,
-                cx,
-            )
+            // A binary body is never decoded by default: the block states what
+            // it is and offers the save and inspection actions. View as text is
+            // the one explicit, bounded exception.
+            if self.binary_as_text && meta.body_stored {
+                self.binary_text_fallback(viewer.clone(), focused)
+            } else {
+                self.binary_card(
+                    meta,
+                    view.completed.preview.size,
+                    view.completed.preview.truncated,
+                    false,
+                    cx,
+                )
+            }
         } else if view.completed.body.is_empty() {
             // A truly empty body gets a composed block. A body that is
             // only whitespace still renders as text, because spaces are
@@ -8932,8 +9406,12 @@ mod tests {
 
         assert!(cx.debug_bounds("response-binary-card").is_some());
         assert!(cx.debug_bounds("response-binary-not-stored").is_some());
+        assert!(cx.debug_bounds("response-binary-actions").is_none());
         assert!(cx.debug_bounds("response-save-body").is_none());
+        assert!(cx.debug_bounds("response-save-downloads").is_none());
+        assert!(cx.debug_bounds("response-view-as-text").is_none());
         assert!(cx.debug_bounds("response-copy-body").is_none());
+        assert!(cx.debug_bounds("response-copy-base64").is_none());
     }
 
     #[gpui::test]
@@ -9052,7 +9530,7 @@ mod tests {
 
         assert!(matches!(
             cx.update(|_, app| viewer.read(app).save_feedback()),
-            Some(SaveFeedback::Failed(_))
+            Some(SaveFeedback::Failed { .. })
         ));
         assert!(cx.debug_bounds("response-save-error").is_some());
         assert!(
@@ -9089,6 +9567,326 @@ mod tests {
         assert!(
             cx.debug_bounds("response-save-feedback").is_some(),
             "the confirmation states that the file is partial"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_live_binary_card_lists_its_actions_in_order(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+
+        assert!(cx.debug_bounds("response-binary-actions").is_some());
+        assert!(cx.debug_bounds("response-copy-base64").is_some());
+        assert!(
+            cx.debug_bounds("response-copy-body").is_none(),
+            "a binary body copies base64 instead of decoded text"
+        );
+        let save = cx
+            .debug_bounds("response-save-body")
+            .expect("Save body… is offered");
+        let downloads = cx
+            .debug_bounds("response-save-downloads")
+            .expect("Save to Downloads is offered");
+        let as_text = cx
+            .debug_bounds("response-view-as-text")
+            .expect("View as text is offered");
+        let at = |bounds: gpui::Bounds<gpui::Pixels>| (bounds.origin.y, bounds.origin.x);
+        assert!(at(save) < at(downloads), "Save body… comes first");
+        assert!(at(downloads) < at(as_text), "View as text comes last");
+    }
+
+    #[gpui::test]
+    async fn an_empty_binary_body_offers_no_text_fallback(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[], false);
+
+        assert!(cx.debug_bounds("response-save-body").is_some());
+        assert!(
+            cx.debug_bounds("response-view-as-text").is_none(),
+            "there are no bytes to show as text"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_generic_binary_body_shows_the_format_its_bytes_reveal(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(
+            &viewer,
+            cx,
+            vec![("content-type".into(), "application/octet-stream".into())],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            false,
+        );
+
+        assert!(cx.debug_bounds("response-binary-card").is_some());
+        assert!(cx.debug_bounds("response-binary-detected").is_some());
+    }
+
+    #[gpui::test]
+    async fn a_declared_type_is_not_second_guessed_by_the_bytes(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+
+        assert!(
+            cx.debug_bounds("response-binary-detected").is_none(),
+            "a declared image/png needs no detected-format line"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_quick_save_never_overwrites_an_existing_file(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(dir.path().join("plot.png"), b"older").expect("seed the collision");
+        let bytes = [0x89, b'P', b'N', b'G', 0, 1];
+        show_with_headers(&viewer, cx, png_headers(), &bytes, false);
+        let quick = dir.path().to_path_buf();
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, _| viewer.save_directory = Some(quick));
+        });
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body_to_downloads(cx));
+        });
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert_eq!(
+            std::fs::read(dir.path().join("plot.png")).expect("the original is kept"),
+            b"older"
+        );
+        let target = dir.path().join("plot (1).png");
+        assert_eq!(
+            std::fs::read(&target).expect("the collision name is written"),
+            bytes
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).save_feedback()),
+            Some(SaveFeedback::Saved {
+                path: target,
+                partial: false,
+            })
+        );
+        assert!(
+            cx.update(|_, app| viewer.read(app).last_save_directory())
+                .is_none(),
+            "a quick save does not move the next dialog"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_failed_quick_save_names_the_directory(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        let missing = dir.path().join("missing");
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+        let quick = missing.clone();
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, _| viewer.save_directory = Some(quick));
+        });
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body_to_downloads(cx));
+        });
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert!(matches!(
+            cx.update(|_, app| viewer.read(app).save_feedback()),
+            Some(SaveFeedback::Failed { path, .. }) if path == missing.join("plot.png")
+        ));
+        assert!(cx.debug_bounds("response-save-error").is_some());
+    }
+
+    #[gpui::test]
+    async fn the_save_dialog_reopens_in_the_last_saved_directory(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let first = tempfile::tempdir().expect("temp directory");
+        let second = tempfile::tempdir().expect("temp directory");
+        let bytes = [0x89, b'P', b'N', b'G'];
+        show_with_headers(&viewer, cx, png_headers(), &bytes, false);
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = first.path().join("plot.png");
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).last_save_directory()),
+            Some(first.path().to_path_buf())
+        );
+
+        // The next dialog opens where the first save went.
+        let seen = Rc::new(std::cell::RefCell::new(None));
+        let recorded = seen.clone();
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = second.path().join("plot.png");
+        cx.simulate_new_path_selection(move |directory| {
+            *recorded.borrow_mut() = Some(directory.to_path_buf());
+            Some(chosen)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            seen.borrow().clone(),
+            Some(first.path().to_path_buf()),
+            "the dialog opens in the directory of the last successful save"
+        );
+        assert_eq!(
+            std::fs::read(second.path().join("plot.png")).expect("the second save is written"),
+            bytes
+        );
+    }
+
+    #[gpui::test]
+    async fn the_saved_row_offers_reveal_and_copies_its_path(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        let bytes = [0x89, b'P', b'N', b'G'];
+        show_with_headers(&viewer, cx, png_headers(), &bytes, false);
+        let target = dir.path().join("plot.png");
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = target.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("response-reveal").is_some(),
+            "the saved row can reveal the file"
+        );
+        // Reveal is not clicked: it would launch a file manager.
+        assert!(cx.debug_bounds("response-copy-path").is_some());
+        click(cx, "response-copy-path");
+        assert_eq!(clipboard(cx), target.display().to_string());
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).copied()),
+            Some(CopyTarget::SavePath)
+        );
+    }
+
+    #[gpui::test]
+    async fn copy_base64_puts_the_exact_bytes_on_the_clipboard(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let bytes = [0x89, b'P', b'N', b'G', 0, 1, 2, 3];
+        show_with_headers(&viewer, cx, png_headers(), &bytes, false);
+        click(cx, "response-copy-base64");
+
+        let encoded = clipboard(cx);
+        assert_eq!(
+            BASE64
+                .decode(&encoded)
+                .expect("the clipboard holds valid base64"),
+            bytes,
+            "the clipboard decodes back to the retained bytes"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).copied()),
+            Some(CopyTarget::Base64)
+        );
+    }
+
+    #[gpui::test]
+    async fn copy_base64_encodes_only_the_retained_prefix(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let retained = [0x89, b'P', b'N', b'G'];
+        show_with_headers(&viewer, cx, png_headers(), &retained, true);
+        click(cx, "response-copy-base64");
+
+        assert_eq!(
+            BASE64
+                .decode(clipboard(cx))
+                .expect("the clipboard holds valid base64"),
+            retained
+        );
+    }
+
+    #[gpui::test]
+    async fn viewing_a_binary_body_as_text_caps_the_fallback(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let body = vec![b'x'; BINARY_TEXT_FALLBACK_LIMIT + 64];
+        show_with_headers(&viewer, cx, png_headers(), &body, false);
+        click(cx, "response-view-as-text");
+
+        assert!(cx.debug_bounds("response-binary-text").is_some());
+        assert!(cx.debug_bounds("response-binary-text-notice").is_some());
+        assert!(cx.debug_bounds("response-show-binary").is_some());
+        assert!(
+            cx.debug_bounds("response-copy-body").is_none(),
+            "the fallback keeps Copy body off"
+        );
+        assert!(
+            cx.debug_bounds("response-find").is_none(),
+            "the fallback keeps Find off"
+        );
+        cx.update(|_, app| {
+            let lines = viewer.read(app).binary_display_lines();
+            assert_eq!(
+                lines.text().len(),
+                BINARY_TEXT_FALLBACK_LIMIT,
+                "the fallback stops at the cap"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn viewing_a_binary_body_as_text_replaces_invalid_bytes(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0xff, b'o', b'k'], false);
+        click(cx, "response-view-as-text");
+
+        cx.update(|_, app| {
+            let lines = viewer.read(app).binary_display_lines();
+            let text = lines.text();
+            assert!(
+                text.starts_with('\u{fffd}'),
+                "the invalid byte is replaced: {text:?}"
+            );
+            assert!(
+                text.ends_with("ok"),
+                "the readable bytes are kept: {text:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn returning_from_the_text_fallback_shows_the_binary_information(
+        cx: &mut TestAppContext,
+    ) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+        click(cx, "response-view-as-text");
+        assert!(cx.update(|_, app| viewer.read(app).binary_as_text()));
+
+        click(cx, "response-show-binary");
+        assert!(
+            !cx.update(|_, app| viewer.read(app).binary_as_text()),
+            "Show binary info returns to the information block"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_new_response_resets_the_text_fallback(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+        click(cx, "response-view-as-text");
+        assert!(cx.update(|_, app| viewer.read(app).binary_as_text()));
+
+        show_with_headers(
+            &viewer,
+            cx,
+            png_headers(),
+            &[0x89, b'P', b'N', b'G', 1],
+            false,
+        );
+        assert!(
+            !cx.update(|_, app| viewer.read(app).binary_as_text()),
+            "the fallback belongs to one response"
         );
     }
 

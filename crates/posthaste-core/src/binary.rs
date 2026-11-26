@@ -10,6 +10,16 @@ use percent_encoding::percent_decode_str;
 /// The largest prefix [`classify`] sniffs for an unlabeled body.
 pub const SNIFF_LIMIT: usize = 8 * 1024;
 
+/// A format identified from a body's leading bytes when the response declared
+/// no useful media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectedFormat {
+    /// A technical display name such as `PNG image`, not a localized sentence.
+    pub label: &'static str,
+    /// The file extension without the dot.
+    pub extension: &'static str,
+}
+
 /// What the viewer needs to present and save a binary body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryMeta {
@@ -22,6 +32,10 @@ pub struct BinaryMeta {
     /// Whether the bytes are still available to save. History keeps metadata
     /// only, so an entry loaded from history reports false.
     pub body_stored: bool,
+    /// The format identified from the bytes when the declared type was absent
+    /// or `application/octet-stream`. `None` for a declared type and for
+    /// history, which carries no bytes.
+    pub detected: Option<DetectedFormat>,
 }
 
 /// Returns the binary metadata for a response, or `None` when it is text.
@@ -51,10 +65,12 @@ pub fn classify(
         }
     }
 
+    let detected = identify(media_type.as_deref(), prefix);
     Some(BinaryMeta {
-        file_name: Some(suggested_name(headers, media_type.as_deref())),
+        file_name: Some(suggested_name(headers, media_type.as_deref(), detected)),
         media_type,
         body_stored: true,
+        detected,
     })
 }
 
@@ -81,9 +97,10 @@ pub fn declared_binary(headers: &[(String, String)]) -> Option<BinaryMeta> {
     }
     let media_type = content_type(headers);
     Some(BinaryMeta {
-        file_name: Some(suggested_name(headers, media_type.as_deref())),
+        file_name: Some(suggested_name(headers, media_type.as_deref(), None)),
         media_type,
         body_stored: true,
+        detected: None,
     })
 }
 
@@ -163,12 +180,134 @@ fn looks_binary(prefix: &[u8]) -> bool {
     }
 }
 
+/// Identifies a format from the bytes only when the declared type says
+/// nothing useful. A declared type is authoritative, even if the bytes
+/// disagree with it.
+fn identify(media_type: Option<&str>, prefix: &[u8]) -> Option<DetectedFormat> {
+    match media_type {
+        None | Some("application/octet-stream") => sniff_format(prefix),
+        Some(_) => None,
+    }
+}
+
+/// Recognizes common file signatures in the leading bytes.
+pub fn sniff_format(prefix: &[u8]) -> Option<DetectedFormat> {
+    const FORMATS: &[(&[u8], DetectedFormat)] = &[
+        (
+            b"\x89PNG\r\n\x1a\n",
+            DetectedFormat {
+                label: "PNG image",
+                extension: "png",
+            },
+        ),
+        (
+            b"\xff\xd8\xff",
+            DetectedFormat {
+                label: "JPEG image",
+                extension: "jpg",
+            },
+        ),
+        (
+            b"GIF87a",
+            DetectedFormat {
+                label: "GIF image",
+                extension: "gif",
+            },
+        ),
+        (
+            b"GIF89a",
+            DetectedFormat {
+                label: "GIF image",
+                extension: "gif",
+            },
+        ),
+        (
+            b"%PDF-",
+            DetectedFormat {
+                label: "PDF document",
+                extension: "pdf",
+            },
+        ),
+        (
+            b"PK\x03\x04",
+            DetectedFormat {
+                label: "ZIP archive",
+                extension: "zip",
+            },
+        ),
+        (
+            b"PK\x05\x06",
+            DetectedFormat {
+                label: "ZIP archive",
+                extension: "zip",
+            },
+        ),
+        (
+            b"PK\x07\x08",
+            DetectedFormat {
+                label: "ZIP archive",
+                extension: "zip",
+            },
+        ),
+        (
+            b"\x1f\x8b",
+            DetectedFormat {
+                label: "Gzip archive",
+                extension: "gz",
+            },
+        ),
+        (
+            b"\x28\xb5\x2f\xfd",
+            DetectedFormat {
+                label: "Zstandard archive",
+                extension: "zst",
+            },
+        ),
+        (
+            b"7z\xbc\xaf\x27\x1c",
+            DetectedFormat {
+                label: "7z archive",
+                extension: "7z",
+            },
+        ),
+        (
+            b"Rar!\x1a\x07",
+            DetectedFormat {
+                label: "RAR archive",
+                extension: "rar",
+            },
+        ),
+    ];
+    FORMATS
+        .iter()
+        .find(|(signature, _)| prefix.starts_with(signature))
+        .map(|(_, format)| *format)
+        .or_else(|| {
+            // RIFF containers carry their type at offset 8.
+            (prefix.len() >= 12 && prefix.starts_with(b"RIFF") && &prefix[8..12] == b"WEBP")
+                .then_some(DetectedFormat {
+                    label: "WebP image",
+                    extension: "webp",
+                })
+        })
+}
+
 /// The name the Save dialog suggests.
-fn suggested_name(headers: &[(String, String)], media_type: Option<&str>) -> String {
+fn suggested_name(
+    headers: &[(String, String)],
+    media_type: Option<&str>,
+    detected: Option<DetectedFormat>,
+) -> String {
     if let Some(name) = disposition_name(headers).and_then(|name| sanitize(&name)) {
         return name;
     }
-    match media_type.and_then(extension_for) {
+    // A detected format is more specific than the generic type it was sniffed
+    // from, so its extension wins for `application/octet-stream`.
+    let extension = match detected {
+        Some(detected) => Some(detected.extension),
+        None => media_type.and_then(extension_for),
+    };
+    match extension {
         Some(extension) => format!("response.{extension}"),
         None => "response.bin".to_owned(),
     }
@@ -447,6 +586,84 @@ mod tests {
     fn a_missing_disposition_still_suggests_the_extension() {
         let meta = classify(&png(), &[0], 1).expect("png is binary");
         assert_eq!(meta.file_name.as_deref(), Some("response.png"));
+    }
+
+    #[test]
+    fn known_signatures_are_recognized() {
+        let cases: &[(&[u8], &str, &str)] = &[
+            (b"\x89PNG\r\n\x1a\n", "PNG image", "png"),
+            (b"\xff\xd8\xff\xe0", "JPEG image", "jpg"),
+            (b"GIF87a", "GIF image", "gif"),
+            (b"GIF89a", "GIF image", "gif"),
+            (b"%PDF-1.7", "PDF document", "pdf"),
+            (b"PK\x03\x04", "ZIP archive", "zip"),
+            (b"\x1f\x8b\x08", "Gzip archive", "gz"),
+            (b"\x28\xb5\x2f\xfd", "Zstandard archive", "zst"),
+            (b"7z\xbc\xaf\x27\x1c", "7z archive", "7z"),
+            (b"Rar!\x1a\x07\x00", "RAR archive", "rar"),
+            (b"RIFF\x24\x00\x00\x00WEBPVP8 ", "WebP image", "webp"),
+        ];
+        for (prefix, label, extension) in cases {
+            let format = sniff_format(prefix).unwrap_or_else(|| {
+                panic!("{label} signature was not recognized");
+            });
+            assert_eq!(format.label, *label);
+            assert_eq!(format.extension, *extension);
+        }
+    }
+
+    #[test]
+    fn a_body_without_a_known_signature_has_no_detected_format() {
+        assert_eq!(sniff_format(b"plain text"), None);
+        assert_eq!(sniff_format(b""), None);
+        // A RIFF container that is not WebP.
+        assert_eq!(sniff_format(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
+    }
+
+    #[test]
+    fn a_generic_type_is_identified_from_its_bytes() {
+        let headers = headers(&[("Content-Type", "application/octet-stream")]);
+        let body = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let meta = classify(&headers, body, body.len()).expect("octet-stream is binary");
+        assert_eq!(
+            meta.detected,
+            Some(DetectedFormat {
+                label: "PNG image",
+                extension: "png",
+            })
+        );
+        assert_eq!(meta.file_name.as_deref(), Some("response.png"));
+    }
+
+    #[test]
+    fn a_disposition_name_still_wins_over_a_detected_extension() {
+        let headers = headers(&[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Disposition", "attachment; filename=\"plot.png\""),
+        ]);
+        let meta = classify(&headers, b"\x89PNG\r\n\x1a\n", 8).expect("octet-stream is binary");
+        assert_eq!(meta.file_name.as_deref(), Some("plot.png"));
+    }
+
+    #[test]
+    fn a_declared_type_is_not_overridden_by_the_bytes() {
+        // The headers say JPEG; the bytes say PNG. The declared type wins and
+        // no detection is reported.
+        let headers = headers(&[("Content-Type", "image/jpeg")]);
+        let meta = classify(&headers, b"\x89PNG\r\n\x1a\n", 8).expect("jpeg is binary");
+        assert_eq!(meta.detected, None);
+        assert_eq!(meta.file_name.as_deref(), Some("response.jpg"));
+    }
+
+    #[test]
+    fn an_unlabeled_body_is_identified_from_its_bytes() {
+        let meta = classify(&[], b"%PDF-1.7\n\0", 10).expect("pdf bytes are binary");
+        assert_eq!(meta.media_type, None);
+        assert_eq!(
+            meta.detected.map(|format| format.label),
+            Some("PDF document")
+        );
+        assert_eq!(meta.file_name.as_deref(), Some("response.pdf"));
     }
 
     #[test]

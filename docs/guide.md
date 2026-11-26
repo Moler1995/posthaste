@@ -693,21 +693,45 @@ While a response streams, a binary media type settles the body before any bytes
 arrive; an unlabeled body is decided from its first 8 KiB or its first invalid
 byte. Once binary, bytes are counted for the size but never decoded.
 
-A completed binary response shows a card in place of the tree and raw views,
-naming the media type, the retained size, and the suggested file name taken from
-`Content-Disposition` (falling back to `response.<ext>`, then `response.bin`),
-with **Save body…**. The `Tree / Raw` and **Find in body** controls and **Copy
-body** are hidden; the Headers and Cookies tabs are unchanged. **Save body…**
-opens a save dialog at the suggested name in the Downloads folder (falling back
-to the home folder, then the working directory), writes the retained bytes
-unchanged on a background thread, and confirms the path under the card. A
-failed write reports the error and leaves the response in place. When the body
-was truncated at the 20 MiB cap, both the card and the confirmation state that
-the saved file holds only the retained prefix.
+A completed binary response shows a top-anchored information block in place of
+the tree and raw views, naming the media type (or an unknown-type label), the
+retained size, and the suggested file name taken from `Content-Disposition`
+(falling back to `response.<ext>`, then `response.bin`). When the type is absent
+or `application/octet-stream`, the block also names the format recognized from
+the leading bytes, such as PNG or PDF, and the suggested name uses that
+extension. The block offers **Save body…**, **Save to Downloads**, and **View as
+text**; **Copy base64** sits in the section strip beside the tabs. The
+`Tree / Raw` and **Find in body** controls and **Copy body** are hidden; the
+Headers and Cookies tabs are unchanged. When the body was truncated at the
+20 MiB cap, the block states that the actions use only the retained prefix.
+
+**Save body…** opens a save dialog at the suggested name. The first dialog opens
+in the Downloads folder (falling back to the home folder, then the working
+directory); later dialogs reopen in the directory where the last dialog save
+succeeded. The bytes are written unchanged on a background thread. **Save to
+Downloads** skips the dialog, writing to the Downloads folder with the same
+fallback, and never overwrites an existing file: the first free `name (n).ext`
+or `name (n)` wins. Both actions confirm the saved path under the block, with
+**Reveal** to show the file in the system file manager and **Copy path** to put
+the path on the clipboard (the label reads `Copied` briefly). A failed write
+reports the error with the path it tried to write and leaves the response in
+place. A truncated body's confirmation states that the file holds only the
+retained prefix.
+
+**Copy base64** encodes the retained binary bytes with standard base64 when the
+action runs and shows the same `Copied` feedback; for a truncated body it
+encodes only the retained prefix.
+
+**View as text** decodes the body lossily for inspection: at most the first
+1 MiB of the retained bytes as UTF-8 with U+FFFD replacing invalid sequences,
+in the same virtualized raw presentation. A notice states the lossy decode and
+the limit, and **Show binary info** returns to the information block. **Find in
+body** and **Copy body** stay off. The fallback belongs to one response: a new
+response always opens on the information block.
 
 History stores no binary bytes: replaying such an entry shows its media type,
 size, and suggested name with a notice that the body was not kept, and offers
-neither **Save body…** nor **Copy body**.
+none of the save, copy, or text actions.
 
 ## Request history
 
@@ -770,9 +794,9 @@ entry does three things:
    banner. The tree/raw body viewer and header table behave as they do for a
    live response, but **Copy body** contains only the stored 512 KiB prefix;
    notices explain when the stored body was cut or the source was truncated at
-   the 20 MiB cap. A binary response replays as its metadata card with a notice
-   that history kept no bytes, and offers neither **Save body…** nor **Copy
-   body**.
+   the 20 MiB cap. A binary response replays as its metadata block with a notice
+   that history kept no bytes, and offers none of the save, copy, or text
+   actions.
 
 Sending, selecting a saved request, or selecting a collection clears the history
 display. **Clear** asks for confirmation before deleting every history file.

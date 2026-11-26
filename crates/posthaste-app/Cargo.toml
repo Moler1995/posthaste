@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+# Encodes a binary body for Copy base64 when the action runs.
+base64.workspace = true
 bytes.workspace = true
 # Formats history timestamps in the machine's local time zone; entries keep
 # storing Unix milliseconds, so the zone is applied only when displaying.
