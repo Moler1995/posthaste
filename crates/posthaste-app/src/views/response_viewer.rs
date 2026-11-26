@@ -3283,10 +3283,14 @@ impl ResponseViewer {
             .into_any_element()
     }
 
-    /// The bar above a text response that declares a file name: it names the
-    /// file and offers the same two save actions as a binary body. Returns
-    /// `None` for a response the server did not name, which has nothing to save
-    /// as a file.
+    /// The bar above a text response that declares a file name: one row with
+    /// the name and the same two save actions as a binary body. Returns `None`
+    /// for a response the server did not name, which has nothing to save as a
+    /// file.
+    ///
+    /// The retained size already shows beside the response, so repeating it
+    /// here would only add weight above the body. A truncated body still says
+    /// that a saved file will be incomplete.
     fn text_file_bar(
         &self,
         view: &ResponseSnapshot<'_>,
@@ -3294,49 +3298,45 @@ impl ResponseViewer {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let file_name = attachment_name(&view.completed.headers)?;
-        let mut facts = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(space::S6)
-            .child(
-                div()
-                    .text_role(type_role::CONTROL)
-                    .text_color(theme::text::primary())
-                    .child(file_name),
-            )
-            .child(fact_separator())
-            .child(
-                div()
-                    .text_role(type_role::META)
-                    .text_color(theme::text::secondary())
-                    .child(format_bytes(view.completed.preview.size)),
-            );
-        if view.completed.preview.truncated {
-            facts = facts.child(binary_hint(
-                "response-text-file-truncated",
-                Key::ResponseBinaryTruncated,
-            ));
-        }
         let mut bar = div()
             .debug_selector(|| "response-text-file".to_owned())
             .flex()
             .flex_col()
             .gap(space::S4)
             .px(space::S12)
-            .py(space::S8)
+            .py(space::S6)
             .border_b(px(1.))
             .border_color(theme::border::subtle())
-            .child(facts)
             .child(
                 div()
-                    .debug_selector(|| "response-text-file-actions".to_owned())
                     .flex()
                     .items_center()
-                    .flex_wrap()
-                    .gap(space::S4)
-                    .children(save_action_buttons(viewer)),
+                    .gap(space::S8)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_ellipsis()
+                            .text_role(type_role::META)
+                            .text_color(theme::text::secondary())
+                            .child(file_name),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "response-text-file-actions".to_owned())
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(space::S4)
+                            .children(save_action_buttons(viewer)),
+                    ),
             );
+        if view.completed.preview.truncated {
+            bar = bar.child(binary_hint(
+                "response-text-file-truncated",
+                Key::ResponseBinaryTruncated,
+            ));
+        }
         if let Some(feedback) = self.save_feedback.clone() {
             bar = bar.child(self.save_feedback_row(feedback, cx));
         }

@@ -740,9 +740,11 @@ none of the save, copy, or text actions.
 ### Text file responses
 
 A text response that names a file in `Content-Disposition`, such as a
-`text/plain` or `text/csv` download, shows a bar above the body naming the file
-and its retained size. **Save body…** and **Save to Downloads** work exactly as
-they do for a binary body — the same dialog directory memory, ` (n)` collision
+`text/plain` or `text/csv` download, shows a one-row bar above the body: the
+file name on the left and **Save body…** and **Save to Downloads** on the
+right. The bar does not repeat the size the response strip already shows, so it
+adds little height above the body. The two actions work exactly as they do for
+a binary body — the same dialog directory memory, ` (n)` collision
 names, saved-path confirmation with **Reveal** and **Copy path**, and error
 reporting — and write the retained text bytes unchanged. The bar stays in every
 body view and also appears for an empty body the server named, which saves an
