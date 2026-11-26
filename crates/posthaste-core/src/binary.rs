@@ -647,13 +647,12 @@ mod tests {
 
     #[test]
     fn a_declared_type_is_not_overridden_by_the_bytes() {
-        // The headers say JPEG; the bytes say PNG. The declared type wins and
+        // The headers say PNG; the bytes say GIF. The declared type wins and
         // no detection is reported.
-        let headers = headers(&[("Content-Type", "image/jpeg")]);
-        let meta = classify(&headers, b"\x89PNG\r\n\x1a\n", 8).expect("jpeg is binary");
+        let headers = headers(&[("Content-Type", "image/png")]);
+        let meta = classify(&headers, b"GIF89a", 6).expect("png is binary");
         assert_eq!(meta.detected, None);
-        // `mime_guess` lists `jpeg` first for `image/jpeg`.
-        assert_eq!(meta.file_name.as_deref(), Some("response.jpeg"));
+        assert_eq!(meta.file_name.as_deref(), Some("response.png"));
     }
 
     #[test]
