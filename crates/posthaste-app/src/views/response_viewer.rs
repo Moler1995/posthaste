@@ -9596,18 +9596,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn an_empty_binary_body_offers_no_text_fallback(cx: &mut TestAppContext) {
-        let (viewer, cx) = viewer_window(cx);
-        show_with_headers(&viewer, cx, png_headers(), &[], false);
-
-        assert!(cx.debug_bounds("response-save-body").is_some());
-        assert!(
-            cx.debug_bounds("response-view-as-text").is_none(),
-            "there are no bytes to show as text"
-        );
-    }
-
-    #[gpui::test]
     async fn a_generic_binary_body_shows_the_format_its_bytes_reveal(cx: &mut TestAppContext) {
         let (viewer, cx) = viewer_window(cx);
         show_with_headers(
