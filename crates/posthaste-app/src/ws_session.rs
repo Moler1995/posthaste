@@ -15,7 +15,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use posthaste_core::history::SessionEnd;
 use posthaste_core::model::{RequestId, RequestSpec};
-use posthaste_core::ws::{WS_COMMAND_QUEUE, WsCloseBy, WsCommand, WsDirection, WsHandshake};
+use posthaste_core::ws::{WsCloseBy, WsCommand, WsDirection, WsHandshake};
 use tokio::sync::{mpsc, oneshot};
 
 /// The largest number of rows the transcript retains.
@@ -488,7 +488,7 @@ mod tests {
     }
 
     fn begin(state: &mut WsSessionState) -> u64 {
-        let (commands, _commands_rx) = mpsc::channel(WS_COMMAND_QUEUE);
+        let (commands, _commands_rx) = mpsc::channel(posthaste_core::ws::WS_COMMAND_QUEUE);
         let (cancel, _cancel_rx) = oneshot::channel();
         state.begin_connect(
             RequestSpec::new("socket"),

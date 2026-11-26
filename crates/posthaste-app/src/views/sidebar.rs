@@ -95,10 +95,8 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                 .scroll_to_item(index, ScrollStrategy::Bottom);
         }
     }
-    if show_history {
-        if let Some(index) = navigation.take_history_reveal(app.selected_history()) {
-            navigation.history_scroll().scroll_to_reveal_item(index);
-        }
+    if show_history && let Some(index) = navigation.take_history_reveal(app.selected_history()) {
+        navigation.history_scroll().scroll_to_reveal_item(index);
     }
 
     // The cached flat index is shared, not copied: a repaint clones one `Rc`.
@@ -3275,6 +3273,7 @@ fn request_row(
     .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn environment_row(
     state: Entity<AppState>,
     entry: &posthaste_core::storage::LoadedEnvironment,

@@ -557,7 +557,7 @@ pub(crate) fn cookies_modal(editor: Entity<RequestEditor>, cx: &App) -> AnyEleme
     let body_editor = editor.clone();
     let editor_ref = body_editor.read(cx);
     let generation = editor_ref.workspace_generation(cx);
-    let view = CookiesView::build(&editor_ref, generation);
+    let view = CookiesView::build(editor_ref, generation);
     let adding = view.add_open;
     let accent = view.accent;
 

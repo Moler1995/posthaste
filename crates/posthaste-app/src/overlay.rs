@@ -150,6 +150,7 @@ impl OverlayHost {
 
     /// Closes the newest capturing overlay, leaving non-capturing surfaces
     /// beneath it open. Falls back to the newest entry when nothing captures.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn close_top(&mut self) -> Option<OverlayKind> {
         let index = self
             .entries
@@ -180,6 +181,7 @@ impl OverlayHost {
     }
 
     /// Whether any open overlay's kind satisfies `pred`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn contains_where(&self, mut pred: impl FnMut(&OverlayKind) -> bool) -> bool {
         self.entries.iter().any(|entry| pred(&entry.kind))
     }
@@ -233,6 +235,7 @@ impl OverlayHost {
     }
 
     /// The newest entry, i.e. the surface painted on top.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn top(&self) -> Option<&OverlayKind> {
         self.entries.last().map(|entry| &entry.kind)
     }
@@ -316,6 +319,7 @@ impl OverlayHost {
     }
 
     /// Whether no overlay is open.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

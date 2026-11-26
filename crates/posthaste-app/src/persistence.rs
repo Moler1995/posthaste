@@ -25,7 +25,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender, TrySendError};
-use gpui::{BackgroundExecutor, Task};
+use gpui::BackgroundExecutor;
 use posthaste_core::cookies::CookieWrite;
 use posthaste_core::history::{HistoryEntry, HistoryId};
 use posthaste_core::model::{Collection, Environment, RequestId, RequestSpec, Workspace};
@@ -111,6 +111,7 @@ pub struct WriteReport {
 
 /// The visible state of one document's latest write.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum DocumentState {
     /// Nothing has been written or queued in this session.
     Idle,
@@ -158,6 +159,8 @@ impl FlushOutcome {
 /// wait for room among the wake-ups, least of all during close.
 #[derive(Debug)]
 enum Barrier {
+    /// The asynchronous flush, used by tests and the deadline wrapper.
+    #[cfg(test)]
     Flush {
         jobs: Vec<WriteJob>,
         ack: Sender<FlushOutcome>,
@@ -212,10 +215,12 @@ impl Pending {
         jobs
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn contains(&self, document: &Document) -> bool {
         self.jobs.contains_key(document)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn len(&self) -> usize {
         self.jobs.len()
     }
@@ -225,6 +230,8 @@ struct Shared {
     pending: Mutex<Pending>,
     last: Mutex<HashMap<Document, WriteReport>>,
     generation: AtomicU64,
+    /// Read through `write_count`, which tests use to prove coalescing.
+    #[cfg_attr(not(test), allow(dead_code))]
     writes: AtomicUsize,
 }
 
@@ -312,6 +319,7 @@ impl Persistence {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_synchronous(&self) -> bool {
         self.inner.synchronous
     }
@@ -322,11 +330,13 @@ impl Persistence {
     }
 
     /// The generation the next schedule will receive.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_generation(&self) -> u64 {
         self.inner.shared.generation.load(Ordering::SeqCst)
     }
 
     /// How many writes this writer performed, including synchronous ones.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn write_count(&self) -> usize {
         self.inner.shared.writes.load(Ordering::SeqCst)
     }
@@ -344,7 +354,7 @@ impl Persistence {
             payload,
         };
         if self.inner.synchronous {
-            let report = perform_write(&job);
+            let report = perform_write(&self.inner.shared, &job);
             self.record(report);
             return;
         }
@@ -376,26 +386,27 @@ impl Persistence {
             path,
             payload,
         };
-        let report = perform_write(&job);
+        let report = perform_write(&self.inner.shared, &job);
         let result = report.result.clone();
         self.record(report);
         Some(result)
     }
 
     /// Queues a write and waits for it to finish.
-    pub fn flush(&self) -> Task<FlushOutcome> {
+    #[cfg(test)]
+    pub fn flush(&self) -> gpui::Task<FlushOutcome> {
         if self.inner.synchronous {
-            return Task::ready(FlushOutcome::default());
+            return gpui::Task::ready(FlushOutcome::default());
         }
         let jobs = Pending::lock(&self.inner.shared.pending).take_all();
         let Some(barriers) = self.inner.barriers.clone() else {
-            return Task::ready(FlushOutcome::timed_out());
+            return gpui::Task::ready(FlushOutcome::timed_out());
         };
         // Enqueue before returning: a caller's deadline must never drop a
         // barrier whose jobs already left the pending map.
         let (ack, outcome) = async_channel::bounded(1);
         if barriers.try_send(Barrier::Flush { jobs, ack }).is_err() {
-            return Task::ready(FlushOutcome::timed_out());
+            return gpui::Task::ready(FlushOutcome::timed_out());
         }
         self.inner.executor.spawn(async move {
             outcome
@@ -409,9 +420,10 @@ impl Persistence {
     ///
     /// The deadline only bounds the wait: a timed-out flush keeps writing, and
     /// its reports still arrive.
-    pub fn flush_with_deadline(&self, deadline: Duration) -> Task<FlushOutcome> {
+    #[cfg(test)]
+    pub fn flush_with_deadline(&self, deadline: Duration) -> gpui::Task<FlushOutcome> {
         if self.inner.synchronous {
-            return Task::ready(FlushOutcome::default());
+            return gpui::Task::ready(FlushOutcome::default());
         }
         let flush = self.flush();
         let timer = self.inner.executor.timer(deadline);
@@ -456,6 +468,7 @@ impl Persistence {
     }
 
     /// The visible state of `document`'s latest write.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn document_state(&self, document: &Document) -> DocumentState {
         if Pending::lock(&self.inner.shared.pending).contains(document) {
             return DocumentState::Pending;
@@ -470,6 +483,7 @@ impl Persistence {
     }
 
     /// Whether any document has a newer payload waiting.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_pending(&self) -> bool {
         Pending::lock(&self.inner.shared.pending).len() > 0
     }
@@ -518,9 +532,10 @@ async fn run_worker(
                 let Some(job) = Pending::lock(&shared.pending).take_next() else {
                     continue;
                 };
-                let report = perform_write(&job);
+                let report = perform_write(&shared, &job);
                 deliver(&shared, &reports, report).await;
             }
+            #[cfg(test)]
             Next::Barrier(Barrier::Flush { jobs, ack }) => {
                 let outcome = run_flush(&shared, &reports, jobs).await;
                 let _ = ack.send(outcome).await;
@@ -569,7 +584,7 @@ async fn run_flush(
     let mut outcome = FlushOutcome::default();
     for job in jobs {
         let path = job.path.clone();
-        let report = perform_write(&job);
+        let report = perform_write(shared, &job);
         let succeeded = report.result.is_ok();
         if let Err(message) = &report.result {
             outcome.failures.push(FlushFailure {
@@ -594,7 +609,8 @@ async fn deliver(shared: &Shared, reports: &Sender<WriteReport>, report: WriteRe
 }
 
 /// Encodes and writes one job. Runs only on the worker in the normal writer.
-fn perform_write(job: &WriteJob) -> WriteReport {
+fn perform_write(shared: &Shared, job: &WriteJob) -> WriteReport {
+    shared.writes.fetch_add(1, Ordering::SeqCst);
     let result = write_payload(&job.path, &job.payload);
     WriteReport {
         document: job.document.clone(),

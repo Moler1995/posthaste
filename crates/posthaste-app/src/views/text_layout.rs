@@ -200,9 +200,7 @@ impl TextLayout {
 
     /// Drops the measured widths, for a font change that makes them stale.
     fn clear_widths(&mut self) {
-        for width in &mut self.widths {
-            *width = None;
-        }
+        self.widths.fill(None);
         self.max_width = px(0.);
     }
 
@@ -545,10 +543,12 @@ impl TextLayout {
         self.spec.as_ref().map_or(px(0.), |spec| spec.line_height)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn max_width(&self) -> Pixels {
         self.max_width
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn content_len(&self) -> usize {
         self.content_len
     }
@@ -557,6 +557,7 @@ impl TextLayout {
         self.line_starts.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn line_starts(&self) -> &[usize] {
         &self.line_starts
     }
@@ -602,11 +603,13 @@ impl TextLayout {
 
     /// Shaping work done since the counter was last read (debug builds only).
     #[cfg(debug_assertions)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_lines_shaped(&mut self) -> usize {
         std::mem::take(&mut self.lines_shaped)
     }
 
     #[cfg(not(debug_assertions))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_lines_shaped(&mut self) -> usize {
         0
     }

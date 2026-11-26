@@ -7,7 +7,7 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, Entity, Window, div, px};
+use gpui::{AnyElement, Entity, div, px};
 
 use crate::app::AppState;
 use crate::i18n::{self, Key};
@@ -24,7 +24,7 @@ pub(crate) fn init_confirmation_modal(
     let display = path.display().to_string();
 
     let dismiss_state = state.clone();
-    let dismiss: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+    let dismiss: ui::DialogCallback = Rc::new(move |window, cx| {
         dismiss_state.update(cx, |state, cx| {
             state.cancel_workspace_init(cx);
             state.focus_active_editor(window, cx);

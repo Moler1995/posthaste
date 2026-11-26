@@ -24,12 +24,16 @@ impl<'a> TableView<'a> {
             kind,
             rows: editor.rows(kind),
             accent: theme::protocol_accent(editor.spec.protocol, editor.spec.method),
-            generated: (kind == RowKind::Header)
-                .then(|| editor.generated_headers())
-                .unwrap_or_default(),
-            file_notice: (kind == RowKind::Multipart)
-                .then(|| editor.file_notice.as_deref())
-                .flatten(),
+            generated: if kind == RowKind::Header {
+                editor.generated_headers()
+            } else {
+                Default::default()
+            },
+            file_notice: if kind == RowKind::Multipart {
+                editor.file_notice.as_deref()
+            } else {
+                None
+            },
             generation,
         }
     }
@@ -329,11 +333,7 @@ impl RequestEditor {
             .flex()
             .flex_col()
             .gap(space::S8)
-            .children(
-                generated
-                    .as_deref()
-                    .and_then(|headers| self.generated_headers_section(headers)),
-            )
+            .children(generated.and_then(|headers| self.generated_headers_section(headers)))
             .children(card)
             .child(self.add_row_button(editor, kind))
             .children(view.file_notice.map(|notice| {

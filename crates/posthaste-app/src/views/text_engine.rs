@@ -131,6 +131,7 @@ impl TextEngine {
         &self.content
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -842,6 +843,7 @@ impl TextEngine {
             .unwrap_or(0)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn line_count(&self) -> usize {
         self.content.split('\n').count()
     }

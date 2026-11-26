@@ -42,7 +42,7 @@ use posthaste_core::storage::{
 };
 use posthaste_core::variables::{resolve_request, resolve_request_lossy};
 use posthaste_core::ws::{
-    WS_COMMAND_QUEUE, WS_EVENT_QUEUE, WsCloseBy, WsCommand, WsDirection, WsEvent, WsHandshake,
+    WS_COMMAND_QUEUE, WS_EVENT_QUEUE, WsCloseBy, WsCommand, WsEvent, WsHandshake,
     prepare_handshake, run_session,
 };
 use std::cell::RefCell;
@@ -319,7 +319,9 @@ pub enum DocumentOrigin {
     /// The saved request this tab opened and the version it opened.
     Saved {
         id: RequestId,
-        baseline: RequestSpec,
+        // Boxed: a tab holds one origin, and every other variant is tiny;
+        // keeping the baseline inline would make the enum 280 bytes.
+        baseline: Box<RequestSpec>,
     },
     /// A stored history entry replayed as a draft, with the source request the
     /// entry names, if any.
@@ -342,7 +344,7 @@ impl DocumentOrigin {
         debug_assert_eq!(saved.id, id, "the baseline must be the opened request");
         Self::Saved {
             id,
-            baseline: saved.clone(),
+            baseline: Box::new(saved.clone()),
         }
     }
 
@@ -379,7 +381,7 @@ impl DocumentOrigin {
     /// The saved request and its restore point, only for a saved origin.
     fn saved(&self) -> Option<(RequestId, &RequestSpec)> {
         match self {
-            Self::Saved { id, baseline } => Some((*id, baseline)),
+            Self::Saved { id, baseline } => Some((*id, baseline.as_ref())),
             _ => None,
         }
     }
@@ -392,7 +394,7 @@ impl DocumentOrigin {
     /// The restore point, mutable so a move or rename can keep it in step.
     fn baseline_mut(&mut self) -> Option<&mut RequestSpec> {
         match self {
-            Self::Saved { baseline, .. } => Some(baseline),
+            Self::Saved { baseline, .. } => Some(baseline.as_mut()),
             _ => None,
         }
     }
@@ -2593,6 +2595,7 @@ impl AppState {
     }
 
     /// Whether the new-workspace dialog is open.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_workspace_open(&self) -> bool {
         self.overlays.contains(&OverlayKind::NewWorkspace)
     }
@@ -3974,6 +3977,7 @@ impl AppState {
 
     /// The history entry the active tab's own send recorded and still presents
     /// as its completed response.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn recorded_run(&self) -> Option<HistoryId> {
         self.active_tab().recorded_run()
     }
@@ -4245,6 +4249,7 @@ impl AppState {
     }
 
     /// The row a move just revealed, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reveal(&self) -> Option<&Reveal> {
         self.reveal.as_ref()
     }
@@ -8719,7 +8724,7 @@ impl AppState {
             let size = payload.len();
             self.active_tab_mut().ws.push_frame(
                 generation,
-                WsDirection::Incoming,
+                posthaste_core::ws::WsDirection::Incoming,
                 false,
                 payload,
                 size,
@@ -14152,7 +14157,7 @@ mod tests {
                 AppState::new_with_store_session_and_history(
                     cx,
                     store.clone(),
-                    SessionStore::at(&session_dir.path().join("session.json")),
+                    SessionStore::at(session_dir.path().join("session.json")),
                     HistoryStore::at(history_dir.path()),
                 )
             })
@@ -14242,7 +14247,7 @@ mod tests {
                 AppState::new_with_store_session_and_history(
                     cx,
                     store.clone(),
-                    SessionStore::at(&session_dir.path().join("session.json")),
+                    SessionStore::at(session_dir.path().join("session.json")),
                     HistoryStore::at(history_dir.path()),
                 )
             })
@@ -21041,7 +21046,7 @@ mod tests {
                 AppState::new_with_store_session_and_history(
                     cx,
                     store.clone(),
-                    SessionStore::at(&dir.path().join("session.json")),
+                    SessionStore::at(dir.path().join("session.json")),
                     HistoryStore::at(history_dir.path()),
                 )
             })

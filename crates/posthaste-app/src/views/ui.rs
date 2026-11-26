@@ -950,6 +950,12 @@ pub(crate) fn confirm_popover(
 /// .actions(footer)
 /// .into_any_element()
 /// ```
+/// A dialog dismissal callback, shared by every modal and its call sites.
+pub(crate) type DialogCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A dialog key-down callback, kept separate so the event argument is named.
+pub(crate) type KeyCallback = Rc<dyn Fn(&gpui::KeyDownEvent, &mut Window, &mut App)>;
+
 pub(crate) struct Modal {
     id: SharedString,
     width: Pixels,
@@ -965,9 +971,9 @@ pub(crate) struct Modal {
     header: Option<AnyElement>,
     children: Vec<AnyElement>,
     close_selector: Option<SharedString>,
-    escape: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
-    key_handler: Option<Rc<dyn Fn(&gpui::KeyDownEvent, &mut Window, &mut App)>>,
-    on_dismiss: Rc<dyn Fn(&mut Window, &mut App)>,
+    escape: Option<DialogCallback>,
+    key_handler: Option<KeyCallback>,
+    on_dismiss: DialogCallback,
 }
 
 /// Starts a dialog shell. `id` names the panel, its backdrop (`{id}-backdrop`),

@@ -215,10 +215,10 @@ mod guard {
         let mut spans = Vec::new();
         let mut offset = 0;
         for line in code.split_inclusive('\n') {
-            if line.trim() == "#[cfg(test)]" {
-                if let Some(span) = test_module_after(code, offset + line.len()) {
-                    spans.push(span);
-                }
+            if line.trim() == "#[cfg(test)]"
+                && let Some(span) = test_module_after(code, offset + line.len())
+            {
+                spans.push(span);
             }
             offset += line.len();
         }
