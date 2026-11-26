@@ -622,13 +622,14 @@ mod tests {
             "generated-header-row-1",
             "generated-header-row-2",
             "generated-header-row-3",
+            "generated-header-row-4",
         ] {
             assert!(
                 cx.debug_bounds(row).is_some(),
-                "the file body lists type, length, host, and encoding"
+                "the file body lists type, length, host, accept, and encoding"
             );
         }
-        assert!(cx.debug_bounds("generated-header-row-4").is_none());
+        assert!(cx.debug_bounds("generated-header-row-5").is_none());
 
         // Multipart keeps the client's boundary even when a row names the
         // content type, and its length is unknown until send.
@@ -668,8 +669,8 @@ mod tests {
         assert!(cx.debug_bounds("generated-header-row-2").is_some());
         assert_eq!(
             headers.len(),
-            3,
-            "a multipart body lists no length row: Content-Type, Host, Accept-Encoding"
+            4,
+            "a multipart body lists no length row: Content-Type, Host, Accept, Accept-Encoding"
         );
     }
 
@@ -723,14 +724,15 @@ mod tests {
             "generated-header-row-1",
             "generated-header-row-2",
             "generated-header-row-3",
+            "generated-header-row-4",
         ] {
             assert!(
                 cx.debug_bounds(row).is_some(),
-                "Content-Type, Content-Length, Host, and Accept-Encoding are listed"
+                "Content-Type, Content-Length, Host, Accept, and Accept-Encoding are listed"
             );
         }
         assert!(
-            cx.debug_bounds("generated-header-row-4").is_none(),
+            cx.debug_bounds("generated-header-row-5").is_none(),
             "only the client's own headers are listed"
         );
         assert!(
@@ -812,10 +814,10 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, app| window.draw(app).clear());
 
-        // Host, Accept-Encoding, then the credential.
-        assert!(cx.debug_bounds("generated-header-row-2").is_some());
+        // Host, Accept, Accept-Encoding, then the credential.
+        assert!(cx.debug_bounds("generated-header-row-3").is_some());
         assert!(
-            cx.debug_bounds("generated-header-row-3").is_none(),
+            cx.debug_bounds("generated-header-row-4").is_none(),
             "one credential row, not one per field"
         );
 
@@ -840,7 +842,7 @@ mod tests {
         });
         assert_eq!(
             names,
-            ["Host", "Accept-Encoding"],
+            ["Host", "Accept", "Accept-Encoding"],
             "a query credential is not a header"
         );
     }

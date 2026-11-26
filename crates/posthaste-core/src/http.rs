@@ -9,8 +9,8 @@
 //!   `Json` (`application/json`) and `Text` (`text/plain`) bodies when the
 //!   request does not define one. `Form` bodies are URL-encoded.
 //! - [`generated_headers`] reports the headers the client adds on its own
-//!   (content type and length, host, accepted encodings) so the editor can
-//!   present the effective request.
+//!   (content type and length, host, accepted types and encodings) so the
+//!   editor can present the effective request.
 //! - The connect timeout defaults to 10 seconds. The whole request (send plus
 //!   body read) is bounded by `RequestSpec::timeout_ms`, or 30 seconds when
 //!   unset.
@@ -58,6 +58,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_REDIRECT_LIMIT: usize = 10;
 /// Maximum response body retained in memory.
 pub const DEFAULT_BODY_LIMIT: usize = 20 * 1024 * 1024;
+/// `Accept` the HTTP client writes when the request does not define one.
+pub const DEFAULT_ACCEPT: &str = "*/*";
 /// `Accept-Encoding` sent when the request does not define one. It mirrors the
 /// decompression features enabled on the workspace's `reqwest` dependency.
 pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip,deflate,br";
@@ -410,6 +412,15 @@ pub fn generated_headers_with_file_length(
             // The authority without the user info: host plus a non-default
             // port, exactly what the transport sends.
             value: url[url::Position::BeforeHost..url::Position::AfterPort].to_owned(),
+        });
+    }
+
+    // The HTTP client writes `Accept: */*` itself; a WebSocket handshake is
+    // sent by another transport, which does not.
+    if spec.protocol == RequestProtocol::Http && !user_supplies("accept") {
+        headers.push(GeneratedHeader {
+            name: "Accept".to_owned(),
+            value: DEFAULT_ACCEPT.to_owned(),
         });
     }
 
@@ -2118,8 +2129,9 @@ mod tests {
         assert_eq!(value("Content-Type"), Some("application/json"));
         assert_eq!(value("Content-Length"), Some("11"));
         assert_eq!(value("Host"), Some("example.com:8443"));
+        assert_eq!(value("Accept"), Some(DEFAULT_ACCEPT));
         assert_eq!(value("Accept-Encoding"), Some(DEFAULT_ACCEPT_ENCODING));
-        assert_eq!(headers.len(), 4);
+        assert_eq!(headers.len(), 5);
     }
 
     #[test]
@@ -2142,10 +2154,10 @@ mod tests {
         let names: Vec<_> = headers.iter().map(|header| header.name.as_str()).collect();
         assert_eq!(
             names,
-            ["Accept-Encoding"],
+            ["Accept", "Accept-Encoding"],
             "a disabled row is not sent, so the default encoding still applies"
         );
-        assert_eq!(headers[0].value, DEFAULT_ACCEPT_ENCODING);
+        assert_eq!(headers[1].value, DEFAULT_ACCEPT_ENCODING);
     }
 
     #[test]
@@ -2154,12 +2166,16 @@ mod tests {
         spec.url = "https://example.com".into();
         let headers = generated_headers(&spec, None);
         let names: Vec<_> = headers.iter().map(|header| header.name.as_str()).collect();
-        assert_eq!(names, ["Host", "Accept-Encoding"]);
+        assert_eq!(names, ["Host", "Accept", "Accept-Encoding"]);
 
         spec.url = "not a url".into();
         let headers = generated_headers(&spec, None);
         let names: Vec<_> = headers.iter().map(|header| header.name.as_str()).collect();
-        assert_eq!(names, ["Accept-Encoding"], "no host without a URL");
+        assert_eq!(
+            names,
+            ["Accept", "Accept-Encoding"],
+            "no host without a URL"
+        );
     }
 
     #[test]

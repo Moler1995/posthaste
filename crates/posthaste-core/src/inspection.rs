@@ -276,15 +276,24 @@ fn mask_query_credential(url: &str, auth: &RequestAuth) -> String {
     if !pairs.iter().any(|(name, value)| is_credential(name, value)) {
         return url.to_owned();
     }
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    for (name, value) in pairs {
+    let mut rebuilt = String::with_capacity(query.len());
+    for (index, (name, value)) in pairs.into_iter().enumerate() {
+        if index > 0 {
+            rebuilt.push('&');
+        }
         if is_credential(&name, &value) {
-            serializer.append_pair(&name, MASKED_VALUE);
+            // The mask is read by the user, so it is written as bullets rather
+            // than as percent-encoded UTF-8.
+            rebuilt.extend(form_urlencoded::byte_serialize(name.as_bytes()));
+            rebuilt.push('=');
+            rebuilt.push_str(MASKED_VALUE);
         } else {
-            serializer.append_pair(&name, &value);
+            let mut pair = form_urlencoded::Serializer::new(String::new());
+            pair.append_pair(&name, &value);
+            rebuilt.push_str(&pair.finish());
         }
     }
-    let mut result = format!("{base}?{}", serializer.finish());
+    let mut result = format!("{base}?{rebuilt}");
     if let Some(fragment) = fragment {
         result.push('#');
         result.push_str(fragment);

@@ -2332,6 +2332,26 @@ pub(crate) fn read_versioned<T: DeserializeOwned + Versioned>(
     path: &Path,
 ) -> Result<T, StorageError> {
     let contents = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
+    // Read the version before the shape: a document from a newer build may
+    // carry fields this build cannot decode, and "unsupported schema" is the
+    // answer the user can act on.
+    let peek: serde_json::Value =
+        serde_json::from_str(&contents).map_err(|error| StorageError::Parse {
+            path: path.to_path_buf(),
+            format: "JSON",
+            message: error.to_string(),
+        })?;
+    if let Some(found) = peek
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        && found > u64::from(SCHEMA_VERSION)
+    {
+        return Err(StorageError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            found: found.min(u64::from(u32::MAX)) as u32,
+            supported: SCHEMA_VERSION,
+        });
+    }
     let value: T = serde_json::from_str(&contents).map_err(|error| StorageError::Parse {
         path: path.to_path_buf(),
         format: "JSON",
