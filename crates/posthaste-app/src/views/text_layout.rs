@@ -901,6 +901,10 @@ mod tests {
     /// cache cannot keep a line painted with stale colors or metrics.
     #[test]
     fn the_line_key_covers_every_input_that_changes_a_run() {
+        // The key hashes the process-wide theme colors. Without the guard, a
+        // parallel test that switches the palette between these two calls
+        // makes two identical specs hash differently.
+        let _guard = crate::test_globals::InterfaceGuard::take();
         let base = spec("{\"a\": 1}");
         let base_key = key(&base);
         assert_eq!(base_key, key(&spec("{\"a\": 1}")));
