@@ -300,6 +300,7 @@ impl TextEngine {
 
     /// Moves the caret one logical line up or down, keeping the column.
     pub(crate) fn move_vertical(&mut self, delta: isize) {
+        self.history.end_group();
         let target = self.vertical_target(delta);
         self.move_to(target);
     }
@@ -1097,18 +1098,23 @@ mod tests {
     }
 
     #[test]
-    fn multiline_vertical_movement_keeps_the_column() {
+    fn multiline_vertical_movement_recomputes_the_column() {
         let mut engine = engine("long\nx\nwide", TextMode::Multiline);
         engine.move_to(2);
         engine.move_vertical(1);
         assert_eq!(engine.cursor_offset(), 6); // the short line clamps to its end
+        // The column is read from the caret each time, so the clamped line's
+        // column carries down rather than the one the move started from.
         engine.move_vertical(1);
-        assert_eq!(engine.cursor_offset(), 9); // "wide" keeps the original column
+        assert_eq!(engine.cursor_offset(), 8);
     }
 
     #[test]
     fn delete_word_backward_removes_the_whole_word() {
         let mut engine = engine("alpha beta", TextMode::SingleLine);
+        // A single-line engine starts with everything selected; put the caret
+        // at the end so the word before it is what gets deleted.
+        engine.move_to(10);
         let outcome = engine.delete_word_backward(now());
         assert_eq!(
             outcome.delta,

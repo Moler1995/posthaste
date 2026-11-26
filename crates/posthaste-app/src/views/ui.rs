@@ -1357,15 +1357,17 @@ mod tests {
                 .expect("missing close bounds");
             assert_eq!(close.size.width, layout::CONTROL_COMPACT);
             assert_eq!(close.size.height, layout::CONTROL_COMPACT);
+            // The panel's border and padding both inset its content box.
+            let inset = space::S16 + px(1.);
             assert_eq!(
                 close.origin.y - panel.origin.y,
-                space::S16,
+                inset,
                 "{selector}: the close sits on the title row's top edge"
             );
             assert_eq!(
                 panel.origin.x + panel.size.width - (close.origin.x + close.size.width),
-                space::S16,
-                "{selector}: the close sits inside the panel's right padding"
+                inset,
+                "{selector}: the close sits inside the panel's border and padding"
             );
         }
     }
@@ -1378,10 +1380,12 @@ mod tests {
     fn dialogs_take_their_width_from_modal_tokens() {
         /// The second argument of every `ui::modal(...)` call in `source`.
         fn dialog_widths(source: &str) -> Vec<(usize, String)> {
+            // Split so this scanner does not match its own source literal.
+            const MODAL_CALL: &str = concat!("ui::modal", "(");
             let mut widths = Vec::new();
             let mut offset = 0;
-            while let Some(found) = source[offset..].find("ui::modal(") {
-                let call = offset + found + "ui::modal(".len();
+            while let Some(found) = source[offset..].find(MODAL_CALL) {
+                let call = offset + found + MODAL_CALL.len();
                 offset = call;
                 let mut depth = 0usize;
                 let mut arguments = Vec::new();

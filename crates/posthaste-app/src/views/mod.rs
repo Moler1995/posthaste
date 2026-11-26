@@ -7706,9 +7706,9 @@ mod tests {
             });
         });
         redraw(cx);
+        let labels = cx.update(|_, app| state.read(app).navigation_row_labels());
         assert!(
-            cx.debug_bounds(leaked(format!("collection-row-{}", added.id)))
-                .is_none(),
+            !labels.iter().any(|label| label == "Added"),
             "a deleted collection is gone on the next frame"
         );
     }
@@ -7793,9 +7793,9 @@ mod tests {
             });
         });
         redraw(cx);
+        let ids = cx.update(|_, app| state.read(app).navigation_history_ids());
         assert!(
-            cx.debug_bounds(leaked(format!("history-row-{linked_id}")))
-                .is_none(),
+            !ids.contains(&linked_id),
             "an unlinked run no longer matches the old name"
         );
         set_sidebar_search(&state, cx, "");
@@ -7805,8 +7805,7 @@ mod tests {
             "the run itself is still listed"
         );
         assert!(
-            cx.debug_bounds(leaked(format!("history-linked-name-{linked_id}")))
-                .is_none(),
+            cx.update(|_, app| state.read(app).linked_history_request(&linked).is_none()),
             "the deleted request's name is no longer linked"
         );
     }
@@ -13674,7 +13673,8 @@ mod tests {
         cx.run_until_parked();
         redraw(cx);
         assert!(cx.debug_bounds("inspector-content").is_some());
-        assert!(cx.debug_bounds("inspector-preparing").is_none());
+        // `debug_bounds` keeps selectors painted on earlier frames, so only the
+        // content's arrival and the result's state prove the transition.
         assert!(cx.update(|_, app| state.read(app).inspector_result().is_some()));
     }
 
@@ -14073,7 +14073,7 @@ mod tests {
 
         open_settings(&state, cx);
         assert!(cx.debug_bounds("settings-dialog").is_some());
-        assert!(cx.debug_bounds("settings-backdrop").is_some());
+        assert!(cx.debug_bounds("settings-dialog-backdrop").is_some());
         cx.update(|_, app| {
             let state = state.read(app);
             assert_eq!(state.active_tab_position().0, tab, "opening changes no tab");
@@ -14112,7 +14112,7 @@ mod tests {
         // A click on the backdrop, away from the centered card, dismisses it.
         open_settings(&state, cx);
         let bounds = cx
-            .debug_bounds("settings-backdrop")
+            .debug_bounds("settings-dialog-backdrop")
             .expect("the backdrop covers the window");
         // A point well inside the backdrop and clearly beside the centered
         // card, away from the platform resize band along the window edges.

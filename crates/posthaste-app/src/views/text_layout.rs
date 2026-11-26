@@ -926,12 +926,7 @@ mod tests {
         assert_ne!(base_key, key(&text_color), "text color");
 
         let mut accent = spec("{\"a\": 1}");
-        accent.accent = Rgba {
-            r: 0.1,
-            g: 0.2,
-            b: 0.3,
-            a: 1.,
-        };
+        accent.accent = theme::accent::hover();
         assert_ne!(base_key, key(&accent), "accent");
 
         let mut marked = spec("{\"a\": 1}");

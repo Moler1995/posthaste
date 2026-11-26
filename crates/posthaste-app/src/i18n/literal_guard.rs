@@ -37,7 +37,19 @@ const ALLOWED_LITERALS: &[&str] = &[
     "TextArea VariableCompletion",
     // A strftime pattern: a format token, not a sentence.
     "%Y-%m-%d %H:%M:%S",
+    // Reasons passed to the save-path flush; they are only recorded in
+    // tracing fields and never reach a frame.
+    "closing the window",
+    "opening a workspace in a new window",
+    "switching workspaces",
+    "recording a completed run",
+    "changing the request selection",
 ];
+
+/// Files the parent module compiles only under `#[cfg(test)]`, so no literal
+/// in them can reach a frame. The item-level scan cannot see the module
+/// declaration in `views/mod.rs`.
+const TEST_ONLY_SOURCES: &[&str] = &["views/editor_suite.rs"];
 
 /// Macros whose string arguments never reach the interface.
 const QUIET_MACROS: &[&str] = &[
@@ -94,6 +106,7 @@ fn scanned_sources(root: &Path) -> Vec<String> {
         }
     }
     files.sort();
+    files.retain(|file| !TEST_ONLY_SOURCES.contains(&file.as_str()));
     files
 }
 
@@ -613,6 +626,16 @@ mod tests {
             assert!(
                 scanned.iter().any(|candidate| candidate == path),
                 "{path} is pinned but not scanned"
+            );
+        }
+        for path in TEST_ONLY_SOURCES {
+            assert!(
+                root.join(path).is_file(),
+                "{path} is listed as test-only but does not exist"
+            );
+            assert!(
+                !scanned.iter().any(|candidate| candidate == path),
+                "{path} is test-only but was scanned"
             );
         }
     }

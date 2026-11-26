@@ -1161,7 +1161,19 @@ mod tests {
     /// a number after the colon.
     fn hardcoded_color(line: &str) -> Option<&'static str> {
         const CALLS: [&str; 3] = ["rgb(", "rgba(", "hsla("];
-        if let Some(call) = CALLS.iter().find(|call| line.contains(**call)) {
+        // A call starts a token; `hash_hsla(`/`hash_rgba(` are the layout
+        // cache's hashing helpers, not color constructors.
+        let starts_call = |index: usize| {
+            index == 0
+                || line[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|before| !before.is_alphanumeric() && before != '_')
+        };
+        if let Some(call) = CALLS.iter().copied().find(|call| {
+            line.match_indices(call)
+                .any(|(index, _)| starts_call(index))
+        }) {
             return Some(call);
         }
         line.match_indices("a:").find_map(|(index, _)| {
@@ -1193,6 +1205,8 @@ mod tests {
             "let color = theme::text::primary();",
             "fn shade<'a: 'b>(color: &'a str) -> &'b str { color }",
             "append(&viewer, cx, b\"a: {}\\n\\n\");",
+            "hash_hsla(&mut hasher, spec.text_color);",
+            "fn hash_rgba(hasher: &mut DefaultHasher, color: Rgba) {}",
         ] {
             assert_eq!(
                 hardcoded_color(allowed),

@@ -414,6 +414,8 @@ text_table! {
     WsSendMessage => "Send message" / "发送消息",
     WsComposerPlaceholder => "Message" / "消息",
     WsComposerSendsWhenConnected => "Sending is available while the session is connected." / "仅在会话连接时才能发送。",
+    WsSendBufferFull => "The send buffer is full; the frame was not sent." / "发送缓冲区已满；该帧未发送。",
+    WsSendNotConnected => "The session is no longer connected." / "会话已断开连接。",
     WsCopyPayload => "Copy payload" / "复制载荷",
     WsPayloadNotRetained => "This frame is not retained in full." / "此帧未被完整保留。",
     EditorTimeoutOutOfRange => "Timeout must be greater than zero." / "超时必须大于零。",
@@ -569,6 +571,8 @@ message_table! {
 pub const INVARIANT_KEYS: &[&str] = &[
     "LanguageEnglish",
     "LanguageChinese",
+    // A body format token: JSON is written the same way in both languages.
+    "InspectBodyJson",
     "BodyJson",
     // Protocol tokens: the WebSocket label, its short form, and the script
     // section heading are written the same way in both languages.

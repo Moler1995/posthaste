@@ -2246,6 +2246,9 @@ mod tests {
         let area = cx.new(|cx| TextArea::new(long_body(5_000), "Body", cx));
         let cx = area_window(cx, area.clone());
         cx.update(|window, app| window.focus(area.read(app).focus_handle()));
+        // Follow the caret before the baseline paint, so it already shows the
+        // end of the body and the edit's row is the one that gets reshaped.
+        cx.update(|_, app| area.update(app, |area, _| area.follow = true));
         cx.update(|window, app| window.draw(app).clear());
         // The first paint shapes the visible rows; the edit is what must not
         // reshape anything outside its line.
@@ -2398,15 +2401,21 @@ mod tests {
             bounds.left() + gutter + px(1.),
             bounds.top() + line_height * 0.5,
         );
-        press(&area, position, 1, false, cx);
+        // Map the pointer directly: a real click notifies, and the test
+        // harness paints the dirty window before the counters can be read.
+        let start = cx.update(|_, app| area.read(app).engine.line_start(300));
+        let offset = cx.update(|window, app| {
+            area.update(app, |area, _| {
+                area.index_for_mouse_position(position, window)
+            })
+        });
         cx.update(|_, app| {
-            let area = area.read(app);
             assert!(
-                area.layout.line(300).is_some(),
+                area.read(app).layout.line(300).is_some(),
                 "the pointer shaped the cold row"
             );
-            assert_eq!(area.engine.cursor_offset(), area.engine.line_start(300));
         });
+        assert_eq!(offset, start, "the pointer mapped the cold row's start");
         assert_eq!(
             reshaped_since_last_draw(&area, cx),
             1,

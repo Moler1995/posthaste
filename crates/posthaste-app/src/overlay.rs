@@ -92,6 +92,21 @@ impl OverlayKind {
     fn same_variant(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
+
+    /// Whether this surface paints inside `host` instead of beside it.
+    ///
+    /// The environment row menu is the one nested case: environment rows exist
+    /// only inside the variables popover, so opening the menu must leave the
+    /// popover that paints it open.
+    fn nests_in(&self, host: &Self) -> bool {
+        matches!(
+            (self, host),
+            (
+                Self::RowMenu(RowMenuTarget::Environment { .. }),
+                Self::Variables
+            )
+        )
+    }
 }
 
 /// One entry in the host: what is open and how it behaves.
@@ -134,7 +149,8 @@ impl OverlayHost {
     pub fn open(&mut self, kind: OverlayKind) {
         let entry = OverlayEntry::new(kind);
         if entry.captures_input {
-            self.entries.retain(|existing| !existing.captures_input);
+            self.entries
+                .retain(|existing| !existing.captures_input || entry.kind.nests_in(&existing.kind));
         }
         self.entries
             .retain(|existing| !existing.kind.same_variant(&entry.kind));
@@ -342,7 +358,7 @@ mod tests {
         host.open(OverlayKind::CollectionsMenu);
 
         assert!(
-            !host.contains(&OverlayKind::CollectionsMenu),
+            host.row_menu().is_none(),
             "opening the collections menu closes the row menu"
         );
         assert_eq!(host.top(), Some(&OverlayKind::CollectionsMenu));
@@ -388,6 +404,22 @@ mod tests {
         host.close(&OverlayKind::Settings);
         assert!(host.is_empty());
         assert!(!host.contains_where(|kind| matches!(kind, OverlayKind::Settings)));
+    }
+
+    #[test]
+    fn an_environment_row_menu_keeps_the_variables_popover_open() {
+        let mut host = OverlayHost::new();
+        host.open(OverlayKind::Variables);
+        let menu = OverlayKind::RowMenu(RowMenuTarget::Environment {
+            slug: "dev".to_owned(),
+        });
+        host.open(menu.clone());
+
+        assert!(
+            host.contains(&OverlayKind::Variables),
+            "the popover hosts the row menu"
+        );
+        assert_eq!(host.top(), Some(&menu));
     }
 
     #[test]

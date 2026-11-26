@@ -3753,6 +3753,9 @@ impl AppState {
                     {
                         tab.save_state = RequestSaveState::Failed(message.clone());
                     }
+                    self.workspace.save_status =
+                        crate::workspace::SaveStatus::Failed(message.clone());
+                    self.workspace.needs_resync = true;
                 }
             },
             Document::HistoryEntry { .. } => {
@@ -3918,15 +3921,15 @@ impl AppState {
     /// visible message, while the session itself stays connected.
     pub fn send_ws_frame(&self, command: WsCommand) -> Result<(), String> {
         let Some(sender) = self.active_tab().ws.command_sender() else {
-            return Err("the session is no longer connected".to_owned());
+            return Err(i18n::t(Key::WsSendNotConnected).to_owned());
         };
         match sender.try_send(command) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                Err("the send buffer is full; the frame was not sent".to_owned())
+                Err(i18n::t(Key::WsSendBufferFull).to_owned())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err("the session is no longer connected".to_owned())
+                Err(i18n::t(Key::WsSendNotConnected).to_owned())
             }
         }
     }
@@ -6490,6 +6493,7 @@ impl AppState {
             tab.pending_save = None;
         }
         self.write_selected_request(&draft);
+        self.drain_write_reports(cx);
         self.schedule_session_write(cx);
         cx.notify();
     }
@@ -6794,6 +6798,7 @@ impl AppState {
         // the draft and stays unsaved until the user saves it explicitly.
         if self.autosave_enabled {
             self.write_selected_request(&restored);
+            self.drain_write_reports(cx);
         } else {
             self.active_tab_mut().save_state = RequestSaveState::Edited;
         }
@@ -14252,7 +14257,8 @@ mod tests {
                 )
             })
         });
-        let entry = HistoryEntry::completed(1_700_000_000_000, &source, &response(200, "ok"));
+        let entry = HistoryEntry::completed(1_700_000_000_000, &source, &response(200, "ok"))
+            .with_source(Some(source.id));
         let entry_id = entry.id;
 
         cx.update(|app| {
@@ -15013,10 +15019,10 @@ mod tests {
                 assert_eq!(state.opened_request(), None);
                 assert_eq!(
                     state.shell().draft().name,
-                    "Untitled request",
-                    "clearing the selection does not rewrite a draft that was never loaded"
+                    "Ping",
+                    "the deleted request's draft stays in the tab"
                 );
-                assert_ne!(state.shell().draft().id, request.id);
+                assert_eq!(state.shell().draft().id, request.id);
                 assert_eq!(state.save_state(), &RequestSaveState::NoTarget);
             });
         });
@@ -15901,10 +15907,10 @@ mod tests {
                 Some(reason.as_str()),
                 "the dialog reports the failure the status bar reports"
             );
-            let RequestSaveState::Failed(status_sentence) = state.save_state() else {
+            let RequestSaveState::Failed(message) = state.save_state() else {
                 panic!("the save-state line shows the failure");
             };
-            assert_eq!(status_sentence, &reason);
+            assert_eq!(message, &i18n::t(Key::SaveFolderMissing));
             assert_eq!(state.shell().draft().url, "https://example.test/probe");
             assert_eq!(state.opened_request(), None);
         });
@@ -20874,7 +20880,8 @@ mod tests {
     fn ui_handlers_never_encode_or_write_a_persisted_document() {
         // The handlers live above the test module. Everything they persist is
         // an owned payload handed to the background writer.
-        let source = include_str!("app.rs");
+        // A CRLF checkout must not hide the test module boundary.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
         let marker = "#[cfg(test)]\nmod tests {";
         let production = &source[..source.find(marker).expect("the test module marker")];
 
@@ -20911,8 +20918,10 @@ mod tests {
 
     #[gpui::test]
     async fn http_progress_stays_at_the_event_bound_and_started_gets_through(
-        _cx: &mut gpui::TestAppContext,
+        cx: &mut gpui::TestAppContext,
     ) {
+        // The producer is an OS thread; the test may park waiting for it.
+        cx.executor().allow_parking();
         let (events, receiver) = async_channel::bounded(2);
         let request = RequestId::new();
         for value in 0..5u8 {

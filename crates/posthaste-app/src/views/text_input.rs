@@ -537,13 +537,15 @@ impl TextInput {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        self.engine.undo(Instant::now());
-        self.after_edit(window, cx);
+        if self.engine.undo(Instant::now()).changed {
+            self.after_edit(window, cx);
+        }
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        self.engine.redo(Instant::now());
-        self.after_edit(window, cx);
+        if self.engine.redo(Instant::now()).changed {
+            self.after_edit(window, cx);
+        }
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
@@ -1605,6 +1607,8 @@ mod tests {
             cx.update(|_, app| input.update(app, |input, _| input.layout.take_lines_shaped()));
         assert_eq!(shaped, 0, "a repaint with nothing new shapes no lines");
 
+        // A fresh input selects its value, so typing would replace all of it.
+        cx.update(|_, app| input.update(app, |input, _| input.engine.move_to(3)));
         cx.simulate_input("x");
         cx.update(|window, app| window.draw(app).clear());
         let shaped =

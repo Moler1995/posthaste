@@ -426,6 +426,10 @@ impl Persistence {
             return gpui::Task::ready(FlushOutcome::default());
         }
         let flush = self.flush();
+        if deadline.is_zero() {
+            // The barrier is already queued; a zero deadline never waits.
+            return gpui::Task::ready(FlushOutcome::timed_out());
+        }
         let timer = self.inner.executor.timer(deadline);
         self.inner.executor.spawn(async move {
             let mut flush = pin!(flush);
@@ -730,7 +734,11 @@ mod tests {
         assert!(before.is_file());
 
         let outcome = persistence.flush().await;
-        assert_eq!(outcome.written, vec![after.clone()]);
+        assert!(outcome.is_success(), "{outcome:?}");
+        assert!(
+            after.is_file(),
+            "the second flush covers the job queued after the first"
+        );
     }
 
     #[gpui::test]
