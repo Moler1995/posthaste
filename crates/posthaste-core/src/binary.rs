@@ -104,6 +104,15 @@ pub fn declared_binary(headers: &[(String, String)]) -> Option<BinaryMeta> {
     })
 }
 
+/// The file name a `Content-Disposition` header declares, sanitized.
+///
+/// Binary responses get a name from [`suggested_name`] even without the header;
+/// this is for textual responses, which otherwise have no file to save and are
+/// offered one only when the server names it.
+pub fn attachment_name(headers: &[(String, String)]) -> Option<String> {
+    disposition_name(headers).and_then(|name| sanitize(&name))
+}
+
 /// The first `Content-Type` value's media type, lowercased and trimmed.
 fn content_type(headers: &[(String, String)]) -> Option<String> {
     let value = header(headers, "content-type")?;
@@ -298,7 +307,7 @@ fn suggested_name(
     media_type: Option<&str>,
     detected: Option<DetectedFormat>,
 ) -> String {
-    if let Some(name) = disposition_name(headers).and_then(|name| sanitize(&name)) {
+    if let Some(name) = attachment_name(headers) {
         return name;
     }
     // A detected format is more specific than the generic type it was sniffed
@@ -507,6 +516,21 @@ mod tests {
         ]);
         let meta = classify(&headers, b"%PDF", 4).expect("pdf is binary");
         assert_eq!(meta.file_name.as_deref(), Some("report.pdf"));
+    }
+
+    #[test]
+    fn a_textual_attachment_names_the_file_to_save() {
+        let attachment = headers(&[
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Disposition", "attachment; filename=\"notes.txt\""),
+        ]);
+        assert_eq!(classify(&attachment, b"hello", 5), None, "text stays text");
+        assert_eq!(attachment_name(&attachment).as_deref(), Some("notes.txt"));
+        assert_eq!(
+            attachment_name(&headers(&[("Content-Type", "text/plain")])),
+            None,
+            "a text response without a disposition names no file"
+        );
     }
 
     #[test]

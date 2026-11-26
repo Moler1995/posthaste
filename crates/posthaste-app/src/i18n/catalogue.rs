@@ -528,6 +528,7 @@ message_table! {
     ResponseBinaryFileName => "Suggested name: {}" / "建议文件名：{}",
     ResponseDetectedFormat => "Detected format: {}" / "识别格式：{}",
     ResponseTextFallbackNotice => "At most the first {} of the retained bytes is shown as lossy UTF-8 text; invalid bytes are replaced." / "最多显示保留的前 {} 字节（有损 UTF-8 文本），无效字节已替换。",
+    ResponseTextFile => "File: {} ({})" / "文件：{}（{}）",
     ResponseBodySaved => "Saved to {}" / "已保存到 {}",
     ResponseBodySavedPartial => "Saved the retained prefix to {}; the response was truncated." / "已保存保留的前缀到 {}；响应已被截断。",
     ResponseBodySaveFailed => "Could not save to {}: {}" / "无法保存到 {}：{}",

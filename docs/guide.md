@@ -25,6 +25,7 @@ a workspace can be committed, reviewed, and shared like any other source file.
 - [WebSocket requests](#websocket-requests)
 - [Response viewer](#response-viewer)
   - [Binary responses](#binary-responses)
+  - [Text file responses](#text-file-responses)
 - [Request history](#request-history)
 - [Layout](#layout)
 
@@ -725,13 +726,28 @@ encodes only the retained prefix.
 **View as text** decodes the body lossily for inspection: at most the first
 1 MiB of the retained bytes as UTF-8 with U+FFFD replacing invalid sequences,
 in the same virtualized raw presentation. A notice states the lossy decode and
-the limit, and **Show binary info** returns to the information block. **Find in
-body** and **Copy body** stay off. The fallback belongs to one response: a new
-response always opens on the information block.
+the limit, and **Show binary info** returns to the information block. **Save
+body…** and **Save to Downloads** stay above the text, so inspecting the body
+as text never takes away the ability to save the file. **Find in body** and
+**Copy body** stay off. The fallback belongs to one response: a new response
+always opens on the information block.
 
 History stores no binary bytes: replaying such an entry shows its media type,
 size, and suggested name with a notice that the body was not kept, and offers
 none of the save, copy, or text actions.
+
+### Text file responses
+
+A text response that names a file in `Content-Disposition`, such as a
+`text/plain` or `text/csv` download, shows a bar above the body naming the file
+and its retained size. **Save body…** and **Save to Downloads** work exactly as
+they do for a binary body — the same dialog directory memory, ` (n)` collision
+names, saved-path confirmation with **Reveal** and **Copy path**, and error
+reporting — and write the retained text bytes unchanged. The bar stays in every
+body view and also appears for an empty body the server named, which saves an
+empty file. A text response without a declared file name shows no bar and no
+save action. If the body was truncated at the 20 MiB cap, the bar states that a
+saved file will be incomplete.
 
 ## Request history
 

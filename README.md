@@ -39,7 +39,8 @@ no telemetry.
 - **Native HTTP and WebSocket** — real requests through reqwest and rustls, a
   collapsible JSON tree, raw text, headers, timing, size, and binary responses
   with save-to-file, save-to-Downloads, copy-as-base64, and a bounded
-  view-as-text fallback.
+  view-as-text fallback. Text responses that the server names as a file offer
+  the same two save actions.
 - **Git-friendly workspace** — collections, folders, requests, environments,
   and uploaded files are plain JSON and files, written atomically with stable
   names.

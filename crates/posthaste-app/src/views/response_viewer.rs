@@ -26,7 +26,8 @@ use gpui::{
     px, uniform_list,
 };
 use posthaste_core::binary::{
-    BinaryMeta, SNIFF_LIMIT as BINARY_SNIFF_LIMIT, classify, declared_binary, header_disposition,
+    BinaryMeta, SNIFF_LIMIT as BINARY_SNIFF_LIMIT, attachment_name, classify, declared_binary,
+    header_disposition,
 };
 use posthaste_core::cookies::CookieJar;
 use posthaste_core::model::{HttpMethod, ResponseCookie};
@@ -703,6 +704,14 @@ pub struct StreamingMeta {
 pub(crate) enum SaveFeedback {
     Saved { path: PathBuf, partial: bool },
     Failed { path: PathBuf, error: String },
+}
+
+/// What a save action writes: the bytes the viewer retains, the name to suggest
+/// for them, and whether they are only a truncated prefix.
+struct SaveTarget {
+    file_name: String,
+    bytes: Bytes,
+    partial: bool,
 }
 
 /// Whether a live body has been identified as an event stream.
@@ -2803,32 +2812,48 @@ impl ResponseViewer {
         self.copy(CopyTarget::Body, contents, cx);
     }
 
-    /// Asks where to save a binary body and writes the retained bytes there.
-    /// The dialog opens in the directory of the last successful save, and the
-    /// write runs off the UI thread; its outcome is shown under the card until
+    /// What a save action would write, or `None` when the response offers no
+    /// save: a history binary kept as metadata only, or a text body the server
+    /// did not name.
+    fn save_target(&self) -> Option<SaveTarget> {
+        let completed = self.completed.as_ref()?;
+        if let Some(meta) = &completed.preview.binary {
+            if !meta.body_stored {
+                return None;
+            }
+            return Some(SaveTarget {
+                file_name: meta
+                    .file_name
+                    .clone()
+                    .unwrap_or_else(|| "response.bin".to_owned()),
+                bytes: completed.body.clone(),
+                partial: completed.preview.truncated,
+            });
+        }
+        let file_name = attachment_name(&completed.headers)?;
+        Some(SaveTarget {
+            file_name,
+            bytes: completed.body.clone(),
+            partial: completed.preview.truncated,
+        })
+    }
+
+    /// Asks where to save a body and writes the retained bytes there. The
+    /// dialog opens in the directory of the last successful save, and the write
+    /// runs off the UI thread; its outcome is shown under the card until
     /// another response replaces it. A metadata-only history entry has no bytes
     /// to save and offers no action.
     pub fn save_body(&mut self, cx: &mut Context<Self>) {
-        let Some(completed) = &self.completed else {
+        let Some(target) = self.save_target() else {
             return;
         };
-        let Some(meta) = &completed.preview.binary else {
-            return;
-        };
-        if !meta.body_stored {
-            return;
-        }
-        let suggested = meta
-            .file_name
-            .clone()
-            .unwrap_or_else(|| "response.bin".to_owned());
         let directory = self
             .last_save_dir
             .clone()
             .unwrap_or_else(crate::app::export_directory);
-        let dialog = cx.prompt_for_new_path(&directory, Some(&suggested));
-        let bytes = completed.body.clone();
-        let partial = completed.preview.truncated;
+        let dialog = cx.prompt_for_new_path(&directory, Some(&target.file_name));
+        let bytes = target.bytes;
+        let partial = target.partial;
         self.save_feedback = None;
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = dialog.await else {
@@ -2858,25 +2883,16 @@ impl ResponseViewer {
         cx.notify();
     }
 
-    /// Writes a binary body to the downloads directory without a dialog. An
-    /// existing file is never overwritten: the first free ` (n)` name wins.
+    /// Writes a body to the downloads directory without a dialog. An existing
+    /// file is never overwritten: the first free ` (n)` name wins.
     pub fn save_body_to_downloads(&mut self, cx: &mut Context<Self>) {
-        let Some(completed) = &self.completed else {
+        let Some(target) = self.save_target() else {
             return;
         };
-        let Some(meta) = &completed.preview.binary else {
-            return;
-        };
-        if !meta.body_stored {
-            return;
-        }
-        let suggested = meta
-            .file_name
-            .clone()
-            .unwrap_or_else(|| "response.bin".to_owned());
+        let suggested = target.file_name;
         let directory = self.quick_save_directory();
-        let bytes = completed.body.clone();
-        let partial = completed.preview.truncated;
+        let bytes = target.bytes;
+        let partial = target.partial;
         self.save_feedback = None;
         let failed_path = directory.join(&suggested);
         cx.spawn(async move |this, cx| {
@@ -3072,34 +3088,14 @@ impl ResponseViewer {
         }
         if !streaming && meta.body_stored {
             let viewer = cx.entity();
-            let save_body_viewer = viewer.clone();
-            let downloads_viewer = viewer.clone();
-            let text_viewer = viewer;
+            let text_viewer = viewer.clone();
             let mut actions = div()
                 .debug_selector(|| "response-binary-actions".to_owned())
                 .flex()
                 .items_center()
                 .flex_wrap()
                 .gap(space::S4)
-                .child(
-                    super::ui::ghost_button("response-save-body", i18n::t(Key::ResponseSaveBody))
-                        .debug_selector(|| "response-save-body".to_owned())
-                        .on_click(move |_, _, cx| {
-                            save_body_viewer.update(cx, |viewer, cx| viewer.save_body(cx));
-                        }),
-                )
-                .child(
-                    super::ui::ghost_button(
-                        "response-save-downloads",
-                        i18n::t(Key::ResponseSaveToDownloads),
-                    )
-                    .debug_selector(|| "response-save-downloads".to_owned())
-                    .on_click(move |_, _, cx| {
-                        downloads_viewer.update(cx, |viewer, cx| {
-                            viewer.save_body_to_downloads(cx);
-                        });
-                    }),
-                );
+                .children(save_action_buttons(viewer));
             if size > 0 {
                 actions = actions.child(
                     super::ui::ghost_button(
@@ -3202,20 +3198,30 @@ impl ResponseViewer {
         }
     }
 
-    /// The lossy text fallback of a binary body: the bounded Raw presentation
-    /// with a notice naming the cap and a way back to the binary information.
-    fn binary_text_fallback(&self, viewer: Entity<ResponseViewer>, focused: bool) -> AnyElement {
+    /// The lossy text fallback of a binary body: a header naming the cap with
+    /// the save actions and a way back to the binary information, then the
+    /// bounded Raw presentation. The actions stay reachable here because
+    /// viewing as text must not take away the ability to save the file.
+    fn binary_text_fallback(
+        &self,
+        viewer: Entity<ResponseViewer>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let info_viewer = viewer.clone();
-        let notice = div()
+        let mut header = div()
             .debug_selector(|| "response-binary-text-notice".to_owned())
             .flex()
-            .items_center()
-            .gap(space::S8)
+            .flex_col()
+            .gap(space::S4)
             .px(space::S12)
-            .py(space::S4)
+            .py(space::S8)
+            .border_b(px(1.))
+            .border_color(theme::border::subtle())
             .child(
+                // The notice wraps instead of pushing the actions off the
+                // right edge.
                 div()
-                    .flex_1()
                     .text_role(type_role::META)
                     .text_color(theme::text::secondary())
                     .child(i18n::msg(
@@ -3224,15 +3230,27 @@ impl ResponseViewer {
                     )),
             )
             .child(
-                super::ui::ghost_button(
-                    "response-show-binary",
-                    i18n::t(Key::ResponseShowBinaryInfo),
-                )
-                .debug_selector(|| "response-show-binary".to_owned())
-                .on_click(move |_, _, cx| {
-                    info_viewer.update(cx, |viewer, cx| viewer.show_binary_info(cx));
-                }),
+                div()
+                    .debug_selector(|| "response-binary-text-actions".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(space::S4)
+                    .children(save_action_buttons(viewer.clone()))
+                    .child(
+                        super::ui::ghost_button(
+                            "response-show-binary",
+                            i18n::t(Key::ResponseShowBinaryInfo),
+                        )
+                        .debug_selector(|| "response-show-binary".to_owned())
+                        .on_click(move |_, _, cx| {
+                            info_viewer.update(cx, |viewer, cx| viewer.show_binary_info(cx));
+                        }),
+                    ),
             );
+        if let Some(feedback) = self.save_feedback.clone() {
+            header = header.child(self.save_feedback_row(feedback, cx));
+        }
         div()
             .id("response-binary-text")
             .debug_selector(|| "response-binary-text".to_owned())
@@ -3240,7 +3258,7 @@ impl ResponseViewer {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(notice)
+            .child(header)
             .child(code_view(
                 "response-binary-text-body",
                 self.binary_display_lines(),
@@ -3256,6 +3274,57 @@ impl ResponseViewer {
                 Some(self.code_interaction(ScrollTarget::BinaryText, viewer, focused)),
             ))
             .into_any_element()
+    }
+
+    /// The bar above a text response that declares a file name: it names the
+    /// file and offers the same two save actions as a binary body. Returns
+    /// `None` for a response the server did not name, which has nothing to save
+    /// as a file.
+    fn text_file_bar(
+        &self,
+        view: &ResponseSnapshot<'_>,
+        viewer: Entity<ResponseViewer>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let file_name = attachment_name(&view.completed.headers)?;
+        let mut facts = div().flex().flex_col().gap(space::S2).child(
+            div()
+                .text_role(type_role::META)
+                .text_color(theme::text::secondary())
+                .child(i18n::msg(
+                    MessageKey::ResponseTextFile,
+                    &[&file_name, &format_bytes(view.completed.preview.size)],
+                )),
+        );
+        if view.completed.preview.truncated {
+            facts = facts.child(binary_hint(
+                "response-text-file-truncated",
+                Key::ResponseBinaryTruncated,
+            ));
+        }
+        let mut bar = div()
+            .debug_selector(|| "response-text-file".to_owned())
+            .flex()
+            .flex_col()
+            .gap(space::S4)
+            .px(space::S12)
+            .py(space::S8)
+            .border_b(px(1.))
+            .border_color(theme::border::subtle())
+            .child(facts)
+            .child(
+                div()
+                    .debug_selector(|| "response-text-file-actions".to_owned())
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(space::S4)
+                    .children(save_action_buttons(viewer)),
+            );
+        if let Some(feedback) = self.save_feedback.clone() {
+            bar = bar.child(self.save_feedback_row(feedback, cx));
+        }
+        Some(bar.into_any_element())
     }
 
     /// Writes `contents` to the clipboard and shows `Copied` on `target` for
@@ -3597,6 +3666,30 @@ fn base64_copy_button(viewer: Entity<ResponseViewer>, label: &'static str) -> An
             viewer.update(cx, |viewer, cx| viewer.copy_base64(cx));
         })
         .into_any_element()
+}
+
+/// The two save actions, shared by the binary card, the binary text fallback,
+/// and the file bar of a named text response.
+fn save_action_buttons(viewer: Entity<ResponseViewer>) -> [AnyElement; 2] {
+    let save_viewer = viewer.clone();
+    let downloads_viewer = viewer;
+    [
+        super::ui::ghost_button("response-save-body", i18n::t(Key::ResponseSaveBody))
+            .debug_selector(|| "response-save-body".to_owned())
+            .on_click(move |_, _, cx| {
+                save_viewer.update(cx, |viewer, cx| viewer.save_body(cx));
+            })
+            .into_any_element(),
+        super::ui::ghost_button(
+            "response-save-downloads",
+            i18n::t(Key::ResponseSaveToDownloads),
+        )
+        .debug_selector(|| "response-save-downloads".to_owned())
+        .on_click(move |_, _, cx| {
+            downloads_viewer.update(cx, |viewer, cx| viewer.save_body_to_downloads(cx));
+        })
+        .into_any_element(),
+    ]
 }
 
 /// The first free quick-save path: `name (n).ext` when `name.ext` is taken, so
@@ -5499,7 +5592,7 @@ impl ResponseViewer {
             // it is and offers the save and inspection actions. View as text is
             // the one explicit, bounded exception.
             if self.binary_as_text && meta.body_stored {
-                self.binary_text_fallback(viewer.clone(), focused)
+                self.binary_text_fallback(viewer.clone(), focused, cx)
             } else {
                 self.binary_card(
                     meta,
@@ -5544,6 +5637,14 @@ impl ResponseViewer {
                 .into_any_element()
         } else {
             self.render_body_modes(view, viewer.clone(), focused)
+        };
+
+        // A text response the server named as a file keeps its save actions
+        // above the body, whichever view is showing it.
+        let file_bar = if view.event_stream || view.completed.preview.binary.is_some() {
+            None
+        } else {
+            self.text_file_bar(view, viewer.clone(), cx)
         };
 
         let prepaint_viewer = viewer.clone();
@@ -5602,6 +5703,7 @@ impl ResponseViewer {
                             });
                         }
                     })
+                    .children(file_bar)
                     .child(body),
             )
             .into_any_element()
@@ -5915,6 +6017,16 @@ mod tests {
             (
                 "content-disposition".into(),
                 "attachment; filename=\"plot.png\"".into(),
+            ),
+        ]
+    }
+
+    fn text_file_headers() -> Vec<(String, String)> {
+        vec![
+            ("content-type".into(), "text/plain; charset=utf-8".into()),
+            (
+                "content-disposition".into(),
+                "attachment; filename=\"notes.txt\"".into(),
             ),
         ]
     }
@@ -9875,6 +9987,184 @@ mod tests {
         assert!(
             !cx.update(|_, app| viewer.read(app).binary_as_text()),
             "the fallback belongs to one response"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_text_fallback_keeps_the_save_actions(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let retained = [0x89, b'P', b'N', b'G'];
+        show_with_headers(&viewer, cx, png_headers(), &retained, false);
+        click(cx, "response-view-as-text");
+
+        assert!(cx.debug_bounds("response-binary-text-actions").is_some());
+        assert!(cx.debug_bounds("response-save-body").is_some());
+        assert!(cx.debug_bounds("response-save-downloads").is_some());
+
+        // Saving from the fallback writes the retained bytes, not the lossy
+        // text the section displays.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("plot.png");
+        click(cx, "response-save-body");
+        let chosen = target.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert_eq!(
+            std::fs::read(&target).expect("the file is written"),
+            retained
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).save_feedback()),
+            Some(SaveFeedback::Saved {
+                path: target,
+                partial: false,
+            })
+        );
+        assert!(
+            cx.update(|_, app| viewer.read(app).binary_as_text()),
+            "saving keeps the fallback open"
+        );
+        assert!(cx.debug_bounds("response-save-feedback").is_some());
+    }
+
+    #[gpui::test]
+    async fn a_named_text_response_offers_save_actions(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, text_file_headers(), b"hello", false);
+
+        assert!(
+            cx.debug_bounds("response-body").is_some(),
+            "the text renders"
+        );
+        assert!(cx.debug_bounds("response-text-file").is_some());
+        assert!(cx.debug_bounds("response-text-file-actions").is_some());
+        assert!(cx.debug_bounds("response-save-body").is_some());
+        assert!(cx.debug_bounds("response-save-downloads").is_some());
+        assert!(
+            cx.debug_bounds("response-copy-body").is_some(),
+            "a text body keeps Copy body"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_unnamed_text_response_offers_no_save(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(
+            &viewer,
+            cx,
+            vec![("content-type".into(), "text/plain".into())],
+            b"hello",
+            false,
+        );
+
+        assert!(
+            cx.debug_bounds("response-body").is_some(),
+            "the text renders"
+        );
+        assert!(
+            cx.debug_bounds("response-text-file").is_none(),
+            "without a declared name there is no file to save"
+        );
+        assert!(cx.debug_bounds("response-save-body").is_none());
+    }
+
+    #[gpui::test]
+    async fn saving_a_text_file_writes_the_exact_bytes(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("notes.txt");
+        let bytes: &[u8] = b"hello, world";
+        show_with_headers(&viewer, cx, text_file_headers(), bytes, false);
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = target.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert_eq!(std::fs::read(&target).expect("the file is written"), bytes);
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).save_feedback()),
+            Some(SaveFeedback::Saved {
+                path: target,
+                partial: false,
+            })
+        );
+        assert!(cx.debug_bounds("response-save-feedback").is_some());
+    }
+
+    #[gpui::test]
+    async fn a_named_text_response_quick_saves_under_its_name(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let dir = tempfile::tempdir().expect("temp directory");
+        let quick = dir.path().to_path_buf();
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, _| viewer.save_directory = Some(quick));
+        });
+        show_with_headers(&viewer, cx, text_file_headers(), b"hello", false);
+
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body_to_downloads(cx));
+        });
+        cx.run_until_parked();
+        redraw(cx);
+
+        let expected: &[u8] = b"hello";
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.txt")).expect("the file is written"),
+            expected
+        );
+        assert!(cx.debug_bounds("response-save-feedback").is_some());
+    }
+
+    #[gpui::test]
+    async fn a_truncated_text_file_says_the_saved_copy_is_partial(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, text_file_headers(), b"hello", true);
+
+        assert!(cx.debug_bounds("response-text-file-truncated").is_some());
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("notes.txt");
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = target.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+
+        assert!(matches!(
+            cx.update(|_, app| viewer.read(app).save_feedback()),
+            Some(SaveFeedback::Saved { partial: true, .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn an_empty_text_file_can_still_be_saved(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, text_file_headers(), b"", false);
+
+        assert!(
+            cx.debug_bounds("response-text-file").is_some(),
+            "an empty body the server named is still a file"
+        );
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("empty.txt");
+        cx.update(|_, app| {
+            viewer.update(app, |viewer, cx| viewer.save_body(cx));
+        });
+        let chosen = target.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+
+        assert!(
+            std::fs::read(&target)
+                .expect("the file is written")
+                .is_empty(),
+            "the saved file is empty"
         );
     }
 
