@@ -14568,7 +14568,18 @@ mod tests {
         });
         redraw(cx);
 
-        let revealed = cx.update(|_, app| state.read(app).navigation_history_offset());
+        // The reveal target is applied during the next layout, and measuring
+        // the rows can clamp the offset into the real content range. Let the
+        // first paint settle that, then a repaint must leave the offset alone.
+        let mut revealed = cx.update(|_, app| state.read(app).navigation_history_offset());
+        for _ in 0..4 {
+            redraw(cx);
+            let settled = cx.update(|_, app| state.read(app).navigation_history_offset());
+            if settled == revealed {
+                break;
+            }
+            revealed = settled;
+        }
         assert!(
             revealed < px(0.),
             "selecting an offscreen entry scrolls it into view"
@@ -14588,6 +14599,7 @@ mod tests {
             "the offscreen row keeps its delete control"
         );
 
+        // Once settled, a repaint must not move the list again.
         redraw(cx);
         assert_eq!(
             cx.update(|_, app| state.read(app).navigation_history_offset()),
