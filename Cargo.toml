@@ -31,7 +31,7 @@ async-channel = "2"
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 cookie_store = "0.22"
-dirs = "6"
+dirs = "7"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 mime_guess = "2"
 percent-encoding = "2"
