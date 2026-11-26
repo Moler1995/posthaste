@@ -379,8 +379,9 @@ pub mod layout {
     /// The gap lives inside the item so a uniform list can lay items out without
     /// external spacing.
     pub const TREE_ROW: Pixels = px(32.);
-    /// In-app title bar.
-    pub const TITLE_BAR: Pixels = px(32.);
+    /// Caption row: the tab strip's row on Windows, matching the sidebar's
+    /// brand row.
+    pub const CAPTION: Pixels = px(36.);
     /// Sidebar width.
     pub const SIDEBAR: Pixels = px(272.);
     /// Pane padding.

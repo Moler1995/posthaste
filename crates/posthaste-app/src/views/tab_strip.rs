@@ -17,6 +17,20 @@ use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
 use crate::views::ui::{menu_action, menu_action_disabled, menu_separator};
 
+/// Width of the fade that hides chips running out of view.
+const FADE_WIDTH: f32 = 18.;
+
+/// Distance from the strip's right edge to the caption controls' first cell, so
+/// the fade never paints over a control.
+#[cfg(target_os = "windows")]
+fn fade_right_inset() -> f32 {
+    super::caption::CONTROL_WIDTH + f32::from(layout::TAB_GAP)
+}
+#[cfg(not(target_os = "windows"))]
+fn fade_right_inset() -> f32 {
+    0.
+}
+
 /// Renders the strip: every open tab in order, then the add control. The
 /// scroll handle is owned by the shell so its offset survives across frames.
 pub(crate) fn render(
@@ -36,7 +50,10 @@ pub(crate) fn render(
         .debug_selector(|| "request-tab-strip-scroll".to_owned())
         .flex()
         .items_center()
-        .flex_1()
+        // No `flex_1`: the strip hugs its chips, so the add control follows the
+        // last visible chip. `flex_shrink` lets it narrow once the chips no
+        // longer fit, and only then does it scroll.
+        .flex_shrink()
         .min_w(px(0.))
         // Each chip is wrapped in a slot that holds half the tab gap on either
         // side and clips there (see `slot`), so the scroller carries no padding
@@ -56,8 +73,14 @@ pub(crate) fn render(
     } else {
         scroller
     };
-    div()
+    // The fades describe the previous frame's scroll, the same one the scroll
+    // hint reads: a one-frame lag on decoration is acceptable, and a layout
+    // measurement would cost a frame of its own.
+    let offset = scroll.offset().x;
+    let max_offset = scroll.max_offset().width;
+    let strip = div()
         .debug_selector(|| "request-tab-strip".to_owned())
+        .relative()
         .flex()
         .items_end()
         .gap_1()
@@ -73,7 +96,51 @@ pub(crate) fn render(
                 menu_focus.clone(),
             ))
         })))
-        .child(add_control(state))
+        .child(add_control(state));
+    // Only Windows hides the native title bar, so only there does the strip's
+    // leftover width act as the window's drag area. The filler is a sibling of
+    // the chips and the add control, so it never takes their clicks.
+    #[cfg(target_os = "windows")]
+    let strip = strip.child(
+        div()
+            .id("caption-drag")
+            .debug_selector(|| "caption-drag".to_owned())
+            .flex_grow()
+            .h_full()
+            .window_control_area(gpui::WindowControlArea::Drag),
+    );
+    // The fades are absolutely positioned siblings of the scroller, so they do
+    // not scroll with the chips, and they carry no id or handler, so they never
+    // take the pointer from the chip beneath them.
+    strip
+        .children((offset > px(0.)).then(|| {
+            div()
+                .debug_selector(|| "tab-strip-fade-left".to_owned())
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(FADE_WIDTH))
+                .h_full()
+                .bg(gpui::linear_gradient(
+                    90.,
+                    gpui::linear_color_stop(theme::surface::canvas(), 0.),
+                    gpui::linear_color_stop(theme::surface::canvas_fade(), 1.),
+                ))
+        }))
+        .children((max_offset > px(0.) && offset < max_offset).then(|| {
+            div()
+                .debug_selector(|| "tab-strip-fade-right".to_owned())
+                .absolute()
+                .right(px(fade_right_inset()))
+                .top_0()
+                .w(px(FADE_WIDTH))
+                .h_full()
+                .bg(gpui::linear_gradient(
+                    90.,
+                    gpui::linear_color_stop(theme::surface::canvas_fade(), 0.),
+                    gpui::linear_color_stop(theme::surface::canvas(), 1.),
+                ))
+        }))
 }
 
 /// One chip's slot: half a tab gap of room on either side, clipped at those

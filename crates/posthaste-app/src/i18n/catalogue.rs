@@ -21,9 +21,10 @@ text_table! {
     SectionHistory => "History" / "历史",
 
     SettingTheme => "Theme" / "主题",
-    SettingThemeHint => "Dark, Light, or the operating system's appearance." / "深色、浅色，或跟随操作系统的外观。",
+    SettingThemeHint => "Dark, Light, Warm, or the operating system's appearance." / "深色、浅色、暖色，或跟随操作系统的外观。",
     ThemeDark => "Dark" / "深色",
     ThemeLight => "Light" / "浅色",
+    ThemeWarm => "Warm" / "暖色",
     ThemeSystem => "System" / "跟随系统",
 
     SettingWrapLongLines => "Wrap long lines" / "自动换行",

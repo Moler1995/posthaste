@@ -89,6 +89,7 @@ fn main() {
             match preferences.appearance.theme {
                 ThemeChoice::Dark => theme::set_mode(theme::Mode::Dark),
                 ThemeChoice::Light => theme::set_mode(theme::Mode::Light),
+                ThemeChoice::Warm => theme::set_mode(theme::Mode::Warm),
                 ThemeChoice::System => {}
             }
             let theme_choice = preferences.appearance.theme;

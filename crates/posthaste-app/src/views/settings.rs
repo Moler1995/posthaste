@@ -105,6 +105,13 @@ fn appearance_section(state: Entity<AppState>, preferences: &Preferences) -> Any
         ),
         theme_segment(
             state.clone(),
+            ThemeChoice::Warm,
+            "settings-theme-warm",
+            Key::ThemeWarm,
+            preferences.appearance.theme == ThemeChoice::Warm,
+        ),
+        theme_segment(
+            state.clone(),
             ThemeChoice::System,
             "settings-theme-system",
             Key::ThemeSystem,

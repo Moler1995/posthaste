@@ -363,12 +363,11 @@ pub fn render(
         .min_h_0()
         .flex()
         .flex_col()
-        // Both panes below the split are the same rounded surface well: the
+        // Both panes below the split continue the primary module's surface: the
         // request editor keeps its section row inside its well, and the
-        // response keeps its header row inside this one. The two cards
-        // therefore start on the same line and share one corner treatment,
-        // instead of the response header floating on the canvas above a
-        // full-bleed surface.
+        // response keeps its header row inside this one. They round only the
+        // module's bottom corners, so the module reads as one surface from the
+        // URL row down to these two wells.
         .child(
             div()
                 .flex_1()
@@ -379,7 +378,7 @@ pub fn render(
                 .px(layout::PANE_PADDING)
                 .py(space::S8)
                 .bg(theme::surface::surface())
-                .rounded(radius::PANEL)
+                .rounded_b(radius::PANEL)
                 .child(header)
                 .child(content),
         )

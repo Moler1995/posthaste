@@ -2175,6 +2175,7 @@ impl AppState {
         match preferences.appearance.theme {
             ThemeChoice::Dark => theme::set_mode(Mode::Dark),
             ThemeChoice::Light => theme::set_mode(Mode::Light),
+            ThemeChoice::Warm => theme::set_mode(Mode::Warm),
             // The shell resolves System from the window's appearance once the
             // window exists.
             ThemeChoice::System => {}
@@ -3528,6 +3529,7 @@ impl AppState {
         let mode = match self.preferences.appearance.theme {
             ThemeChoice::Dark => Some(Mode::Dark),
             ThemeChoice::Light => Some(Mode::Light),
+            ThemeChoice::Warm => Some(Mode::Warm),
             ThemeChoice::System => None,
         };
         if let Some(mode) = mode

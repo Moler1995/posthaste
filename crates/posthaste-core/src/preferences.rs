@@ -84,13 +84,15 @@ const fn default_history_retention() -> u32 {
     DEFAULT_HISTORY_RETENTION
 }
 
-/// The chosen theme. `System` follows the operating system's appearance.
+/// The chosen theme. `Warm` is a light colorway with warm neutrals; `System`
+/// follows the operating system's appearance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
     #[default]
     Dark,
     Light,
+    Warm,
     System,
 }
 
@@ -543,6 +545,29 @@ mod tests {
                 serde_json::from_str(&json).expect("an unknown language parses");
             assert_eq!(parsed.language, LanguageChoice::English, "{unknown}");
         }
+    }
+
+    #[test]
+    fn the_warm_theme_round_trips() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join(PREFERENCES_FILE);
+        let preferences = Preferences {
+            appearance: AppearancePreferences {
+                theme: ThemeChoice::Warm,
+                wrap_long_lines: false,
+            },
+            ..Preferences::default()
+        };
+        store_in(&dir).save(&preferences).expect("save");
+
+        let json = fs::read_to_string(&path).expect("read preferences");
+        assert!(json.contains("\"theme\": \"warm\""), "{json}");
+
+        let reloaded = store_in(&dir).load();
+        assert_eq!(reloaded.preferences.appearance.theme, ThemeChoice::Warm);
+
+        let parsed: ThemeChoice = serde_json::from_str("\"warm\"").expect("parse warm");
+        assert_eq!(parsed, ThemeChoice::Warm);
     }
 
     #[test]

@@ -12,10 +12,11 @@
 //! - [`http_method`] — one color per HTTP method
 //! - [`syntax`] — JSON syntax colors
 //!
-//! Two private token tables, dark and light, define the same roles. Public
-//! functions keep their signatures and resolve through a process-wide [`Mode`],
-//! so no view call site changes with the theme. The mode is the effective theme
-//! (Dark or Light); a System choice is resolved before [`set_mode`] is called.
+//! Three private token tables — dark, light, and warm — define the same roles.
+//! Public functions keep their signatures and resolve through a process-wide
+//! [`Mode`], so no view call site changes with the theme. The mode is the
+//! effective theme (Dark, Light, or Warm); a System choice is resolved before
+//! [`set_mode`] is called.
 //!
 //! The remaining widget-oriented aliases (`background`, `text_muted`, …) are
 //! kept during the transition and removed once every view uses the role-based
@@ -34,6 +35,8 @@ use posthaste_core::preferences::ThemeChoice;
 pub enum Mode {
     Dark,
     Light,
+    /// The warm light colorway: warm neutral surfaces with a terracotta accent.
+    Warm,
 }
 
 impl Mode {
@@ -41,15 +44,20 @@ impl Mode {
         match self {
             Self::Dark => 0,
             Self::Light => 1,
+            Self::Warm => 2,
         }
     }
 
     const fn from_u8(value: u8) -> Self {
-        if value == 1 { Self::Light } else { Self::Dark }
+        match value {
+            2 => Self::Warm,
+            1 => Self::Light,
+            _ => Self::Dark,
+        }
     }
 }
 
-/// Every role in one palette. The two tables must define the same fields.
+/// Every role in one palette. All three tables must define the same fields.
 struct Tokens {
     canvas: Rgba,
     sidebar: Rgba,
@@ -96,22 +104,22 @@ struct Tokens {
     rest_wash: Rgba,
     hover_wash: Rgba,
     pressed_wash: Rgba,
-
-    /// The title-bar hairline. Only the Windows title bar reads it.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    chrome_border: Rgba,
 }
 
 fn dark() -> &'static Tokens {
     static TOKENS: OnceLock<Tokens> = OnceLock::new();
     TOKENS.get_or_init(|| Tokens {
-        canvas: rgb(0x0e1013),
-        sidebar: rgb(0x141619),
-        surface: rgb(0x16181c),
-        raised: rgb(0x1d2025),
+        // The ladder's steps measure 1.068 / 1.052 / 1.096 in WCAG contrast, so
+        // no two of these planes share a tone; `raised_pressed` sits below
+        // `raised` and above `surface`, where a press reads without collapsing
+        // into the plane the control rests on.
+        canvas: rgb(0x0d0f12),
+        sidebar: rgb(0x14171b),
+        surface: rgb(0x191c21),
+        raised: rgb(0x20242a),
         raised_hover: rgb(0x262a31),
-        raised_pressed: rgb(0x181b20),
-        input: rgb(0x121418),
+        raised_pressed: rgb(0x1a1e23),
+        input: rgb(0x111316),
         overlay: rgb(0x262a31),
         floating_shadow: rgba(0x00000066),
 
@@ -161,24 +169,23 @@ fn dark() -> &'static Tokens {
         rest_wash: rgba(0xffffff0d),
         hover_wash: rgba(0xffffff14),
         pressed_wash: rgba(0xffffff26),
-
-        chrome_border: rgba(0x23262c8c),
     })
 }
 
 fn light() -> &'static Tokens {
     static TOKENS: OnceLock<Tokens> = OnceLock::new();
     TOKENS.get_or_init(|| Tokens {
-        // The light chrome is a mid grey so the title bar stays one step
-        // darker than every content surface, matching the dark theme's rule.
-        canvas: rgb(0xe3e7ed),
-        sidebar: rgb(0xe9edf2),
-        surface: rgb(0xf5f7fa),
-        raised: rgb(0xfbfcfe),
+        // The ladder's steps measure 1.088 / 1.085 / 1.083, and the canvas sits
+        // low enough that the sidebar and the panel surface read as separate
+        // planes rather than one wash.
+        canvas: rgb(0xdde2e9),
+        sidebar: rgb(0xe7ebf1),
+        surface: rgb(0xf1f4f8),
+        raised: rgb(0xfcfdfe),
         raised_hover: rgb(0xeef2f7),
         raised_pressed: rgb(0xe6ebf2),
         // Fields stay recessed below the pane surface, as in the dark theme.
-        input: rgb(0xedf0f5),
+        input: rgb(0xe8edf3),
         overlay: rgb(0xffffff),
         floating_shadow: rgba(0x00000033),
 
@@ -236,8 +243,78 @@ fn light() -> &'static Tokens {
         rest_wash: rgba(0x0000000a),
         hover_wash: rgba(0x00000010),
         pressed_wash: rgba(0x0000001f),
+    })
+}
 
-        chrome_border: rgba(0xd5dae18c),
+/// The warm light colorway: the light palette's contrast discipline on warm
+/// neutral paper tones, with a terracotta accent.
+///
+/// The method, syntax, and wash roles are the light palette's: their contrast
+/// was measured against the warm canvas (every hue ≥5.0) and on its surface
+/// (≥6.0), and one hue per method keeps a request's accent stable across the two
+/// light colorways. The status tones are deeper than light's because the warm
+/// canvas is darker — light's danger (4.49) and warning (4.50) would fall under
+/// the 4.5 floor here — and the accent is a deeper clay than Claude's #c15f3c,
+/// which is only 4.23 on white and has to clear 4.5 on every surface.
+fn warm() -> &'static Tokens {
+    static TOKENS: OnceLock<Tokens> = OnceLock::new();
+    TOKENS.get_or_init(|| Tokens {
+        // Steps of 1.087 / 1.113 / 1.071; the field sits 1.081 below its pane.
+        canvas: rgb(0xe5e0d3),
+        sidebar: rgb(0xeee9dc),
+        surface: rgb(0xf8f5ed),
+        raised: rgb(0xfffdf7),
+        raised_hover: rgb(0xf3eee2),
+        raised_pressed: rgb(0xede7d9),
+        input: rgb(0xf1ece1),
+        overlay: rgb(0xffffff),
+        floating_shadow: rgba(0x00000033),
+
+        text_primary: rgb(0x241f19),
+        text_secondary: rgb(0x574f44),
+        text_tertiary: rgb(0x6a6154),
+        on_accent: rgb(0xffffff),
+
+        border_subtle: rgb(0xddd6c6),
+        border_default: rgb(0xcfc6b4),
+        border_strong: rgb(0xb8ad98),
+
+        accent_base: rgb(0xa34228),
+        accent_hover: rgb(0xb5502f),
+        accent_pressed: rgb(0x92371f),
+        accent_subtle: rgba(0xa3422824),
+
+        success: rgb(0x146c2e),
+        success_subtle: rgba(0x146c2e1f),
+        warning: rgb(0x835400),
+        warning_subtle: rgba(0x8354001f),
+        danger: rgb(0xbc2424),
+        danger_hover: rgb(0xc43737),
+        danger_pressed: rgb(0xa91f1f),
+        danger_subtle: rgba(0xbc24241f),
+
+        methods: [
+            rgb(0x1450b4), // GET
+            rgb(0x17692f), // POST
+            rgb(0x7a5000), // PUT
+            rgb(0x6f3fc4), // PATCH
+            rgb(0x8f3533), // DELETE
+            rgb(0x0c5c59), // HEAD
+            rgb(0x4f5c1a), // OPTIONS
+        ],
+
+        websocket: rgb(0xa62d70),
+
+        syntax_key: rgb(0x1a5cc8),
+        syntax_string: rgb(0x17692f),
+        syntax_number: rgb(0x7a5000),
+        syntax_literal: rgb(0x6f3fc4),
+        syntax_punctuation: rgb(0x6a6154),
+
+        // Neutral controls take the light palette's black wash.
+        rest_wash: rgba(0x0000000a),
+        hover_wash: rgba(0x00000010),
+        pressed_wash: rgba(0x0000001f),
     })
 }
 
@@ -245,6 +322,7 @@ fn tokens_for(mode: Mode) -> &'static Tokens {
     match mode {
         Mode::Dark => dark(),
         Mode::Light => light(),
+        Mode::Warm => warm(),
     }
 }
 
@@ -274,6 +352,8 @@ pub fn resolve_theme(choice: ThemeChoice, appearance: WindowAppearance) -> Mode 
     match choice {
         ThemeChoice::Dark => Mode::Dark,
         ThemeChoice::Light => Mode::Light,
+        // Warm is the warm light colorway; it never follows the OS.
+        ThemeChoice::Warm => Mode::Warm,
         ThemeChoice::System => match appearance {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Mode::Dark,
             WindowAppearance::Light | WindowAppearance::VibrantLight => Mode::Light,
@@ -298,8 +378,10 @@ fn method_index(method: HttpMethod) -> usize {
 }
 
 /// Background steps. Luminance increases from `canvas` to `overlay`, except for
-/// `input`, which is recessed below the surface it sits on. In the light theme
-/// the same ladder runs from the darker chrome to the white overlay.
+/// `input`, which is recessed below the surface it sits on. Every adjacent step
+/// measures at least 1.05 of contrast, so each plane reads as its own surface;
+/// only the overlay is exempt, because its shadow and border mark it as
+/// floating.
 pub mod surface {
     use super::{Rgba, tokens};
 
@@ -309,8 +391,8 @@ pub mod surface {
     }
 
     /// Sidebar background. It sits above the canvas by enough to read as a
-    /// region on tone alone, and below [`surface`] so it stays chrome rather
-    /// than content.
+    /// region on tone alone, and below [`surface`] so the main module stays the
+    /// brighter plane.
     pub fn sidebar() -> Rgba {
         tokens().sidebar
     }
@@ -351,6 +433,13 @@ pub mod surface {
     /// Drop shadow under a floating card, so it lifts off the surface below.
     pub fn floating_shadow() -> Rgba {
         tokens().floating_shadow
+    }
+
+    /// The canvas at zero alpha. A strip fades its hidden edge into this so the
+    /// gradient lands on exactly the tone behind it, in every palette.
+    pub fn canvas_fade() -> Rgba {
+        let canvas = tokens().canvas;
+        Rgba { a: 0., ..canvas }
     }
 
     /// Translucent black behind a modal dialog. It is the same in both themes:
@@ -708,25 +797,6 @@ pub fn background() -> Rgba {
     surface::canvas()
 }
 
-/// Window chrome behind the in-app title bar.
-///
-/// The title bar shares the canvas step so it reads as the frame around the
-/// content rather than as another content surface.
-///
-/// Only Windows draws this title bar; the aliases are exercised elsewhere by
-/// the theme tests alone.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn chrome() -> Rgba {
-    surface::canvas()
-}
-
-/// Hairline under the title bar: the subtle border at reduced opacity, so the
-/// seam reads as a softened edge instead of a divider between two panels.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn chrome_border() -> Rgba {
-    tokens().chrome_border
-}
-
 /// Alias for [`text::primary`].
 pub fn text() -> Rgba {
     text::primary()
@@ -795,10 +865,10 @@ mod tests {
         }
     }
 
-    /// Runs one check against both palettes. Every contrast or role test goes
-    /// through this helper so neither palette can drift.
+    /// Runs one check against every palette. Every contrast or role test goes
+    /// through this helper so no palette can drift.
     fn for_each_mode(mut test: impl FnMut()) {
-        for mode in [Mode::Dark, Mode::Light] {
+        for mode in [Mode::Dark, Mode::Light, Mode::Warm] {
             with_mode(mode, &mut test);
         }
     }
@@ -837,23 +907,51 @@ mod tests {
             resolve_theme(ThemeChoice::System, WindowAppearance::VibrantLight),
             Mode::Light
         );
+        assert_eq!(
+            resolve_theme(ThemeChoice::Warm, WindowAppearance::Light),
+            Mode::Warm
+        );
+        assert_eq!(
+            resolve_theme(ThemeChoice::Warm, WindowAppearance::Dark),
+            Mode::Warm
+        );
+        assert_eq!(
+            resolve_theme(ThemeChoice::Warm, WindowAppearance::VibrantDark),
+            Mode::Warm
+        );
     }
 
+    /// Ordering alone let the dark sidebar and surface share a tone at 1.02
+    /// for months. A step under 1.05 does not read as a separate plane on a
+    /// normal panel, so every adjacent pair must clear it. Overlays are exempt:
+    /// a shadow and a border, not a tone step, mark them as floating.
     #[test]
-    fn surface_ladder_is_ordered() {
+    fn adjacent_surfaces_keep_a_visible_step() {
         for_each_mode(|| {
-            let canvas = luminance(surface::canvas());
-            let sidebar = luminance(surface::sidebar());
-            let surface = luminance(surface::surface());
-            let raised = luminance(surface::raised());
-            let overlay = luminance(surface::overlay());
-
-            assert!(canvas < sidebar, "canvas must be darker than sidebar");
-            assert!(sidebar < surface, "sidebar must be darker than surface");
-            assert!(surface < raised, "surface must be darker than raised");
-            assert!(raised < overlay, "raised must be darker than overlay");
+            let ladder = [
+                ("canvas", surface::canvas()),
+                ("sidebar", surface::sidebar()),
+                ("surface", surface::surface()),
+                ("raised", surface::raised()),
+                ("overlay", surface::overlay()),
+            ];
+            for pair in ladder.windows(2) {
+                let (lower_name, lower) = pair[0];
+                let (upper_name, upper) = pair[1];
+                assert!(
+                    luminance(lower) < luminance(upper),
+                    "{lower_name} must be darker than {upper_name}"
+                );
+                if upper_name == "overlay" {
+                    continue;
+                }
+                assert!(
+                    contrast(upper, lower) >= 1.05,
+                    "{lower_name} -> {upper_name} is a dead step"
+                );
+            }
             assert!(
-                luminance(surface::input()) < surface,
+                contrast(surface::surface(), surface::input()) >= 1.02,
                 "input must be recessed below the surface it sits on"
             );
         });
@@ -970,24 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn chrome_is_not_lighter_than_content_surfaces() {
-        for_each_mode(|| {
-            let chrome = luminance(chrome());
-            assert!(chrome <= luminance(background()));
-            assert!(chrome < luminance(surface::surface()));
-            assert!(chrome < luminance(surface::raised()));
-        });
-    }
-
-    #[test]
-    fn chrome_border_is_a_translucent_hairline() {
-        for_each_mode(|| {
-            let border = chrome_border();
-            assert!(border.a > 0.0 && border.a < 1.0);
-        });
-    }
-
-    #[test]
     fn aliases_match_their_role_tokens() {
         for_each_mode(|| {
             assert_eq!(background(), surface::canvas());
@@ -1012,6 +1092,17 @@ mod tests {
             assert_eq!(http_method(HttpMethod::Options), rgb(0x9aab63));
         });
         with_mode(Mode::Light, || {
+            assert_eq!(http_method(HttpMethod::Get), rgb(0x1450b4));
+            assert_eq!(http_method(HttpMethod::Post), rgb(0x17692f));
+            assert_eq!(http_method(HttpMethod::Put), rgb(0x7a5000));
+            assert_eq!(http_method(HttpMethod::Patch), rgb(0x6f3fc4));
+            assert_eq!(http_method(HttpMethod::Delete), rgb(0x8f3533));
+            assert_eq!(http_method(HttpMethod::Head), rgb(0x0c5c59));
+            assert_eq!(http_method(HttpMethod::Options), rgb(0x4f5c1a));
+        });
+        // The warm colorway shares the light hues: one hue per method, and they
+        // clear the floors on the warm canvas too.
+        with_mode(Mode::Warm, || {
             assert_eq!(http_method(HttpMethod::Get), rgb(0x1450b4));
             assert_eq!(http_method(HttpMethod::Post), rgb(0x17692f));
             assert_eq!(http_method(HttpMethod::Put), rgb(0x7a5000));

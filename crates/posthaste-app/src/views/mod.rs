@@ -1,5 +1,7 @@
 //! Root view of the Posthaste shell.
 
+#[cfg(target_os = "windows")]
+mod caption;
 mod code_lines;
 mod cookie_selection;
 #[cfg(test)]
@@ -28,8 +30,6 @@ mod text_history;
 pub mod text_input;
 mod text_layout;
 mod text_selection;
-#[cfg(target_os = "windows")]
-mod title_bar;
 pub(crate) mod tree;
 pub(crate) mod ui;
 pub(crate) mod websocket_panel;
@@ -37,7 +37,6 @@ pub(crate) mod welcome;
 #[cfg(target_os = "windows")]
 pub(crate) mod window_frame;
 mod workspace_init;
-#[cfg(target_os = "windows")]
 mod workspace_menu;
 mod workspace_open;
 
@@ -543,21 +542,63 @@ impl Render for AppShell {
             .on_click(move |_, _, cx| {
                 menu_state.update(cx, |state, cx| state.close_anchored_overlays(cx));
             });
-        // Only Windows hides the native title bar, so only Windows draws the
-        // replacement bar; elsewhere it would sit under the OS caption.
-        #[cfg(target_os = "windows")]
-        let root = root.child(title_bar::render(window, cx, self.state.clone()));
+        // The caption row is the strip's row: on Windows it is always drawn
+        // (the drag area carries the welcome screen), and elsewhere it exists
+        // only while a tab strip does.
+        let show_caption = show_tabs || cfg!(target_os = "windows");
+        let captioned = {
+            let mut row = div()
+                .debug_selector(|| "caption-row".to_owned())
+                .flex_none()
+                .w_full()
+                .h(layout::CAPTION)
+                .flex()
+                .items_end()
+                .gap(layout::TAB_GAP)
+                .bg(theme::background())
+                // The leading inset gives up half a tab gap: the first chip's
+                // slot pads it back inside its clipped bounds (see
+                // `tab_strip::slot`), so the chip lines up with the rows below.
+                .pl(px(
+                    f32::from(layout::PANE_PADDING) - f32::from(layout::TAB_GAP) / 2.
+                ));
+            if show_tabs {
+                row = row.child(tab_strip::render(
+                    self.state.clone(),
+                    app,
+                    &self.tab_strip_scroll,
+                ));
+            }
+            // Only Windows hides the native title bar, so only Windows supplies
+            // a drag area and the caption controls.
+            #[cfg(target_os = "windows")]
+            {
+                if !show_tabs {
+                    row = row.child(caption::drag_area());
+                }
+                row = row.child(caption::controls(window));
+            }
+            row
+        };
 
         root.child(
             div()
                 .flex()
                 .flex_1()
                 .min_h_0()
-                .p(layout::GUTTER)
+                // Windows lets the sidebar and the caption row reach the
+                // window's top edge; a native title bar keeps them below it.
+                .pt(if cfg!(target_os = "windows") {
+                    px(0.)
+                } else {
+                    layout::GUTTER
+                })
+                .px(layout::GUTTER)
+                .pb(layout::GUTTER)
                 .gap(layout::GUTTER)
                 .bg(theme::background())
                 .track_focus(&self.focus_handle)
-                .child(sidebar::render(self.state.clone(), app))
+                .child(sidebar::render(self.state.clone(), app, cx))
                 .child(if show_tabs {
                     div()
                         .flex_1()
@@ -565,17 +606,16 @@ impl Render for AppShell {
                         .min_w(px(0.))
                         .flex()
                         .flex_col()
-                        .gap(layout::GUTTER)
-                        // The tab strip and the URL row are the request's main
-                        // module, so they span the full content width above the
-                        // split; only the request body and the response take
-                        // part in the left/right split below.
-                        .child(request_pane::render_primary(
+                        // The caption row, the tab strip and the URL row are the
+                        // request's main module, so they span the full content
+                        // width above the split; only the request body and the
+                        // response take part in the left/right split below.
+                        .children(show_caption.then_some(captioned))
+                        .child(request_pane::render_head(
                             self.state.clone(),
                             app,
                             cx,
                             window,
-                            &self.tab_strip_scroll,
                         ))
                         .child(
                             div()
@@ -633,13 +673,23 @@ impl Render for AppShell {
                         )
                 } else {
                     // The welcome screen takes the tab view's whole column: no
-                    // strip, request row, or response pane is drawn behind it.
+                    // strip, request row, or response pane is drawn behind it,
+                    // but Windows still draws the caption row above it so the
+                    // window keeps its controls and drag area.
                     div()
                         .flex_1()
                         .min_h_0()
                         .min_w(px(0.))
                         .flex()
-                        .child(welcome::render(self.state.clone(), app))
+                        .flex_col()
+                        .children((show_caption && !show_tabs).then_some(captioned))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .child(welcome::render(self.state.clone(), app)),
+                        )
                 }),
         )
         // The status bar spans the window below the padded panes: the save
@@ -1185,42 +1235,23 @@ fn transfer_notice(state: Entity<AppState>, app: &AppState) -> Option<gpui::AnyE
     )
 }
 
-/// An 8 px drag handle at full height around two vertical grip strokes. The
-/// handle uses `on_drag` so mouse moves keep arriving after the pointer leaves
-/// the divider.
+/// An 8 px canvas channel at full height between the request and response
+/// wells. The channel uses `on_drag` so mouse moves keep arriving after the
+/// pointer leaves it.
 fn split_divider() -> impl IntoElement {
+    // The channel paints the canvas through, so it reads as the gutter between
+    // the two wells rather than as a line between them. Its hover and pressed
+    // washes are the whole affordance.
     div()
         .id("request-response-divider")
         .debug_selector(|| "request-response-divider".to_owned())
-        .group("split-handle")
         .flex_none()
         .w(px(SPLIT_DIVIDER_WIDTH))
         .h_full()
-        .flex()
-        .items_center()
-        .justify_center()
         .cursor_ew_resize()
         .hover(|style| style.bg(theme::interaction::hover_wash()))
         .active(|style| style.bg(theme::interaction::pressed_wash()))
         .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| SplitDrag))
-        .child(
-            div()
-                .debug_selector(|| "request-response-divider-line".to_owned())
-                .flex()
-                .gap(px(3.))
-                .child(grip_stroke())
-                .child(grip_stroke()),
-        )
-}
-
-/// One of the divider's two grip strokes.
-fn grip_stroke() -> impl IntoElement {
-    div()
-        .w(px(2.))
-        .h(px(28.))
-        .rounded_full()
-        .bg(theme::border::default())
-        .group_hover("split-handle", |style| style.bg(theme::border::strong()))
 }
 
 #[cfg(test)]
@@ -5292,42 +5323,91 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[gpui::test]
-    async fn title_bar_sits_above_the_three_panes(cx: &mut TestAppContext) {
+    async fn the_caption_row_sits_above_the_panes(cx: &mut TestAppContext) {
         let (_dir, _view, cx) = shell_window(cx);
         redraw(cx);
 
         let width = cx.update(|window, _| window.viewport_size().width);
-        let bar = cx
-            .debug_bounds("title-bar")
-            .expect("title bar should be laid out");
-        assert_eq!(bar.size.height, gpui::px(32.));
-        assert_eq!(bar.size.width, width);
+        let gutter = layout::GUTTER;
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("sidebar should be laid out");
+        let row = cx
+            .debug_bounds("caption-row")
+            .expect("caption row should be laid out");
+        assert_eq!(
+            row.origin.y,
+            gpui::px(0.),
+            "the caption row starts at the window's top edge"
+        );
+        assert_eq!(row.size.height, layout::CAPTION);
+        assert_eq!(
+            row.origin.x,
+            sidebar.origin.x + sidebar.size.width + gutter,
+            "the row starts at the sidebar's right edge plus the gutter"
+        );
+        assert_eq!(
+            row.origin.x + row.size.width,
+            width - gutter,
+            "the row ends at the window's right edge minus the gutter"
+        );
 
-        let band = title_bar::FRAME_BAND_HEIGHT;
-        for selector in [
-            "title-bar-drag",
-            "title-bar-minimize",
-            "title-bar-maximize",
-            "title-bar-close",
-        ] {
+        let band = caption::FRAME_BAND;
+        for selector in ["caption-minimize", "caption-maximize", "caption-close"] {
             let bounds = cx
                 .debug_bounds(selector)
                 .unwrap_or_else(|| panic!("missing debug selector {selector}"));
             assert_eq!(
                 bounds.origin.y,
-                bar.origin.y + band,
+                row.origin.y + band,
                 "{selector} must leave the top resize band to the window frame"
             );
             assert_eq!(
                 bounds.size.height,
-                gpui::px(32.) - band,
-                "{selector} should fill the bar below the resize band"
+                layout::CAPTION - band,
+                "{selector} should fill the row below the resize band"
             );
         }
+
+        let add = cx.debug_bounds("new-tab").expect("add control");
+        let drag = cx
+            .debug_bounds("caption-drag")
+            .expect("the drag area follows the chips");
+        assert!(
+            drag.origin.x >= add.origin.x + add.size.width,
+            "the drag area must not start before the add control ends"
+        );
 
         assert!(cx.debug_bounds("sidebar-new-collection").is_some());
         assert!(cx.debug_bounds("send-button").is_some());
         assert!(cx.debug_bounds("response-idle").is_some());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    async fn the_caption_row_survives_the_welcome_screen(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = welcome_window(cx);
+        redraw(cx);
+
+        let row = cx
+            .debug_bounds("caption-row")
+            .expect("the caption row is drawn without a tab strip");
+        assert_eq!(row.origin.y, gpui::px(0.));
+        assert_eq!(row.size.height, layout::CAPTION);
+        assert!(
+            cx.debug_bounds("request-tab-strip").is_none(),
+            "the welcome screen shows no tab strip"
+        );
+        assert!(
+            cx.debug_bounds("caption-drag").is_some(),
+            "the empty caption row carries the window's drag area"
+        );
+        for selector in ["caption-minimize", "caption-maximize", "caption-close"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} stays reachable on the welcome screen"
+            );
+        }
     }
 
     /// The title bar names the open workspace, and its control opens a menu
@@ -6208,6 +6288,57 @@ mod tests {
             add.origin.x >= chip.origin.x + chip.size.width,
             "the add control follows the chips"
         );
+        // It hugs them rather than sitting at the row's right edge: the leftover
+        // width belongs to the window's drag area.
+        assert!(
+            f32::from(add.origin.x - (chip.origin.x + chip.size.width)) <= 8.,
+            "the add control follows the last chip instead of floating at the row's end"
+        );
+    }
+
+    /// Every region of the tab view keeps its size and stays inside the
+    /// window at the app's minimum dimensions.
+    #[gpui::test]
+    async fn the_shell_lays_out_at_the_minimum_size(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        click(cx, "new-tab");
+        redraw(cx);
+        let id = cx.update(|_, app| state.read(app).active_tab_position().0);
+
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+
+        let width = cx.update(|window, _| window.viewport_size().width);
+        let selectors = [
+            ("caption row", "caption-row".to_owned()),
+            ("brand row", "sidebar-brand".to_owned()),
+            ("settings control", "sidebar-settings".to_owned()),
+            ("tab strip", "request-tab-strip".to_owned()),
+            ("save dot", format!("request-tab-dot-unstored-{id}")),
+            ("URL head", "request-head".to_owned()),
+            ("URL row", "request-url".to_owned()),
+            ("channel", "request-response-divider".to_owned()),
+            ("request well", "request-region".to_owned()),
+            ("response well", "response-region".to_owned()),
+            ("response header", "response-header".to_owned()),
+            ("status bar", "status-bar".to_owned()),
+        ];
+        for (name, selector) in selectors {
+            let bounds = cx
+                .debug_bounds(leaked(selector))
+                .unwrap_or_else(|| panic!("missing {name} at the minimum window size"));
+            assert!(
+                bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                "the {name} must be laid out at the minimum window size"
+            );
+            assert!(
+                bounds.origin.x + bounds.size.width <= width
+                    && bounds.origin.y + bounds.size.height <= px(600.),
+                "the {name} must stay inside the minimum window"
+            );
+        }
     }
 
     #[gpui::test]
@@ -7263,6 +7394,122 @@ mod tests {
             chip.origin.x >= strip.origin.x
                 && chip.origin.x + chip.size.width <= strip.origin.x + strip.size.width,
             "cycled-to chips are scrolled into view"
+        );
+    }
+
+    #[gpui::test]
+    async fn activating_an_early_tab_scrolls_back(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        for _ in 0..10 {
+            click(cx, "new-tab");
+            redraw(cx);
+        }
+
+        // The strip is scrolled to the end, so the first chip is hidden and the
+        // left fade marks the edge.
+        let strip = cx
+            .debug_bounds("request-tab-strip-scroll")
+            .expect("strip viewport");
+        let first = cx.update(|_, app| state.read(app).tab_summaries()[0].id);
+        let first_selector = leaked(format!("request-tab-chip-{first}"));
+        let chip = cx.debug_bounds(first_selector).expect("first chip");
+        assert!(
+            chip.origin.x + chip.size.width <= strip.origin.x,
+            "the first chip starts out of view"
+        );
+
+        // Activating it from the far end scrolls back, so the chip returns to
+        // the viewport from the left.
+        cx.update(|_, app| {
+            state.update(app, |state, cx| state.activate_tab(0, cx));
+        });
+        cx.run_until_parked();
+        redraw(cx);
+
+        let chip = cx.debug_bounds(first_selector).expect("first chip");
+        assert!(
+            chip.origin.x >= strip.origin.x
+                && chip.origin.x + chip.size.width <= strip.origin.x + strip.size.width,
+            "activating an early tab scrolls its chip back into view"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_strip_fades_its_hidden_edge_without_taking_the_pointer(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        for _ in 0..10 {
+            click(cx, "new-tab");
+            redraw(cx);
+        }
+
+        let strip = cx
+            .debug_bounds("request-tab-strip-scroll")
+            .expect("strip viewport");
+        assert!(
+            cx.debug_bounds("tab-strip-fade-right").is_some(),
+            "the overflowing strip fades its hidden right edge"
+        );
+        assert!(
+            cx.debug_bounds("tab-strip-fade-left").is_none(),
+            "nothing is hidden on the left at the start of the run"
+        );
+
+        // Scroll back a little so a chip lies beneath the left fade.
+        cx.simulate_event(ScrollWheelEvent {
+            position: strip.center(),
+            delta: ScrollDelta::Pixels(point(px(-120.), px(0.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        redraw(cx);
+
+        let left = cx
+            .debug_bounds("tab-strip-fade-left")
+            .expect("the scrolled strip fades its hidden left edge");
+        let ids: Vec<_> = cx.update(|_, app| {
+            state
+                .read(app)
+                .tab_summaries()
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect()
+        });
+        let target = ids
+            .iter()
+            .copied()
+            .find(|id| {
+                cx.debug_bounds(leaked(format!("request-tab-chip-{id}")))
+                    .is_some_and(|bounds| {
+                        bounds.origin.x < left.center().x
+                            && bounds.origin.x + bounds.size.width > left.center().x
+                    })
+            })
+            .expect("a chip lies under the fade after scrolling");
+        // The chip under the fade stays clickable: the fade carries no handler
+        // of its own, so the click lands on the chip beneath it.
+        cx.simulate_click(left.center(), Modifiers::default());
+        cx.run_until_parked();
+        redraw(cx);
+        let active = cx.update(|_, app| {
+            state
+                .read(app)
+                .tab_summaries()
+                .into_iter()
+                .find(|summary| summary.active)
+                .map(|summary| summary.id)
+        });
+        assert_eq!(
+            active,
+            Some(target),
+            "the chip beneath the fade takes the click"
         );
     }
 
@@ -10344,16 +10591,9 @@ mod tests {
             cx.update(|_, app| view.read(app).split_ratio()),
             DEFAULT_SPLIT_RATIO
         );
-        // The handle is a full-height column, and its grip is a vertical bar.
+        // The handle is the full-height canvas channel between the two wells.
         assert_eq!(divider.size.width, px(SPLIT_DIVIDER_WIDTH));
         assert_eq!(divider.size.height, region.size.height);
-        let grip = cx
-            .debug_bounds("request-response-divider-line")
-            .expect("divider grip");
-        assert!(
-            grip.size.height > grip.size.width,
-            "the divider grip reads as vertical"
-        );
 
         // The panes sit side by side, and the default halves the region.
         let request = cx.debug_bounds("request-region").expect("request region");
@@ -10375,12 +10615,16 @@ mod tests {
         );
 
         let y = divider.center().y;
-        // Hovering and pressing the handle leave the grip in place.
+        // Hovering the handle leaves it exactly where it was: the wash is the
+        // affordance, and it must not move either well.
         cx.simulate_mouse_move(divider.center(), None, Modifiers::default());
         redraw(cx);
-        assert!(
-            cx.debug_bounds("request-response-divider-line").is_some(),
-            "the grip is drawn under the pointer"
+        assert_eq!(
+            cx.debug_bounds("request-response-divider")
+                .expect("divider")
+                .origin,
+            divider.origin,
+            "hovering the channel does not move it"
         );
         // Press on the handle, then move twice: the first move crosses gpui's
         // 2 px drag threshold, the second is delivered to the drag listener.
@@ -10426,6 +10670,43 @@ mod tests {
             sidebar_width,
             "the split must not resize the sidebar"
         );
+    }
+
+    #[gpui::test]
+    async fn the_primary_module_meets_its_wells_without_a_seam(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = shell_window(cx);
+        redraw(cx);
+
+        let head = cx.debug_bounds("request-head").expect("head row");
+        let split = cx
+            .debug_bounds("request-response-split")
+            .expect("split region");
+        assert_eq!(
+            head.origin.y + head.size.height,
+            split.origin.y,
+            "the wells start on the head's hairline, with no canvas gap"
+        );
+        assert_eq!(
+            head.size.width, split.size.width,
+            "the head spans the split row's full width"
+        );
+
+        // The channel and both wells begin on that same line.
+        let divider = cx
+            .debug_bounds("request-response-divider")
+            .expect("divider");
+        let request = cx.debug_bounds("request-region").expect("request region");
+        let response = cx.debug_bounds("response-region").expect("response region");
+        for (name, bounds) in [
+            ("divider", divider),
+            ("request well", request),
+            ("response well", response),
+        ] {
+            assert_eq!(
+                bounds.origin.y, split.origin.y,
+                "the {name} starts on the module's hairline"
+            );
+        }
     }
 
     #[gpui::test]
@@ -12182,6 +12463,20 @@ mod tests {
                 "the {name} action must not be clipped"
             );
         }
+
+        // The chrome around the welcome screen survives the same size.
+        assert!(cx.debug_bounds("sidebar-brand").is_some());
+        assert!(cx.debug_bounds("sidebar-settings").is_some());
+        let status = cx.debug_bounds("status-bar").expect("status bar");
+        assert!(
+            status.origin.y + status.size.height <= px(600.),
+            "the status bar must stay inside the minimum window"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            cx.debug_bounds("caption-row").is_some(),
+            "the caption row is drawn on the welcome screen"
+        );
     }
 
     #[gpui::test]
@@ -13971,6 +14266,81 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn the_sidebar_reaches_the_window_top(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = shell_window(cx);
+        redraw(cx);
+
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("sidebar should be laid out");
+        let brand = cx
+            .debug_bounds("sidebar-brand")
+            .expect("the brand row should be laid out");
+        let expected_top = if cfg!(target_os = "windows") {
+            gpui::px(0.)
+        } else {
+            layout::GUTTER
+        };
+        assert_eq!(
+            sidebar.origin.y, expected_top,
+            "the sidebar meets the window's top edge where there is no OS caption"
+        );
+        assert_eq!(
+            brand.origin.y, sidebar.origin.y,
+            "the brand row is the card's first row"
+        );
+        assert!(
+            brand.origin.x >= sidebar.origin.x,
+            "the brand row sits inside the card"
+        );
+        // The settings control is drawn on every platform: on Windows it is the
+        // only entry point, and elsewhere it sits beside the OS caption.
+        assert!(cx.debug_bounds("sidebar-settings").is_some());
+    }
+
+    #[gpui::test]
+    async fn the_settings_dialog_offers_four_themes(cx: &mut TestAppContext) {
+        // The theme is process-wide and the segments are clicked by their
+        // painted position, so serialize with the other interface tests.
+        let _guard = crate::test_globals::InterfaceGuard::take();
+        let preferences_dir = tempfile::tempdir().expect("temp preferences");
+        let (_, view, cx) = settings_window(
+            cx,
+            posthaste_core::preferences::PreferencesStore::at(preferences_dir.path()),
+        );
+        let state = shell_state(&view, cx);
+        let previous_mode = crate::theme::mode();
+        // A tall window keeps the whole appearance row inside the dialog's
+        // scroll viewport, so every segment is clickable.
+        cx.simulate_resize(gpui::size(px(1920.), px(1600.)));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        open_settings(&state, cx);
+
+        for selector in [
+            "settings-theme-dark",
+            "settings-theme-light",
+            "settings-theme-warm",
+            "settings-theme-system",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} is laid out in the appearance row"
+            );
+        }
+
+        click(cx, "settings-theme-warm");
+        redraw(cx);
+        assert_eq!(
+            settings_preferences(&state, cx).appearance.theme,
+            posthaste_core::preferences::ThemeChoice::Warm
+        );
+        assert_eq!(crate::theme::mode(), crate::theme::Mode::Warm);
+
+        crate::theme::set_mode(previous_mode);
+    }
+
+    #[gpui::test]
     async fn settings_number_fields_take_whole_numbers_only(cx: &mut TestAppContext) {
         // The font field applies the process-wide editor font, and the rows
         // are clicked by their painted position.
@@ -14145,9 +14515,8 @@ mod tests {
         });
     }
 
-    #[cfg(target_os = "windows")]
     #[gpui::test]
-    async fn the_title_bar_settings_control_opens_the_dialog(cx: &mut TestAppContext) {
+    async fn the_sidebar_settings_control_opens_the_dialog(cx: &mut TestAppContext) {
         let preferences_dir = tempfile::tempdir().expect("temp preferences");
         let (_, view, cx) = settings_window(
             cx,
@@ -14159,7 +14528,7 @@ mod tests {
             (state.active_tab_position().0, state.shell().draft().clone())
         });
 
-        click(cx, "title-bar-settings");
+        click(cx, "sidebar-settings");
         redraw(cx);
         cx.update(|window, app| {
             let state = state.read(app);
@@ -14174,7 +14543,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_failed_settings_write_shows_an_error_and_a_title_dot(cx: &mut TestAppContext) {
+    async fn a_failed_settings_write_shows_an_error_and_a_sidebar_dot(cx: &mut TestAppContext) {
         let blocker = tempfile::tempdir().expect("blocker parent");
         let preferences_root = blocker.path().join("preferences");
         std::fs::write(&preferences_root, b"not a directory").expect("write the blocker");
@@ -14200,10 +14569,9 @@ mod tests {
             cx.debug_bounds("settings-error").is_some(),
             "the dialog footer names the failed write"
         );
-        #[cfg(target_os = "windows")]
         assert!(
             cx.debug_bounds("settings-error-dot").is_some(),
-            "the title-bar control shows a danger dot"
+            "the sidebar's settings control shows a danger dot"
         );
         assert_eq!(
             settings_preferences(&state, cx).requests.timeout_seconds,

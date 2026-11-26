@@ -3,8 +3,8 @@
 
 use gpui::{
     AnyElement, App, AppContext as _, Entity, FontWeight, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Window, actions, div, px,
+    KeyBinding, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, actions,
+    div, px,
 };
 use posthaste_core::model::{FolderId, HttpMethod, RequestProtocol};
 
@@ -61,16 +61,19 @@ pub fn save_picker_copy(app: &AppState) -> (&'static str, &'static str) {
     }
 }
 
-/// The request panel's primary module: the open requests' tab strip and the
-/// method, URL, and Send row. It spans the full width above the split, so a
-/// URL is read at the window's width whatever the divider position and only
-/// the request body below it takes part in the left/right split.
-pub fn render_primary(
+/// The primary module's head: the method, URL, and Send row. It spans the full
+/// width above the split, so a URL is read at the window's width whatever the
+/// divider position and only the request body below it takes part in the
+/// left/right split.
+///
+/// The head owns the module's top corners and its only interior line: one
+/// hairline closes the row along its bottom edge, and the request and response
+/// wells continue the same surface below it.
+pub fn render_head(
     state: Entity<AppState>,
     app: &AppState,
     cx: &App,
     window: &Window,
-    tab_strip_scroll: &ScrollHandle,
 ) -> impl IntoElement {
     let in_flight = app.shell().is_in_flight();
     let send_label = send_label(app);
@@ -130,45 +133,21 @@ pub fn render_primary(
         .w_full()
         .flex()
         .flex_col()
-        // The tab strip spans the panel as chrome rather than sitting inside
-        // the padded body, so it reads as the panel's header. Its canvas band
-        // is the strip's own ground: every chip carries a body above it, and
-        // the active chip's body is the content surface, so the tone steps from
-        // the canvas through the chip bodies make each tab's edges visible. The
-        // padding is the pane's, so the first chip lines up with the method, URL,
-        // and section row below it. The leading inset gives up half a
-        // tab gap: the first chip's slot pads it back inside its clipped bounds
-        // (see `tab_strip::slot`).
+        // The row is the module's head, so it rounds the module's top corners
+        // and closes it with one hairline along its bottom edge. Its padding
+        // keeps the row clear of the corner curves.
         .child(
             div()
-                .flex_none()
-                .w_full()
-                .h(layout::PANEL_HEADER)
-                .pl(px(
-                    f32::from(layout::PANE_PADDING) - f32::from(layout::TAB_GAP) / 2.
-                ))
-                .pr(layout::PANE_PADDING)
-                .flex()
-                .items_end()
-                .bg(theme::background())
-                .child(super::tab_strip::render(
-                    state.clone(),
-                    app,
-                    tab_strip_scroll,
-                )),
-        )
-        // The URL row is the request's main module, so it owns a surface well
-        // of its own above the split. Its padding keeps the row clear of the
-        // corner curves.
-        .child(
-            div()
+                .debug_selector(|| "request-head".to_owned())
                 .flex()
                 .flex_col()
                 .gap(space::S6)
                 .px(layout::PANE_PADDING)
                 .py(space::S8)
                 .bg(theme::surface::surface())
-                .rounded(radius::PANEL)
+                .rounded_t(radius::PANEL)
+                .border_b_1()
+                .border_color(theme::border::subtle())
                 .child(command_bar(
                     editor.clone(),
                     method,
@@ -318,11 +297,12 @@ pub fn render(state: Entity<AppState>, app: &AppState, cx: &App) -> impl IntoEle
                 .gap(space::S8)
                 .px(layout::PANE_PADDING)
                 .py(space::S8)
-                // The content surface is the well the whole shell shares:
-                // rounded at the panel radius, square-edged chrome above and
-                // below it. Its padding keeps rows clear of the corner curves.
+                // The content surface continues the head's surface, so it
+                // rounds only the module's bottom corners; its top edge meets
+                // the head's hairline directly. Its padding keeps rows clear of
+                // the corner curves.
                 .bg(theme::surface::surface())
-                .rounded(radius::PANEL)
+                .rounded_b(radius::PANEL)
                 // The section tabs and the save state share one hairline row:
                 // the status is always on screen, and the pane gives its
                 // remaining height to the editor instead of to a band of its

@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, Entity, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, KeyBinding, ListSizingBehavior, MouseButton, ParentElement,
     Pixels, ScrollStrategy, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
-    actions, div, list, px, svg, uniform_list,
+    actions, div, img, list, px, svg, uniform_list,
 };
 
 use posthaste_core::history::{HistoryEntry, HistoryId};
@@ -29,6 +29,7 @@ use crate::views::text_input::TextInput;
 use crate::views::ui::{
     accent_button, menu_action, menu_action_disabled, menu_separator, overlay_button,
 };
+use crate::views::workspace_menu;
 use crate::workspace::{
     DeleteTarget, MoveDestination, MoveTarget, RenameTarget, RowMenuTarget, WorkspaceState,
 };
@@ -47,7 +48,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
+pub fn render(state: Entity<AppState>, app: &AppState, cx: &App) -> impl IntoElement {
     let workspace = app.workspace();
     let history = app.history();
     let collections_menu_focus = app.collections_menu_focus().cloned();
@@ -60,6 +61,10 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
     let curl_import_text = app.curl_import_text().cloned();
     let curl_import_target = app.curl_import_target().map(str::to_owned);
     let curl_import_target_menu_open = app.curl_import_target_menu_open();
+    // The brand row names the open workspace and opens its menu; the footer's
+    // settings control carries the standing write failure.
+    let workspace_menu_focus = app.workspace_menu_focus().cloned();
+    let settings_failed = app.prefs_error().is_some();
     let curl_import_collections: Vec<(String, String)> = workspace
         .collections
         .iter()
@@ -182,6 +187,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                     .flex()
                     .items_center()
                     .gap(space::S6)
+                    .flex_1()
                     .min_w(px(0.))
                     .child(div().flex_none().w(px(6.)).h(px(6.)).rounded(px(3.)).bg(
                         if chip_active {
@@ -213,6 +219,35 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                     .h(px(12.))
                     .text_color(theme::text::tertiary()),
             );
+
+    // The brand row is the sidebar's caption: the mark, then the open
+    // workspace's name. On Windows the card reaches the window's top edge, so
+    // this row takes the place the title bar used to hold.
+    let brand = div()
+        .debug_selector(|| "sidebar-brand".to_owned())
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(space::S6)
+        .h(layout::CAPTION)
+        .child(img(assets::MARK).flex_none().w(px(16.)).h(px(16.)))
+        // The slot spans the row's full height so the menu, which is
+        // positioned from its parent, lands exactly on the row's bottom edge.
+        .child(
+            div()
+                .id("workspace-slot")
+                .debug_selector(|| "workspace-slot".to_owned())
+                .relative()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .h_full()
+                .child(workspace_menu::render(
+                    state.clone(),
+                    workspace_menu_focus.as_ref(),
+                    cx,
+                )),
+        );
 
     // The tree list is built only while the section shows and holds a row. A
     // closed section builds no row elements at all; an empty one renders the
@@ -320,7 +355,7 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
         .children(tree_list)
         .children(collections_state);
 
-    div()
+    let card = div()
         .debug_selector(|| "sidebar".to_owned())
         .relative()
         .w(layout::SIDEBAR)
@@ -329,13 +364,22 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
         .flex()
         .flex_col()
         .gap_2()
-        .p_3()
+        // The brand row supplies the top inset itself, so the card can reach
+        // the window's top edge on Windows.
+        .px_3()
+        .pb_3()
         .bg(theme::surface::sidebar())
         // The sidebar and the pane content wells round at the same radius, so
         // the shell reads as one corner treatment rather than a rounded column
         // beside square panes. No outline: the tone step carries the edge.
-        .rounded(radius::PANEL)
-        .overflow_hidden()
+        // Where the card is flush with the window's top edge it rounds only
+        // its bottom corners.
+        .overflow_hidden();
+    #[cfg(target_os = "windows")]
+    let card = card.rounded_b(radius::PANEL);
+    #[cfg(not(target_os = "windows"))]
+    let card = card.rounded(radius::PANEL);
+    card.child(brand)
         .child(
             div()
                 .debug_selector(|| "sidebar-search".to_owned())
@@ -375,8 +419,59 @@ pub fn render(state: Entity<AppState>, app: &AppState) -> impl IntoElement {
                 .border_t_1()
                 .border_color(theme::border::subtle())
                 .children(fatal)
-                .child(chip),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(space::S6)
+                        // A long environment name truncates rather than pushing
+                        // the settings control out of reach.
+                        .child(div().flex_1().min_w(px(0.)).child(chip))
+                        .child(settings_control(state.clone(), settings_failed)),
+                ),
         )
+}
+
+/// The settings entry point in the sidebar footer: the same control the title
+/// bar used to carry, beside the environment chip.
+fn settings_control(state: Entity<AppState>, failed: bool) -> impl IntoElement {
+    div()
+        .id("sidebar-settings")
+        .debug_selector(|| "sidebar-settings".to_owned())
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .w(layout::CONTROL)
+        .h(layout::CONTROL)
+        .rounded(radius::CONTROL)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::interaction::hover_wash()))
+        .active(|style| style.bg(theme::interaction::pressed_wash()))
+        .on_click(move |_, window, cx| {
+            state.update(cx, |state, cx| state.open_settings(window, cx));
+        })
+        .child(
+            svg()
+                .path(assets::SETTINGS)
+                .w(px(14.))
+                .h(px(14.))
+                .text_color(theme::text_muted()),
+        )
+        // A standing write failure shows a danger dot on the entry point, so
+        // the error is visible without opening the dialog.
+        .children(failed.then(|| {
+            div()
+                .debug_selector(|| "settings-error-dot".to_owned())
+                .absolute()
+                .top(px(3.))
+                .right(px(3.))
+                .w(px(5.))
+                .h(px(5.))
+                .rounded_full()
+                .bg(theme::status::danger())
+        }))
 }
 
 /// The variables manager: a scope rail on the left and one variable table on

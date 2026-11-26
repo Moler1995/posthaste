@@ -1,4 +1,4 @@
-//! The title bar's workspace control and the menu it opens.
+//! The sidebar brand row's workspace control and the menu it opens.
 //!
 //! The control names the open workspace. Its menu is an anchored overlay like
 //! the collections menu: the element that opens it draws it, it takes focus so
@@ -29,7 +29,7 @@ const MENU_WIDTH: f32 = 320.;
 /// must keep their room.
 const NAME_MAX_WIDTH: f32 = 220.;
 
-/// The title bar's workspace control, with its menu when the menu is open.
+/// The brand row's workspace control, with its menu when the menu is open.
 pub(crate) fn render(
     state: Entity<AppState>,
     menu_focus: Option<&FocusHandle>,
@@ -139,7 +139,7 @@ fn menu_panel(
         .debug_selector(|| "workspace-menu-panel".to_owned())
         .key_context("WorkspaceMenu")
         .absolute()
-        .top(layout::TITLE_BAR)
+        .top(layout::CAPTION)
         // The control sits at the bar's left end now, so the panel opens from
         // its left edge and grows rightwards.
         .left(px(0.))
