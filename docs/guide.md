@@ -695,11 +695,12 @@ arrive; an unlabeled body is decided from its first 8 KiB or its first invalid
 byte. Once binary, bytes are counted for the size but never decoded.
 
 A completed binary response shows a top-anchored information block in place of
-the tree and raw views, naming the media type (or an unknown-type label), the
-retained size, and the suggested file name taken from `Content-Disposition`
-(falling back to `response.<ext>`, then `response.bin`). When the type is absent
-or `application/octet-stream`, the block also names the format recognized from
-the leading bytes, such as PNG or PDF, and the suggested name falls back to that
+the tree and raw views. The suggested file name leads as the heading, taken
+from `Content-Disposition` (falling back to `response.<ext>`, then
+`response.bin`); one quiet line below it states the media type (or an
+unknown-type label) and the retained size. When the type is absent or
+`application/octet-stream`, that line also names the format recognized from the
+leading bytes, such as PNG or PDF, and the suggested name falls back to that
 extension when `Content-Disposition` names no file. The block offers **Save body…**, **Save to Downloads**, and **View as
 text**; **Copy base64** sits in the section strip beside the tabs. The
 `Tree / Raw` and **Find in body** controls and **Copy body** are hidden; the
@@ -712,12 +713,12 @@ directory); later dialogs reopen in the directory where the last dialog save
 succeeded. The bytes are written unchanged on a background thread. **Save to
 Downloads** skips the dialog, writing to the Downloads folder with the same
 fallback, and never overwrites an existing file: the first free `name (n).ext`
-or `name (n)` wins. Both actions confirm the saved path under the block, with
-**Reveal** to show the file in the system file manager and **Copy path** to put
-the path on the clipboard (the label reads `Copied` briefly). A failed write
-reports the error with the path it tried to write and leaves the response in
-place. A truncated body's confirmation states that the file holds only the
-retained prefix.
+or `name (n)` wins. Both actions confirm the saved path under the block on one
+row, with **Reveal** to show the file in the system file manager and **Copy
+path** to put the path on the clipboard (the label reads `Copied` briefly). A
+failed write reports the error with the path it tried to write and leaves the
+response in place. A truncated body's confirmation states that the file holds
+only the retained prefix.
 
 **Copy base64** encodes the retained binary bytes with standard base64 when the
 action runs and shows the same `Copied` feedback; for a truncated body it

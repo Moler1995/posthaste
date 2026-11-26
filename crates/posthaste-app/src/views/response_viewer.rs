@@ -3014,11 +3014,11 @@ impl ResponseViewer {
     }
 
     /// The information block that replaces text for a binary body, anchored to
-    /// the top of the Body section. It names the media type (and any detected
-    /// format), retained size, and suggested save name, states any limitation,
-    /// and — for a live response whose bytes are available — offers the save
-    /// and inspection actions with the last save outcome. A history entry keeps
-    /// metadata only, so it offers no action.
+    /// the top of the Body section. The suggested file name leads as the title,
+    /// one quiet line states the media type (and any detected format) and the
+    /// retained size, and — for a live response whose bytes are available — the
+    /// save and inspection actions follow with the last save outcome. A history
+    /// entry keeps metadata only, so it offers no action.
     fn binary_card(
         &self,
         meta: &BinaryMeta,
@@ -3031,6 +3031,35 @@ impl ResponseViewer {
             .media_type
             .clone()
             .unwrap_or_else(|| i18n::t(Key::ResponseBinaryUnknownType).to_owned());
+        // The name is what the save actions produce, so it is the one piece of
+        // metadata worth leading with.
+        let title = meta
+            .file_name
+            .clone()
+            .unwrap_or_else(|| i18n::t(Key::ResponseBinaryTitle).to_owned());
+        let mut facts = div()
+            .debug_selector(|| "response-binary-facts".to_owned())
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(space::S6)
+            .text_role(type_role::META)
+            .text_color(theme::text::secondary())
+            .child(i18n::t(if streaming {
+                Key::ResponseBinaryStreaming
+            } else {
+                Key::ResponseBinaryTitle
+            }))
+            .child(fact_separator())
+            .child(media_type);
+        if let Some(detected) = &meta.detected {
+            facts = facts.child(fact_separator()).child(
+                div()
+                    .debug_selector(|| "response-binary-detected".to_owned())
+                    .child(detected.label),
+            );
+        }
+        facts = facts.child(fact_separator()).child(format_bytes(size));
         let mut card = div()
             .debug_selector(|| "response-binary-card".to_owned())
             .flex()
@@ -3040,40 +3069,11 @@ impl ResponseViewer {
             .child(
                 div()
                     .debug_selector(|| "response-binary-title".to_owned())
-                    .text_role(type_role::BODY)
+                    .text_role(type_role::PANE_TITLE)
                     .text_color(theme::text::primary())
-                    .child(i18n::t(if streaming {
-                        Key::ResponseBinaryStreaming
-                    } else {
-                        Key::ResponseBinaryTitle
-                    })),
+                    .child(title),
             )
-            .child(binary_fact(i18n::msg(
-                MessageKey::ResponseBinaryMediaType,
-                &[&media_type],
-            )))
-            .child(binary_fact(i18n::msg(
-                MessageKey::ResponseBinarySize,
-                &[&format_bytes(size)],
-            )));
-        if let Some(detected) = &meta.detected {
-            card = card.child(
-                div()
-                    .debug_selector(|| "response-binary-detected".to_owned())
-                    .text_role(type_role::META)
-                    .text_color(theme::text::secondary())
-                    .child(i18n::msg(
-                        MessageKey::ResponseDetectedFormat,
-                        &[&detected.label],
-                    )),
-            );
-        }
-        if !streaming && let Some(name) = &meta.file_name {
-            card = card.child(binary_fact(i18n::msg(
-                MessageKey::ResponseBinaryFileName,
-                &[name],
-            )));
-        }
+            .child(facts);
         if truncated {
             card = card.child(binary_hint(
                 "response-binary-truncated",
@@ -3150,10 +3150,16 @@ impl ResponseViewer {
                 div()
                     .debug_selector(|| "response-save-feedback".to_owned())
                     .flex()
-                    .flex_col()
-                    .gap(space::S4)
+                    .flex_wrap()
+                    .items_center()
+                    .gap(space::S8)
                     .child(
+                        // The path and the two follow-up actions share one row
+                        // when they fit; a long path wraps instead of stacking
+                        // a second full row.
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .text_role(type_role::META)
                             .text_color(theme::text::secondary())
                             .child(text),
@@ -3161,8 +3167,9 @@ impl ResponseViewer {
                     .child(
                         div()
                             .flex()
+                            .flex_none()
                             .items_center()
-                            .gap(space::S4)
+                            .gap(space::S2)
                             .child(
                                 super::ui::ghost_button(
                                     "response-reveal",
@@ -3287,15 +3294,24 @@ impl ResponseViewer {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let file_name = attachment_name(&view.completed.headers)?;
-        let mut facts = div().flex().flex_col().gap(space::S2).child(
-            div()
-                .text_role(type_role::META)
-                .text_color(theme::text::secondary())
-                .child(i18n::msg(
-                    MessageKey::ResponseTextFile,
-                    &[&file_name, &format_bytes(view.completed.preview.size)],
-                )),
-        );
+        let mut facts = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(space::S6)
+            .child(
+                div()
+                    .text_role(type_role::CONTROL)
+                    .text_color(theme::text::primary())
+                    .child(file_name),
+            )
+            .child(fact_separator())
+            .child(
+                div()
+                    .text_role(type_role::META)
+                    .text_color(theme::text::secondary())
+                    .child(format_bytes(view.completed.preview.size)),
+            );
         if view.completed.preview.truncated {
             facts = facts.child(binary_hint(
                 "response-text-file-truncated",
@@ -3674,7 +3690,9 @@ fn save_action_buttons(viewer: Entity<ResponseViewer>) -> [AnyElement; 2] {
     let save_viewer = viewer.clone();
     let downloads_viewer = viewer;
     [
-        super::ui::ghost_button("response-save-body", i18n::t(Key::ResponseSaveBody))
+        // Saving is the primary reason to visit a binary card, so its main
+        // action carries a filled control while the rest stay quiet.
+        super::ui::secondary_button("response-save-body", i18n::t(Key::ResponseSaveBody))
             .debug_selector(|| "response-save-body".to_owned())
             .on_click(move |_, _, cx| {
                 save_viewer.update(cx, |viewer, cx| viewer.save_body(cx));
@@ -3721,12 +3739,11 @@ fn unique_save_target(directory: &Path, file_name: &str) -> PathBuf {
     }
 }
 
-/// One metadata line on the binary card.
-fn binary_fact(text: String) -> AnyElement {
+/// A quiet separator between the facts of a response's leading line.
+fn fact_separator() -> AnyElement {
     div()
-        .text_role(type_role::META)
-        .text_color(theme::text::secondary())
-        .child(text)
+        .text_color(theme::text::tertiary())
+        .child("·")
         .into_any_element()
 }
 
@@ -9705,6 +9722,23 @@ mod tests {
         let at = |bounds: gpui::Bounds<gpui::Pixels>| (bounds.origin.y, bounds.origin.x);
         assert!(at(save) < at(downloads), "Save body… comes first");
         assert!(at(downloads) < at(as_text), "View as text comes last");
+    }
+
+    #[gpui::test]
+    async fn the_binary_card_leads_with_the_file_name(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        show_with_headers(&viewer, cx, png_headers(), &[0x89, b'P', b'N', b'G'], false);
+
+        let title = cx
+            .debug_bounds("response-binary-title")
+            .expect("the file name is the title");
+        let facts = cx
+            .debug_bounds("response-binary-facts")
+            .expect("the media type, size, and name share one facts line");
+        assert!(
+            title.origin.y < facts.origin.y,
+            "the title sits above the single facts line"
+        );
     }
 
     #[gpui::test]
