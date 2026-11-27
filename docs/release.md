@@ -99,16 +99,21 @@ python -m pip install pillow
 python scripts/generate-icon.py
 ```
 
-The script does not draw: it packs the transparent **C3 / THE WAX** seal
-(`resources/brand/brand-mark/seal.png`) into 16, 24, 32, 48, 64, 128, and 256 px
-ICO frames. Every frame is a LANCZOS reduction of the same 1024 px seal, so the
-mark stays consistent from Explorer's small view to the taskbar and has no
-badge background behind it. It also writes the 32×32 seal to
-`resources/icons/posthaste-mark.png` (override with `--mark-out`) for the
-in-app title bar. It prints both output paths and the frame list, and fails if a
-frame is missing, the 16 px frame no longer shows the red wax, or the mark is
-not a 32×32 RGBA image. See the module docstring in
-`scripts/generate-icon.py` for details.
+The script does not draw: it packs the transparent **C3 / THE WAX** seal into
+16, 24, 32, 48, 64, 128, and 256 px ICO frames, and writes the 32×32 in-app mark
+to `resources/icons/posthaste-mark.png` (override with `--mark-out`), which the
+sidebar's brand row draws at 16 logical px. It packs from two transparent
+renders, both LANCZOS-reduced from 1024 px and both without the badge
+background: the detailed `resources/brand/brand-mark/seal.png` for the 128 and
+256 px frames, and the character-only `seal-small.png` for every frame below
+128 px and for the in-app mark. The ring text does not survive the smaller
+sizes — at 32 px it lands on two pixels and turns the face into dark specks —
+so the small cut keeps the wax and its hare but drops the inscription, and the
+hare is scaled up to fill the face.
+It prints which source fed each frame, and fails if a frame comes from the
+wrong cut, if the 16 px frame no longer shows the red wax, or if the mark is not
+a 32×32 RGBA image. See the module docstring in `scripts/generate-icon.py` for
+details.
 
 The three window-control glyphs live next to it as hand-written SVGs in
 `resources/icons/window/` (`minimize.svg`, `maximize.svg`, `restore.svg`,

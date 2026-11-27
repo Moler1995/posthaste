@@ -10,12 +10,11 @@ use std::borrow::Cow;
 use anyhow::Result;
 use gpui::{AssetSource, SharedString};
 
-/// Mark drawn at the left of the title bar.
-///
-/// The window chrome below is only drawn on Windows; elsewhere the OS caption
-/// replaces it and these constants are referenced by the asset test alone.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Mark drawn at the left of the sidebar's brand row.
 pub(crate) const MARK: &str = "icons/posthaste-mark.png";
+// The window glyphs are only drawn on Windows; elsewhere the OS caption
+// replaces them, and these constants are referenced by the asset test alone.
+
 /// Minimize glyph.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const MINIMIZE: &str = "icons/window/minimize.svg";
@@ -31,9 +30,10 @@ pub(crate) const CLOSE: &str = "icons/window/close.svg";
 /// Brand mark shown at the top of the welcome panel.
 ///
 /// This is the A2 stamp (a letter with its corner turned) on a transparent
-/// background, not the wax seal the title bar and the executable carry: the
-/// welcome panel is a large surface, so it uses the mark that holds detail at
-/// that size, and it floats on the panel instead of sitting on an icon tile.
+/// background, not the wax seal the sidebar's brand row and the executable
+/// carry: the welcome panel is a large surface, so it uses the mark that holds
+/// detail at that size, and it floats on the panel instead of sitting on an
+/// icon tile.
 pub(crate) const WELCOME_MARK: &str = "icons/welcome-mark.png";
 /// Chevron pointing right, for a collapsed section.
 pub(crate) const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
@@ -63,8 +63,7 @@ pub(crate) const CLOSE_DIALOG: &str = "icons/close-dialog.svg";
 pub(crate) const CODE: &str = "icons/code.svg";
 /// Circled information mark, for the request inspector.
 pub(crate) const INFO: &str = "icons/info.svg";
-/// Sliders, for the title bar's settings control.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Sliders, for the settings control in the sidebar's footer.
 pub(crate) const SETTINGS: &str = "icons/settings.svg";
 
 /// Every embedded asset, keyed by the path views pass to gpui.

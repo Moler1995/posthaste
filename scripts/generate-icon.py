@@ -1,20 +1,25 @@
-"""Pack the application icon and title-bar mark from the brand assets.
+"""Pack the application icon and the sidebar brand mark from the brand assets.
 
 The artwork is **C3 / THE WAX** from ``resources/brand/brand-mark/``. It is
 hand-written SVG rendered to a PNG outside this repository; this script does
-not draw it. ``seal.png`` is the transparent render of the seal group alone,
+not draw it. Both seals are transparent renders of the seal group alone,
 without the badge background or wordmark, so every icon slot shows the wax on
 whatever surface it lands on. The script packs the Windows icon container:
 
 - ``resources/icons/posthaste.ico`` with 16, 24, 32, 48, 64, 128, and 256 px
   frames, embedded in the executable by ``build.rs``.
 - ``resources/icons/posthaste-mark.png``, the seal at 32x32, drawn at 16
-  logical pixels in the in-app title bar. gpui cannot decode ICO, so the mark
-  needs its own raster file.
+  logical pixels in the sidebar's brand row. gpui cannot decode ICO, so the
+  mark needs its own raster file.
 
-Every frame is a LANCZOS reduction of the 1024 px transparent seal, so all
-sizes show the same mark. The icon deliberately uses C3 below its usual 128 px
-floor: as application chrome it needs one mark that survives the small slots.
+Frames below ``DETAIL_FLOOR`` come from ``seal-small.png``, the character-only
+cut: it drops the ring inscription, and the hare of the detailed seal is scaled
+up to fill the face. The 26-unit ring text turns into dark specks below 128 px,
+while the single dark hare still reads at 24 px. The 128 and 256 px frames come
+from the detailed ``seal.png``, where the engraving is readable. Every frame is
+a LANCZOS reduction of the 1024 px transparent seal, so the silhouette matches
+at every size. The icon deliberately uses C3 below its usual 128 px floor: as
+application chrome it needs one mark that survives the small slots.
 
 This script is a maintenance tool, not a build prerequisite. Pillow is not
 required to build Posthaste; the committed ICO and PNG are used as-is.
@@ -34,21 +39,30 @@ import argparse
 import io
 import struct
 from pathlib import Path
+from typing import cast
 
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 BRAND = ROOT / "resources" / "brand" / "brand-mark"
-SOURCE = BRAND / "seal.png"
+DETAILED_SEAL = BRAND / "seal.png"
+SMALL_SEAL = BRAND / "seal-small.png"
 
 EXPECTED_SIZES = (16, 24, 32, 48, 64, 128, 256)
+# Frames at or above this size show the ring inscription; smaller ones use the
+# character-only cut.
+DETAIL_FLOOR = 128
 
 
-def load_seal() -> Image.Image:
-    with Image.open(SOURCE) as source:
+def source_for(size: int) -> Path:
+    return DETAILED_SEAL if size >= DETAIL_FLOOR else SMALL_SEAL
+
+
+def load_seal(path: Path) -> Image.Image:
+    with Image.open(path) as source:
         image = source.convert("RGBA")
     if image.size != (1024, 1024):
-        raise SystemExit(f"{SOURCE.name}: expected 1024x1024, found {image.size}")
+        raise SystemExit(f"{path.name}: expected 1024x1024, found {image.size}")
     return image
 
 
@@ -127,16 +141,31 @@ def main() -> None:
         "--mark-out",
         type=Path,
         default=ROOT / "resources" / "icons" / "posthaste-mark.png",
-        help="output title-bar mark path (default: resources/icons/posthaste-mark.png)",
+        help="output in-app mark path (default: resources/icons/posthaste-mark.png)",
     )
     args = parser.parse_args()
 
-    seal = load_seal()
-    images = {size: load_frame(seal, size) for size in EXPECTED_SIZES}
+    seals = {DETAILED_SEAL: load_seal(DETAILED_SEAL), SMALL_SEAL: load_seal(SMALL_SEAL)}
+    images: dict[int, Image.Image] = {}
+    sources: dict[int, Path] = {}
+    for size in EXPECTED_SIZES:
+        source = source_for(size)
+        if source not in seals:
+            raise SystemExit(f"{size} px frame has no source seal: {source}")
+        images[size] = load_frame(seals[source], size)
+        sources[size] = source
+    # The floor is the whole point of the split: frames below it must come from
+    # the character-only cut, and the large frames from the detailed seal.
+    for size in EXPECTED_SIZES:
+        expected = SMALL_SEAL if size < DETAIL_FLOOR else DETAILED_SEAL
+        if sources[size] != expected:
+            raise SystemExit(f"{size} px frame packed from {sources[size].name}")
 
     # The wax is the icon, so the smallest frame must still show a red centre
     # rather than collapsing into the dark badge background.
-    red, green, blue, alpha = images[16].getpixel((8, 8))
+    red, green, blue, alpha = cast(
+        tuple[int, int, int, int], images[16].getpixel((8, 8))
+    )
     if alpha < 200 or red <= green or red <= blue:
         raise SystemExit("16 px frame does not show the wax seal")
 
@@ -160,7 +189,10 @@ def main() -> None:
         raise SystemExit(f"ICO frames are wrong: {found}")
 
     print(f"wrote {args.out} ({args.out.stat().st_size} bytes)")
-    print(f"frames: {', '.join(str(size) for size in EXPECTED_SIZES)}")
+    print(
+        "frames: "
+        + ", ".join(f"{size} px <- {sources[size].name}" for size in EXPECTED_SIZES)
+    )
 
     args.mark_out.parent.mkdir(parents=True, exist_ok=True)
     images[32].save(args.mark_out, format="PNG", optimize=True)
