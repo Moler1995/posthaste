@@ -4396,7 +4396,6 @@ pub(crate) fn cookie_group_header(domain: &str, count: usize) -> AnyElement {
         .px(space::S4)
         .bg(theme::surface::surface())
         .text_role(type_role::MICRO)
-        .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text::secondary())
         .child(
             div()

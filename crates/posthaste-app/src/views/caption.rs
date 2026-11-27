@@ -6,33 +6,45 @@
 //! supplies its two non-tab parts — the window controls at the right edge and
 //! the drag area that fills the rest of the row.
 //!
-//! Hit-testing is delegated to the platform through [`WindowControlArea`], so
-//! dragging, double-click maximize, snapping, and the caption-button behaviour
-//! come from the operating system rather than from click handlers.
+//! Both parts are ordinary client-area controls. The platform's own caption
+//! routing ([`WindowControlArea`](gpui::WindowControlArea)) was tried first and
+//! proved unreliable here: it resolves the area from the hit test taken at the
+//! previous mouse position, so a press could arrive with a stale area and do
+//! nothing. A click is a click everywhere else in the shell, so the controls are
+//! buttons, and the drag hands the window to the system's move loop itself (see
+//! [`window_frame::begin_move`](super::window_frame::begin_move)) — which keeps
+//! snapping and double-click maximize, because that is the same loop a native
+//! caption enters.
 
 use gpui::prelude::*;
-use gpui::{IntoElement, Pixels, Window, WindowControlArea, div, px, svg};
+use gpui::{App, IntoElement, MouseButton, Pixels, Window, div, px, svg};
 
 use crate::assets;
+use crate::metrics::layout;
 use crate::theme;
+
+use super::window_frame;
 
 /// Width of each window control, matching the Windows caption button metric.
 pub(crate) const CONTROL_WIDTH: f32 = 46.;
 
-/// Rendered size of a control glyph.
-const GLYPH_SIZE: f32 = 10.;
+/// How much caption the drag area keeps even when the chips want the whole row.
+/// Without a floor the strip can eat the area outright on a busy tab bar, and
+/// the window stops being movable — which is exactly what happened. It is one
+/// caption cell wide, so the add control stays next to the window controls
+/// instead of drifting away from them.
+pub(crate) const DRAG_MIN: Pixels = px(CONTROL_WIDTH);
 
 /// Height of the invisible resize band along the top edge. Windows keeps the
-/// caption's top frame inside the client area when the title bar is hidden, and
-/// the window control areas would otherwise turn that band into a drag or
-/// caption-button target. Keeping the controls below it leaves the top edge to
-/// the platform's resize hit test.
+/// caption's top frame inside the client area when the title bar is hidden, so
+/// the top [`FRAME_BAND`] of the row is the platform's resize target; the
+/// controls start below it so the resize edge stays reachable.
 pub(crate) const FRAME_BAND: Pixels = px(4.);
 
 /// The minimize, maximize-or-restore, and close controls at the caption row's
-/// right edge. Each cell starts below [`FRAME_BAND`], so the window's top edge
-/// stays the platform's resize target.
+/// right edge.
 pub(crate) fn controls(window: &Window) -> impl IntoElement {
+    let maximized = window.is_maximized();
     div()
         .debug_selector(|| "caption-controls".to_owned())
         .flex()
@@ -43,51 +55,66 @@ pub(crate) fn controls(window: &Window) -> impl IntoElement {
         .child(control(
             "caption-minimize",
             assets::MINIMIZE,
-            WindowControlArea::Min,
             false,
+            |window, _| window.minimize_window(),
         ))
         .child(control(
             "caption-maximize",
-            maximize_glyph(window.is_maximized()),
-            WindowControlArea::Max,
+            maximize_glyph(maximized),
             false,
+            |window, _| window.zoom_window(),
         ))
         .child(control(
             "caption-close",
             assets::CLOSE,
-            WindowControlArea::Close,
             true,
+            |window, _| window_frame::request_close(window),
         ))
 }
 
-/// The empty stretch of the caption row that behaves like a native caption.
+/// The stretch of the caption row that behaves like a native caption.
 ///
-/// It owns the drag so double-click maximize and window snapping work anywhere
-/// in the row that is not a chip, the add control, or a window control.
+/// A press anywhere in it hands the window to the system's move loop, so
+/// dragging and snapping come from the operating system rather than from
+/// hand-rolled pointer tracking. A double click toggles maximize, which is what
+/// the caption does.
 pub(crate) fn drag_area() -> impl IntoElement {
     div()
         .id("caption-drag")
         .debug_selector(|| "caption-drag".to_owned())
         .flex_1()
+        // The floor keeps the window movable on a tab bar that fills the row:
+        // the strip gives up the width instead, and scrolls its hidden edge.
+        .min_w(DRAG_MIN)
         .h_full()
-        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, press)
+}
+
+/// A press on caption space, wherever that space is drawn: a double click
+/// toggles maximize, a single press hands the window to the system's move loop.
+///
+/// It is shared with the tab strip's caption band, which is caption space above
+/// the chips rather than beside them.
+pub(crate) fn press(event: &gpui::MouseDownEvent, window: &mut Window, _: &mut App) {
+    if event.click_count >= 2 {
+        window.zoom_window();
+    } else {
+        window_frame::begin_move(window);
+    }
 }
 
 /// Builds one window control. `closes` switches the hover state to the danger
 /// color, as the native caption does.
+///
+/// The glyphs are drawn from the same asset style as the tab strip's add
+/// control: one stroke width, one color, and the same rendered size, so the
+/// caption reads as a single set of controls.
 fn control(
     id: &'static str,
     glyph: &'static str,
-    area: WindowControlArea,
     closes: bool,
+    action: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    // The glyph color lives on the `svg` element: gpui resolves `currentColor`
-    // from the SVG's own text color, not from the enclosing div.
-    let glyph_color = if closes {
-        theme::text()
-    } else {
-        theme::text_muted()
-    };
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
@@ -96,9 +123,8 @@ fn control(
         .justify_center()
         .flex_shrink_0()
         .w(px(CONTROL_WIDTH))
-        .h_full()
+        .h(layout::CAPTION_CONTROL)
         .cursor_pointer()
-        .window_control_area(area)
         .hover(move |style| {
             if closes {
                 style.bg(theme::status::danger())
@@ -107,12 +133,16 @@ fn control(
             }
         })
         .active(|style| style.bg(theme::interaction::pressed_wash()))
+        .on_click(move |_, window, cx| action(window, cx))
         .child(
+            // The glyph color lives on the `svg` element: gpui resolves
+            // `currentColor` from the SVG's own text color, not from the
+            // enclosing div.
             svg()
                 .path(glyph)
-                .w(px(GLYPH_SIZE))
-                .h(px(GLYPH_SIZE))
-                .text_color(glyph_color),
+                .w(layout::ICON)
+                .h(layout::ICON)
+                .text_color(theme::text::secondary()),
         )
 }
 
@@ -134,5 +164,23 @@ mod tests {
     fn maximize_glyph_follows_window_state() {
         assert_eq!(maximize_glyph(false), assets::MAXIMIZE);
         assert_eq!(maximize_glyph(true), assets::RESTORE);
+    }
+
+    #[test]
+    fn the_controls_fill_the_band_below_the_resize_edge() {
+        assert_eq!(
+            layout::CAPTION - FRAME_BAND,
+            layout::CAPTION_CONTROL,
+            "the controls take the row's height minus the resize band, which is the height the tab strip's add control uses to line up with them"
+        );
+    }
+
+    #[test]
+    fn the_drag_floor_is_one_caption_cell() {
+        assert_eq!(
+            f32::from(DRAG_MIN),
+            CONTROL_WIDTH,
+            "the drag area never takes more caption than one window control, so the add control stays next to the window controls"
+        );
     }
 }

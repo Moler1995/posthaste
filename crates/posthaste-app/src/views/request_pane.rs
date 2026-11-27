@@ -4,7 +4,7 @@
 use gpui::{
     AnyElement, App, AppContext as _, Entity, FontWeight, InteractiveElement, IntoElement,
     KeyBinding, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, actions,
-    div, px,
+    div, px, svg,
 };
 use posthaste_core::model::{FolderId, HttpMethod, RequestProtocol};
 
@@ -732,45 +732,64 @@ fn command_bar(
     } else {
         i18n::t(Key::RequestShowScript)
     };
-    let script_control = super::ui::icon_button("request-script-toggle", "</>")
-        .debug_selector(|| "request-script-toggle".to_owned())
-        .text_role(type_role::MICRO)
-        .text_color(if script_open {
-            accent
-        } else {
-            theme::text::secondary()
-        })
-        // The shared icon button already owns its hover wash, so the open
-        // state is carried by the resting fill instead of a second hover
-        // style, which gpui rejects outright.
-        .bg(if script_open {
-            theme::accent::subtle_for(accent)
-        } else {
-            theme::interaction::transparent()
-        })
-        .tooltip(move |_, cx| {
-            cx.new(|_| super::ui::TextTooltip::new(script_tooltip))
-                .into()
-        })
-        .on_click(move |_, _, cx| {
-            script_editor.update(cx, |editor, cx| editor.toggle_script_preview(cx));
-        });
+    // The glyph is an asset, not text: every control in these rows draws its
+    // mark from the same icon set, so a "</>" laid out in the type size would
+    // read as a different kind of control. The mark is drawn at the roomy size,
+    // not the caption size: beside the URL field a caption-sized glyph reads
+    // smaller than the text it sits next to. These two assets carry a 1.125
+    // stroke so that at 16 px they still land on the 1.5 px line the 12 px
+    // glyphs draw — at the shared 1.5 stroke they scaled up to 2 px and read
+    // as a bolder icon than the rest of the set.
+    let script_control = super::ui::icon_button(
+        "request-script-toggle",
+        svg()
+            .path(crate::assets::CODE)
+            .w(layout::ICON_ROOMY)
+            .h(layout::ICON_ROOMY)
+            .text_color(if script_open {
+                accent
+            } else {
+                theme::text::secondary()
+            }),
+    )
+    .debug_selector(|| "request-script-toggle".to_owned())
+    // The shared icon button already owns its hover wash, so the open
+    // state is carried by the resting fill instead of a second hover
+    // style, which gpui rejects outright.
+    .bg(if script_open {
+        theme::accent::subtle_for(accent)
+    } else {
+        theme::interaction::transparent()
+    })
+    .tooltip(move |_, cx| {
+        cx.new(|_| super::ui::TextTooltip::new(script_tooltip))
+            .into()
+    })
+    .on_click(move |_, _, cx| {
+        script_editor.update(cx, |editor, cx| editor.toggle_script_preview(cx));
+    });
 
     // Read-only access to what Send would actually do, beside the URL field so
     // it is reachable from the draft it describes without leaving the row. For
     // a handshake draft it sits just before Connect, the only action a
     // WebSocket request has.
     let inspect_state = state.clone();
-    let inspect_control = super::ui::icon_button("request-inspect", "ⓘ")
-        .debug_selector(|| "request-inspect".to_owned())
-        .text_role(type_role::MICRO)
-        .tooltip(|_, cx| {
-            cx.new(|_| super::ui::TextTooltip::new(i18n::t(Key::RequestInspect)))
-                .into()
-        })
-        .on_click(move |_, window, cx| {
-            inspect_state.update(cx, |state, cx| state.open_inspector(window, cx));
-        });
+    let inspect_control = super::ui::icon_button(
+        "request-inspect",
+        svg()
+            .path(crate::assets::INFO)
+            .w(layout::ICON_ROOMY)
+            .h(layout::ICON_ROOMY)
+            .text_color(theme::text::secondary()),
+    )
+    .debug_selector(|| "request-inspect".to_owned())
+    .tooltip(|_, cx| {
+        cx.new(|_| super::ui::TextTooltip::new(i18n::t(Key::RequestInspect)))
+            .into()
+    })
+    .on_click(move |_, window, cx| {
+        inspect_state.update(cx, |state, cx| state.open_inspector(window, cx));
+    });
 
     // One leading control carries both the transport and the method: the HTTP
     // draft shows its method, the handshake draft shows WS, and the one menu
@@ -865,7 +884,6 @@ fn request_selector(
         .rounded(radius::ROW)
         .bg(theme::interaction::transparent())
         .text_role(type_role::MICRO)
-        .font_weight(FontWeight::SEMIBOLD)
         .text_color(accent)
         .child(div().flex_1().min_w(px(0.)).text_ellipsis().child(label))
         .child(
@@ -902,7 +920,6 @@ fn request_selector(
                 .rounded(radius::ROW)
                 .cursor_pointer()
                 .text_role(type_role::MICRO)
-                .font_weight(FontWeight::SEMIBOLD)
                 .bg(if selected {
                     theme::surface::raised()
                 } else {
@@ -938,7 +955,6 @@ fn request_selector(
             .rounded(radius::ROW)
             .cursor_pointer()
             .text_role(type_role::MICRO)
-            .font_weight(FontWeight::SEMIBOLD)
             .bg(if websocket_selected {
                 theme::surface::raised()
             } else {

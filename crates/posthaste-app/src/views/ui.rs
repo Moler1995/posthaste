@@ -247,7 +247,7 @@ pub(crate) fn danger_button(
 /// A compact ghost control for a single glyph.
 pub(crate) fn icon_button(
     id: impl Into<gpui::ElementId>,
-    glyph: impl Into<SharedString>,
+    glyph: impl IntoElement,
 ) -> Stateful<Div> {
     div()
         .id(id)
@@ -263,7 +263,7 @@ pub(crate) fn icon_button(
         .text_color(theme::text::secondary())
         .hover(|style| style.bg(theme::interaction::hover_wash()))
         .active(|style| style.bg(theme::interaction::pressed_wash()))
-        .child(glyph.into())
+        .child(glyph)
 }
 
 /// A glyph control sized for a dense row. The regular [`icon_button`] is
@@ -271,7 +271,7 @@ pub(crate) fn icon_button(
 /// the chevron metric and a micro glyph instead.
 pub(crate) fn icon_button_compact(
     id: impl Into<gpui::ElementId>,
-    glyph: impl Into<SharedString>,
+    glyph: impl IntoElement,
 ) -> Stateful<Div> {
     icon_button(id, glyph)
         .w(layout::TREE_CHEVRON)

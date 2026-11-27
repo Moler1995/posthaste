@@ -259,14 +259,17 @@ fn light() -> &'static Tokens {
 fn warm() -> &'static Tokens {
     static TOKENS: OnceLock<Tokens> = OnceLock::new();
     TOKENS.get_or_init(|| Tokens {
-        // Steps of 1.087 / 1.113 / 1.071; the field sits 1.081 below its pane.
+        // Steps of 1.087 / 1.113 / 1.071; the field sits 1.075 below its pane.
         canvas: rgb(0xe5e0d3),
         sidebar: rgb(0xeee9dc),
         surface: rgb(0xf8f5ed),
         raised: rgb(0xfffdf7),
         raised_hover: rgb(0xf3eee2),
         raised_pressed: rgb(0xede7d9),
-        input: rgb(0xf1ece1),
+        // The field is a neutral recess, not a warm one: a cream field on the
+        // pure-white overlay read as a stain rather than a well, and dialogs
+        // put every field on that overlay.
+        input: rgb(0xeeede9),
         overlay: rgb(0xffffff),
         floating_shadow: rgba(0x00000033),
 

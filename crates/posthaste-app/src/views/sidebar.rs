@@ -1226,8 +1226,7 @@ fn history_row(
                 )
                 .child(
                     super::ui::protocol_label(entry.request.protocol, entry.request.method)
-                        .text_role(type_role::MICRO)
-                        .font_weight(FontWeight::SEMIBOLD),
+                        .text_role(type_role::MICRO),
                 )
                 .child(
                     div()
@@ -2148,7 +2147,6 @@ fn move_collection_row(
         .px(space::S6)
         .rounded(radius::ROW)
         .text_role(type_role::MICRO)
-        .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text::secondary())
         .cursor_pointer()
         .hover(|style| style.bg(theme::interaction::hover_wash()))
@@ -3353,8 +3351,7 @@ fn request_row(
             .child(
                 super::ui::protocol_label(request.protocol, request.method)
                     .debug_selector(move || method_selector.clone())
-                    .text_role(type_role::MICRO)
-                    .font_weight(FontWeight::SEMIBOLD),
+                    .text_role(type_role::MICRO),
             )
             .child(label)
             .child(marker),

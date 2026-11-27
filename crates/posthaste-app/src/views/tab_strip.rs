@@ -2,6 +2,8 @@
 //!
 //! Chips scroll horizontally while the add control stays reachable at the end.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -17,19 +19,22 @@ use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
 use crate::views::ui::{menu_action, menu_action_disabled, menu_separator};
 
-/// Width of the fade that hides chips running out of view.
-const FADE_WIDTH: f32 = 18.;
+/// Width of the edge the chips run out of view behind: the gradient's span, and
+/// the arrow's hit area.
+const EDGE_WIDTH: f32 = 22.;
 
-/// Distance from the strip's right edge to the caption controls' first cell, so
-/// the fade never paints over a control.
-#[cfg(target_os = "windows")]
-fn fade_right_inset() -> f32 {
-    super::caption::CONTROL_WIDTH + f32::from(layout::TAB_GAP)
-}
-#[cfg(not(target_os = "windows"))]
-fn fade_right_inset() -> f32 {
-    0.
-}
+/// How far one press of a scroll arrow moves the strip.
+///
+/// A fixed step rather than a page: the strip only overflows by a chip or two
+/// in the common case, so a page-sized step would land on the last tab at once
+/// and the arrow would read as "jump to the end". Two chips' worth moves the
+/// strip visibly and leaves the rest to the next press.
+pub(super) const SCROLL_STEP: Pixels = px(240.);
+
+/// One frame of a scroll arrow's glide, and how many of them it takes: ten
+/// frames of a 60 Hz display, so the step takes about 160 ms.
+const GLIDE_FRAME: Duration = Duration::from_millis(16);
+const GLIDE_FRAMES: u32 = 10;
 
 /// Renders the strip: every open tab in order, then the add control. The
 /// scroll handle is owned by the shell so its offset survives across frames.
@@ -37,6 +42,7 @@ pub(crate) fn render(
     state: Entity<AppState>,
     app: &AppState,
     scroll: &ScrollHandle,
+    glide: Rc<Cell<u64>>,
 ) -> impl IntoElement {
     let summaries = app.tab_summaries();
     let hovered = app.hovered_tab();
@@ -73,18 +79,20 @@ pub(crate) fn render(
     } else {
         scroller
     };
-    // The fades describe the previous frame's scroll, the same one the scroll
+    // The edges describe the previous frame's scroll, the same one the scroll
     // hint reads: a one-frame lag on decoration is acceptable, and a layout
-    // measurement would cost a frame of its own.
-    let offset = scroll.offset().x;
+    // measurement would cost a frame of its own. `ScrollHandle` reports the
+    // content's displacement, which is zero at the leading edge and becomes
+    // negative as the strip scrolls right, so the progress is its negation.
+    let scrolled = px(0.) - scroll.offset().x;
     let max_offset = scroll.max_offset().width;
-    let strip = div()
-        .debug_selector(|| "request-tab-strip".to_owned())
+    // The edges hang on the viewport rather than on the strip: the strip also
+    // carries the add control and the caption's drag area, so its own right edge
+    // is well past the point where the last chip is cut off. They are siblings
+    // of the scroller, so they do not scroll with the chips.
+    let viewport = div()
         .relative()
-        .flex()
-        .items_end()
-        .gap_1()
-        .flex_1()
+        .flex_shrink()
         .min_w(px(0.))
         .child(scroller.children(summaries.into_iter().map(|summary| {
             let menu_open = menu == Some(summary.id);
@@ -96,51 +104,235 @@ pub(crate) fn render(
                 menu_focus.clone(),
             ))
         })))
+        .children((scrolled > px(0.)).then(|| {
+            scroll_edge(
+                scroll,
+                Edge::Leading,
+                "tab-strip-scroll-left",
+                glide.clone(),
+            )
+        }))
+        .children((max_offset > px(0.) && scrolled < max_offset).then(|| {
+            scroll_edge(
+                scroll,
+                Edge::Trailing,
+                "tab-strip-scroll-right",
+                glide.clone(),
+            )
+        }));
+    // The strip takes the row's leftover width, and the chips get first claim on
+    // it: the add control follows the last chip, so the "+" moves right with
+    // every tab opened until the strip runs out of room. Only the floor of the
+    // drag area (see `caption::drag_area`) is withheld from the chips.
+    let strip = div()
+        .debug_selector(|| "request-tab-strip".to_owned())
+        .relative()
+        .flex()
+        .items_end()
+        .gap_1()
+        .flex_1()
+        .min_w(px(0.))
+        .h_full()
+        .child(caption_column(viewport.into_any_element()))
         .child(add_control(state));
     // Only Windows hides the native title bar, so only there does the strip's
-    // leftover width act as the window's drag area. The filler is a sibling of
-    // the chips and the add control, so it never takes their clicks.
+    // leftover width act as the window's drag area. The filler follows the add
+    // control, so it never takes the chips' clicks, and its floor keeps the
+    // window movable even on a tab bar that fills the row.
     #[cfg(target_os = "windows")]
-    let strip = strip.child(
-        div()
-            .id("caption-drag")
-            .debug_selector(|| "caption-drag".to_owned())
-            .flex_grow()
-            .h_full()
-            .window_control_area(gpui::WindowControlArea::Drag),
-    );
-    // The fades are absolutely positioned siblings of the scroller, so they do
-    // not scroll with the chips, and they carry no id or handler, so they never
-    // take the pointer from the chip beneath them.
+    let strip = strip.child(super::caption::drag_area());
     strip
-        .children((offset > px(0.)).then(|| {
+}
+
+/// The chips and the bare caption band above them.
+///
+/// The chips sit on the row's bottom edge, so the caption space above them is
+/// empty canvas. On Windows that band belongs to the caption: a press there
+/// drags the window, the way the stretch past the add control does, so the whole
+/// width of the row's top is usable for moving the window and not just the gap
+/// next to the window controls. Elsewhere the native title bar already provides
+/// that surface, and the column is the viewport alone.
+fn caption_column(viewport: AnyElement) -> AnyElement {
+    let column = div().flex_col().h_full().flex_shrink().min_w(px(0.));
+    #[cfg(target_os = "windows")]
+    let column = column.child(caption_band());
+    column.child(viewport).into_any_element()
+}
+
+/// The empty stretch of caption above the chips.
+#[cfg(target_os = "windows")]
+fn caption_band() -> AnyElement {
+    div()
+        .debug_selector(|| "tab-strip-caption-band".to_owned())
+        .w_full()
+        .h(caption_band_height())
+        .flex_shrink_0()
+        .on_mouse_down(MouseButton::Left, super::caption::press)
+        .into_any_element()
+}
+
+/// Height of the bare caption above the chips: the row's height less the chips
+/// that sit on its bottom edge. The system's top resize edge covers the first
+/// [`caption::FRAME_BAND`](super::caption::FRAME_BAND) of it, so the pressable
+/// part starts below that.
+#[cfg(target_os = "windows")]
+fn caption_band_height() -> Pixels {
+    layout::CAPTION - layout::CONTROL_COMPACT
+}
+
+/// Which side of the viewport a strip of chips runs out of view on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// The side the strip starts from; its arrow scrolls back toward the first
+    /// tab.
+    Leading,
+    /// The side the strip ends on; its arrow scrolls on toward the last tab.
+    Trailing,
+}
+
+/// One edge of the strip's viewport, where chips are cut off.
+///
+/// The gradient dissolves the chip that runs under the edge, and the chevron
+/// turns it into a control: hovering the edge reveals the arrow, and a press
+/// moves the strip a fixed step that way. The arrow is drawn only under the
+/// pointer, because it lies over the last visible chip and a permanent chevron
+/// there would compete with the chip's own label; the gradient already says
+/// there is more. Both edges are drawn from the same code, so the two arrows
+/// appear and behave alike however far the strip is scrolled.
+fn scroll_edge(
+    scroll: &ScrollHandle,
+    edge: Edge,
+    selector: &'static str,
+    glide: Rc<Cell<u64>>,
+) -> AnyElement {
+    let leading = edge == Edge::Leading;
+    let handle = scroll.clone();
+    let (outer, inner) = if leading {
+        (theme::surface::canvas(), theme::surface::canvas_fade())
+    } else {
+        (theme::surface::canvas_fade(), theme::surface::canvas())
+    };
+    let glyph = if leading {
+        crate::assets::CHEVRON_LEFT
+    } else {
+        crate::assets::CHEVRON_RIGHT
+    };
+    let group = if leading {
+        "tab-strip-scroll-leading"
+    } else {
+        "tab-strip-scroll-trailing"
+    };
+    let control = div()
+        .id(group)
+        .debug_selector(move || selector.to_owned())
+        .group(group)
+        .absolute()
+        .top_0()
+        .w(px(EDGE_WIDTH))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        // The edge lies over the chip that is cut off there, and gpui delivers
+        // a press to every hitbox under the pointer: without this the chip
+        // beneath would take the same press and become the active tab. Scroll
+        // events still pass through, so the wheel keeps working over the edge.
+        .block_mouse_except_scroll()
+        .bg(gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(outer, 0.),
+            gpui::linear_color_stop(inner, 1.),
+        ))
+        .tooltip(|_, cx| {
+            cx.new(|_| TabTooltip {
+                label: i18n::t(Key::TabScrollHint).to_owned(),
+                debug_selector: Some("tab-strip-scroll-hint"),
+            })
+            .into()
+        })
+        // The offset is negative and grows toward the end of the strip, so
+        // scrolling on subtracts from it. Clamping here keeps the arrow from
+        // pushing past either end; gpui clamps again at prepaint.
+        .on_click(move |_, window, cx| {
+            let scrolled = px(0.) - handle.offset().x;
+            let max_offset = handle.max_offset().width;
+            let target = if leading {
+                scrolled - SCROLL_STEP
+            } else {
+                scrolled + SCROLL_STEP
+            }
+            .clamp(px(0.), max_offset);
+            // This press takes over from any glide still running, so a second
+            // press mid-flight continues from where the strip is now instead of
+            // fighting the first one for the same frames.
+            let token = glide.get().wrapping_add(1);
+            glide.set(token);
+            glide_to(&handle, glide.clone(), token, scrolled, target, window, cx);
+        })
+        .child(
             div()
-                .debug_selector(|| "tab-strip-fade-left".to_owned())
-                .absolute()
-                .left_0()
-                .top_0()
-                .w(px(FADE_WIDTH))
-                .h_full()
-                .bg(gpui::linear_gradient(
-                    90.,
-                    gpui::linear_color_stop(theme::surface::canvas(), 0.),
-                    gpui::linear_color_stop(theme::surface::canvas_fade(), 1.),
-                ))
-        }))
-        .children((max_offset > px(0.) && offset < max_offset).then(|| {
-            div()
-                .debug_selector(|| "tab-strip-fade-right".to_owned())
-                .absolute()
-                .right(px(fade_right_inset()))
-                .top_0()
-                .w(px(FADE_WIDTH))
-                .h_full()
-                .bg(gpui::linear_gradient(
-                    90.,
-                    gpui::linear_color_stop(theme::surface::canvas_fade(), 0.),
-                    gpui::linear_color_stop(theme::surface::canvas(), 1.),
-                ))
-        }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.)
+                .group_hover(group, |style| style.opacity(1.))
+                .child(
+                    svg()
+                        .path(glyph)
+                        .w(layout::ICON)
+                        .h(layout::ICON)
+                        .text_color(theme::text::secondary()),
+                ),
+        );
+    if leading {
+        control.left_0().into_any_element()
+    } else {
+        control.right_0().into_any_element()
+    }
+}
+
+/// Moves the strip from `start` to `target` a frame at a time.
+///
+/// gpui animates an element's style (`with_animation`), and a scroll offset is
+/// not a style property: the chips' positions come from the handle, so the
+/// glide writes the offset itself and asks for the next frame. The easing is
+/// cubic ease-out, so the strip leaves at once and settles into place instead
+/// of stopping dead on the last frame. `token` is the press's generation: a
+/// newer press replaces it, and this glide leaves the strip to its successor.
+fn glide_to(
+    scroll: &ScrollHandle,
+    glide: Rc<Cell<u64>>,
+    token: u64,
+    start: Pixels,
+    target: Pixels,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let distance = target - start;
+    if distance.abs() < px(0.5) {
+        return;
+    }
+    let handle = scroll.clone();
+    let y = scroll.offset().y;
+    window
+        .spawn(cx, async move |cx| {
+            for frame in 1..=GLIDE_FRAMES {
+                cx.background_executor().timer(GLIDE_FRAME).await;
+                if glide.get() != token {
+                    return;
+                }
+                let progress = frame as f32 / GLIDE_FRAMES as f32;
+                let eased = 1. - (1. - progress).powi(3);
+                let scrolled = start + distance * eased;
+                cx.update(|window, _| {
+                    handle.set_offset(point(px(0.) - scrolled, y));
+                    window.refresh();
+                })
+                .ok();
+            }
+        })
+        .detach();
 }
 
 /// One chip's slot: half a tab gap of room on either side, clipped at those
@@ -815,10 +1007,26 @@ pub(crate) fn close_confirmation_modal(state: Entity<AppState>, app: &AppState) 
 }
 
 /// The trailing add control opens a blank tab.
+///
+/// It is drawn like the caption's window controls — one glyph style, one
+/// rendered size, one color, and the same band below the row's resize edge — so
+/// the two sets read as a single row of controls rather than as a text "+"
+/// beside a set of icons.
 fn add_control(state: Entity<AppState>) -> AnyElement {
-    super::ui::icon_button("new-tab", "+")
+    div()
+        .id("new-tab")
         .debug_selector(|| "new-tab".to_owned())
         .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(layout::CONTROL_COMPACT)
+        .h(layout::CAPTION_CONTROL)
+        .rounded(radius::CONTROL)
+        .cursor_pointer()
+        .bg(theme::interaction::transparent())
+        .hover(|style| style.bg(theme::interaction::hover_wash()))
+        .active(|style| style.bg(theme::interaction::pressed_wash()))
         .tooltip(|_, cx| {
             cx.new(|_| TabTooltip {
                 label: i18n::t(Key::TabNew).to_owned(),
@@ -832,6 +1040,13 @@ fn add_control(state: Entity<AppState>) -> AnyElement {
                 state.focus_active_editor(window, cx);
             });
         })
+        .child(
+            svg()
+                .path(crate::assets::PLUS)
+                .w(layout::ICON)
+                .h(layout::ICON)
+                .text_color(theme::text::secondary()),
+        )
         .into_any_element()
 }
 

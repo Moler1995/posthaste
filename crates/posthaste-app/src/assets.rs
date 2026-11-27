@@ -37,6 +37,8 @@ pub(crate) const CLOSE: &str = "icons/window/close.svg";
 pub(crate) const WELCOME_MARK: &str = "icons/welcome-mark.png";
 /// Chevron pointing right, for a collapsed section.
 pub(crate) const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+/// Chevron pointing left, for the tab strip's scroll arrow.
+pub(crate) const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
 /// Chevron pointing down, for an expanded section.
 pub(crate) const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 /// Plus glyph, for compact create actions.
@@ -57,6 +59,10 @@ pub(crate) const EMPTY_AUTH: &str = "icons/empty-auth.svg";
 pub(crate) const COPY: &str = "icons/copy.svg";
 /// Larger cross, for dismissing a dialog from its top-right corner.
 pub(crate) const CLOSE_DIALOG: &str = "icons/close-dialog.svg";
+/// Angle brackets with a slash, for the script preview toggle.
+pub(crate) const CODE: &str = "icons/code.svg";
+/// Circled information mark, for the request inspector.
+pub(crate) const INFO: &str = "icons/info.svg";
 /// Sliders, for the title bar's settings control.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const SETTINGS: &str = "icons/settings.svg";
@@ -90,6 +96,10 @@ const ASSETS: &[(&str, &[u8])] = &[
     (
         "icons/chevron-right.svg",
         include_bytes!("../../../resources/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/chevron-left.svg",
+        include_bytes!("../../../resources/icons/chevron-left.svg"),
     ),
     (
         "icons/chevron-down.svg",
@@ -130,6 +140,14 @@ const ASSETS: &[(&str, &[u8])] = &[
     (
         "icons/close-dialog.svg",
         include_bytes!("../../../resources/icons/close-dialog.svg"),
+    ),
+    (
+        "icons/code.svg",
+        include_bytes!("../../../resources/icons/code.svg"),
+    ),
+    (
+        "icons/info.svg",
+        include_bytes!("../../../resources/icons/info.svg"),
     ),
     (
         "icons/settings.svg",
@@ -177,6 +195,7 @@ mod tests {
             CLOSE,
             WELCOME_MARK,
             CHEVRON_RIGHT,
+            CHEVRON_LEFT,
             CHEVRON_DOWN,
             PLUS,
             ASTERISK,
@@ -187,6 +206,8 @@ mod tests {
             EMPTY_AUTH,
             COPY,
             CLOSE_DIALOG,
+            CODE,
+            INFO,
             SETTINGS,
         ] {
             let bytes = Assets

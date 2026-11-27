@@ -1,11 +1,11 @@
-//! Windows resize frame for the shell's custom title bar.
+//! Windows frame handling for the shell's custom title bar.
 //!
 //! The window hides the system caption so the shell can paint its own title
 //! bar. Windows still reserves the non-client sizing frame, but gpui 0.2.2
 //! gives that frame no resize cursor and lets the shell's input handling
-//! swallow non-client clicks, so only the top edge (which gpui special-cases)
-//! can be dragged. This module subclasses the window procedure and owns three
-//! things for the frame band:
+//! swallow non-client clicks, so the platform's own frame is not usable as it
+//! stands. This module subclasses the window procedure and owns three things
+//! for the frame band:
 //!
 //! - `WM_NCHITTEST` returns the sizing code for every edge and corner,
 //!   including the client-side gutter the shell paints around its panels.
@@ -13,6 +13,10 @@
 //!   cursor, which gpui would otherwise reset to an arrow.
 //! - `WM_NCLBUTTONDOWN` starts the system's sizing loop directly, bypassing
 //!   gpui's input dispatch, which may consume the click.
+//!
+//! The caption itself ([`super::caption`]) uses the same direct approach for the
+//! move loop ([`begin_move`]) and for closing ([`request_close`]), so neither
+//! depends on gpui's non-client routing.
 //!
 //! The subclass is installed once, on the window's own thread, and removes
 //! itself when the window is destroyed.
@@ -36,6 +40,7 @@ const TOP_BAND: f32 = 4.;
 /// around its panels, so the cursor works from the very edge of the window.
 const SIDE_BAND: f32 = 16.;
 
+const WM_CLOSE: u32 = 0x0010;
 const WM_NCHITTEST: u32 = 0x0084;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
@@ -46,6 +51,7 @@ const WM_NCDESTROY: u32 = 0x0082;
 const GWL_STYLE: i32 = -16;
 const WS_THICKFRAME: u32 = 0x0004_0000;
 
+const HTCAPTION: isize = 2;
 const HTLEFT: isize = 10;
 const HTRIGHT: isize = 11;
 const HTTOP: isize = 12;
@@ -101,7 +107,9 @@ unsafe extern "system" {
     fn GetCursorPos(point: *mut Point) -> i32;
     fn IsZoomed(hwnd: *mut c_void) -> i32;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
+    fn ReleaseCapture() -> i32;
     fn SetCursor(cursor: *mut c_void) -> *mut c_void;
+    fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
 /// The edge or corner of the window frame under a point.
@@ -212,23 +220,67 @@ unsafe fn set_cursor(cursor: *mut c_void) {
     }
 }
 
+/// The window's native handle, or `None` when it has none (gpui's test window).
+fn hwnd_of(window: &Window) -> Option<*mut c_void> {
+    // `Window` also has an inherent `window_handle` returning an entity handle,
+    // so the raw-handle trait has to be named explicitly.
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+    Some(win32.hwnd.get() as *mut c_void)
+}
+
 /// Installs the frame handling on the window's own thread. Does nothing when
 /// the window cannot expose an HWND (for example, gpui's test window).
 pub(crate) fn install(window: &Window) {
-    // `Window` also has an inherent `window_handle` returning an entity handle,
-    // so the raw-handle trait has to be named explicitly.
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+    let Some(hwnd) = hwnd_of(window) else {
         return;
     };
-    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = win32.hwnd.get() as *mut c_void;
     // SAFETY: the window lives on this thread and outlives the subclass, which
     // removes itself in WM_NCDESTROY.
     let installed = unsafe { SetWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID, 0) };
     if installed == 0 {
         tracing::warn!("failed to install the resize frame subclass");
+    }
+}
+
+/// Hands the window to the system's move loop, as a press on a native caption
+/// does.
+///
+/// The loop is the one Windows enters for `HTCAPTION`, so Aero snap,
+/// double-click maximize, and "dragging a maximized window restores it" keep
+/// working without being reimplemented. It runs until the button is released,
+/// which is why the caption calls it straight from the press handler.
+///
+/// `DefWindowProcW` is called directly instead of posting the message: the
+/// message would come back through this subclass and gpui's input dispatch, and
+/// gpui would treat it as an ordinary press before the loop ever started.
+pub(crate) fn begin_move(window: &Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    // SAFETY: called on the window's own thread from its input handler; the
+    // loop pumps this thread's message queue until the drag ends.
+    unsafe {
+        ReleaseCapture();
+        DefWindowProcW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+    }
+}
+
+/// Closes the window the way the system close button does.
+///
+/// Posting `WM_CLOSE` rather than dropping the window keeps the close path —
+/// the shell's `should_close` hook and the state it persists — exactly as it is
+/// when the user closes the window from its own button.
+pub(crate) fn request_close(window: &Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    // SAFETY: posting to a live window owned by this thread; the message is
+    // processed by the message loop that is already running.
+    unsafe {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
 }
 

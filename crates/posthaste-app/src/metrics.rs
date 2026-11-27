@@ -258,16 +258,19 @@ pub mod type_role {
     pub const BODY: TypeRole = TypeRole::new(14., 22., FontWeight::NORMAL, false);
     /// Duration, size, timestamps, hints.
     pub const META: TypeRole = TypeRole::new(13., 18., FontWeight::NORMAL, false);
-    /// Badges and shortcut hints. Semibold is explicit: the UI face has no
-    /// medium weight, and relying on font matching to pick one is opaque.
-    pub const MICRO: TypeRole = TypeRole::new(12., 16., FontWeight::SEMIBOLD, false);
+    /// Badges and shortcut hints. The weight is the body weight: the many small
+    /// labels (tab captions, hints, counters) carried semibold and made a dense
+    /// row read heavier than its hierarchy needed, so only the section eyebrows
+    /// above them stay semibold.
+    pub const MICRO: TypeRole = TypeRole::new(12., 16., FontWeight::NORMAL, false);
     /// URLs, JSON, and bodies.
     pub const CODE: TypeRole = TypeRole::new(14., 22., FontWeight::NORMAL, true);
     /// Header table and history rows.
     pub const CODE_COMPACT: TypeRole = TypeRole::new(13., 20., FontWeight::NORMAL, true);
-    /// Button and tab labels. Heavier than body text so controls read as
-    /// controls without growing the layout.
-    pub const CONTROL: TypeRole = TypeRole::new(13., 18., FontWeight::SEMIBOLD, false);
+    /// Button and tab labels. Same weight as body text: the control geometry
+    /// (fill, border, hover wash) already sets them apart, and semibold labels
+    /// made every action read as a heading.
+    pub const CONTROL: TypeRole = TypeRole::new(13., 18., FontWeight::NORMAL, false);
     /// A lone glyph in an icon-sized control (`+`). A symbol has no lowercase
     /// body to carry it, so it sits a step above body text and keeps the
     /// semibold weight the other controls use.
@@ -382,6 +385,21 @@ pub mod layout {
     /// Caption row: the tab strip's row on Windows, matching the sidebar's
     /// brand row.
     pub const CAPTION: Pixels = px(36.);
+    /// Height of the caption row's controls. The row's top frame band belongs to
+    /// the window's resize edge, so the window controls and the tab strip's add
+    /// control share the band below it and their glyphs line up.
+    pub const CAPTION_CONTROL: Pixels = px(32.);
+    /// Rendered size of a line icon. Glyph controls draw their marks at this
+    /// size from the same asset style (one stroke, round caps), so the caption
+    /// row and the request row read as one set.
+    pub const ICON: Pixels = px(12.);
+    /// Rendered size of a line icon in a control with room to spare, such as
+    /// the command bar's accessory buttons. [`ICON`] is tuned to the caption
+    /// cells, where the glyph shares the height with a 4 px resize band; a
+    /// 28 px button beside a text field can carry a mark a third larger, and
+    /// at [`ICON`] the command bar's icons read smaller than the text they sit
+    /// next to.
+    pub const ICON_ROOMY: Pixels = px(16.);
     /// Sidebar width.
     pub const SIDEBAR: Pixels = px(272.);
     /// Pane padding.
@@ -525,7 +543,7 @@ mod tests {
 
         assert_eq!(type_role::MICRO.size(), px(12.));
         assert_eq!(type_role::MICRO.line_height(), px(16.));
-        assert_eq!(type_role::MICRO.weight(), FontWeight::SEMIBOLD);
+        assert_eq!(type_role::MICRO.weight(), FontWeight::NORMAL);
 
         assert_eq!(type_role::CODE.size(), px(14.));
         assert_eq!(type_role::CODE.line_height(), px(22.));
@@ -537,7 +555,7 @@ mod tests {
 
         assert_eq!(type_role::CONTROL.size(), px(13.));
         assert_eq!(type_role::CONTROL.line_height(), px(18.));
-        assert_eq!(type_role::CONTROL.weight(), FontWeight::SEMIBOLD);
+        assert_eq!(type_role::CONTROL.weight(), FontWeight::NORMAL);
         assert!(!type_role::CONTROL.is_mono());
 
         assert_eq!(type_role::GLYPH.size(), px(18.));

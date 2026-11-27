@@ -46,6 +46,9 @@ use gpui::{
     Styled, Subscription, Window, WindowBounds, actions, div, prelude::*, px, relative,
 };
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use posthaste_core::model::RequestProtocol;
 use posthaste_core::preferences::WindowFrame;
 
@@ -141,6 +144,11 @@ pub struct AppShell {
     /// `AppState` because it is a view offset, and it must survive renders:
     /// a handle created during render would reset on the next frame.
     tab_strip_scroll: ScrollHandle,
+    /// Generations of the strip's glide animation. A press on a scroll arrow
+    /// takes the next number, and the glide it superseded stops on its next
+    /// frame, so overlapping presses settle into the last one instead of
+    /// pulling the strip in opposite directions.
+    tab_strip_glide: Rc<Cell<u64>>,
     /// The active tab whose chip the strip last scrolled into view. Scrolling
     /// only when this pair changes leaves manual scrolling alone.
     tab_strip_active: Option<(TabId, usize)>,
@@ -314,6 +322,7 @@ impl AppShell {
             focus_handle,
             split_ratio,
             tab_strip_scroll: ScrollHandle::new(),
+            tab_strip_glide: Rc::new(Cell::new(0)),
             tab_strip_active: None,
             focused_rename: None,
             focused_save_name: None,
@@ -567,10 +576,14 @@ impl Render for AppShell {
                     self.state.clone(),
                     app,
                     &self.tab_strip_scroll,
+                    self.tab_strip_glide.clone(),
                 ));
             }
             // Only Windows hides the native title bar, so only Windows supplies
-            // a drag area and the caption controls.
+            // a drag area and the caption controls. The strip carries its own
+            // drag area past the add control, so the empty stretch of caption
+            // belongs to it and the chips keep first claim on the row's width;
+            // only the tab-less welcome screen needs one here.
             #[cfg(target_os = "windows")]
             {
                 if !show_tabs {
@@ -5370,12 +5383,35 @@ mod tests {
         }
 
         let add = cx.debug_bounds("new-tab").expect("add control");
+        let minimize = cx
+            .debug_bounds("caption-minimize")
+            .expect("caption controls");
+        assert_eq!(
+            add.origin.y, minimize.origin.y,
+            "the add control shares the window controls' band, so the two sets of glyphs line up"
+        );
+        assert_eq!(
+            add.size.height, minimize.size.height,
+            "the add control and the window controls are the same height"
+        );
         let drag = cx
             .debug_bounds("caption-drag")
             .expect("the drag area follows the chips");
         assert!(
             drag.origin.x >= add.origin.x + add.size.width,
             "the drag area must not start before the add control ends"
+        );
+        assert!(
+            drag.size.width >= caption::DRAG_MIN,
+            "the drag area keeps a grabbable width even when the chips want the row"
+        );
+        let controls = cx
+            .debug_bounds("caption-controls")
+            .expect("caption controls");
+        assert_eq!(
+            drag.origin.x + drag.size.width + layout::TAB_GAP,
+            controls.origin.x,
+            "the drag area meets the controls across the row's gap"
         );
 
         assert!(cx.debug_bounds("sidebar-new-collection").is_some());
@@ -6338,6 +6374,20 @@ mod tests {
                     && bounds.origin.y + bounds.size.height <= px(600.),
                 "the {name} must stay inside the minimum window"
             );
+        }
+
+        // The window must stay movable when the tab bar is busy, so the drag
+        // area keeps its floor and the strip gives up the width instead.
+        #[cfg(target_os = "windows")]
+        {
+            let drag = cx
+                .debug_bounds("caption-drag")
+                .expect("missing drag area at the minimum window size");
+            assert!(
+                drag.size.width >= caption::DRAG_MIN,
+                "the drag area must stay grabbable at the minimum window size"
+            );
+            assert_eq!(drag.size.height, layout::CAPTION);
         }
     }
 
@@ -7439,7 +7489,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn the_strip_fades_its_hidden_edge_without_taking_the_pointer(cx: &mut TestAppContext) {
+    async fn the_strip_edges_scroll_the_tabs_they_fade(cx: &mut TestAppContext) {
         let (_dir, view, cx) = shell_window(cx);
         let state = shell_state(&view, cx);
         cx.simulate_resize(gpui::size(px(1080.), px(600.)));
@@ -7450,66 +7500,114 @@ mod tests {
             redraw(cx);
         }
 
-        let strip = cx
-            .debug_bounds("request-tab-strip-scroll")
-            .expect("strip viewport");
+        let active_tab = |cx: &mut VisualTestContext| {
+            cx.update(|_, app| {
+                state
+                    .read(app)
+                    .tab_summaries()
+                    .into_iter()
+                    .find(|summary| summary.active)
+                    .map(|summary| summary.id)
+            })
+        };
+        // A press glides the strip over a handful of frames, and the test clock
+        // only moves when it is told to.
+        let glide = |cx: &mut VisualTestContext| {
+            for _ in 0..12 {
+                cx.executor().advance_clock(Duration::from_millis(20));
+                cx.run_until_parked();
+            }
+            redraw(cx);
+        };
+        let active = active_tab(cx);
         assert!(
-            cx.debug_bounds("tab-strip-fade-right").is_some(),
+            cx.debug_bounds("tab-strip-scroll-right").is_some(),
             "the overflowing strip fades its hidden right edge"
         );
         assert!(
-            cx.debug_bounds("tab-strip-fade-left").is_none(),
+            cx.debug_bounds("tab-strip-scroll-left").is_none(),
             "nothing is hidden on the left at the start of the run"
         );
 
-        // Scroll back a little so a chip lies beneath the left fade.
-        cx.simulate_event(ScrollWheelEvent {
-            position: strip.center(),
-            delta: ScrollDelta::Pixels(point(px(-120.), px(0.))),
-            modifiers: Modifiers::default(),
-            touch_phase: TouchPhase::Moved,
-        });
-        redraw(cx);
+        // The right edge's arrow scrolls the strip on. It lies over the last
+        // visible chip, so the press must move the strip rather than activate
+        // that chip.
+        let first = cx.update(|_, app| state.read(app).tab_summaries()[0].id);
+        let first_selector = leaked(format!("request-tab-chip-{first}"));
+        let before = cx
+            .debug_bounds(first_selector)
+            .expect("the first chip")
+            .origin
+            .x;
+        let right = cx
+            .debug_bounds("tab-strip-scroll-right")
+            .expect("the trailing edge");
+        cx.simulate_click(right.center(), Modifiers::default());
+        cx.run_until_parked();
+        glide(cx);
+        assert_eq!(
+            active_tab(cx),
+            active,
+            "the trailing arrow takes the press instead of the chip beneath it"
+        );
+        let after = cx
+            .debug_bounds(first_selector)
+            .expect("the first chip")
+            .origin
+            .x;
+        let moved = f32::from(before - after);
+        assert!(
+            (moved - f32::from(super::tab_strip::SCROLL_STEP)).abs() < 0.5,
+            "one press moves the strip a fixed step ({moved} px), not the whole overflow"
+        );
+        assert!(
+            cx.debug_bounds("tab-strip-scroll-left").is_some(),
+            "scrolling on hides the strip's start, so the leading edge gets its own arrow"
+        );
 
+        // The left edge's arrow brings the strip back to its start.
         let left = cx
-            .debug_bounds("tab-strip-fade-left")
-            .expect("the scrolled strip fades its hidden left edge");
-        let ids: Vec<_> = cx.update(|_, app| {
-            state
-                .read(app)
-                .tab_summaries()
-                .into_iter()
-                .map(|summary| summary.id)
-                .collect()
-        });
-        let target = ids
-            .iter()
-            .copied()
-            .find(|id| {
-                cx.debug_bounds(leaked(format!("request-tab-chip-{id}")))
-                    .is_some_and(|bounds| {
-                        bounds.origin.x < left.center().x
-                            && bounds.origin.x + bounds.size.width > left.center().x
-                    })
-            })
-            .expect("a chip lies under the fade after scrolling");
-        // The chip under the fade stays clickable: the fade carries no handler
-        // of its own, so the click lands on the chip beneath it.
+            .debug_bounds("tab-strip-scroll-left")
+            .expect("the leading edge");
         cx.simulate_click(left.center(), Modifiers::default());
         cx.run_until_parked();
+        glide(cx);
+        assert!(
+            cx.debug_bounds("tab-strip-scroll-left").is_none(),
+            "the leading arrow scrolls back to the strip's start"
+        );
+        assert!(
+            cx.debug_bounds("tab-strip-scroll-right").is_some(),
+            "tabs are hidden on the right again"
+        );
+    }
+
+    // The band is caption space only where the native title bar is hidden, which
+    // is Windows alone.
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    async fn the_strip_keeps_a_caption_band_above_the_chips(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = shell_window(cx);
         redraw(cx);
-        let active = cx.update(|_, app| {
-            state
-                .read(app)
-                .tab_summaries()
-                .into_iter()
-                .find(|summary| summary.active)
-                .map(|summary| summary.id)
-        });
+
+        let strip = cx.debug_bounds("request-tab-strip").expect("the tab strip");
+        let band = cx
+            .debug_bounds("tab-strip-caption-band")
+            .expect("the strip draws caption space above its chips");
+        let add = cx.debug_bounds("new-tab").expect("the add control");
+
         assert_eq!(
-            active,
-            Some(target),
-            "the chip beneath the fade takes the click"
+            band.origin.y, strip.origin.y,
+            "the band starts at the row's top edge"
+        );
+        assert!(
+            band.size.height > px(0.),
+            "the band has height, or a press on it has nowhere to land"
+        );
+        assert_eq!(
+            band.origin.y + band.size.height,
+            add.origin.y,
+            "the band ends where the chips begin, so the empty top of the row drags the window"
         );
     }
 
