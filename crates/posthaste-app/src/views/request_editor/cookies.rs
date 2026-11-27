@@ -2,6 +2,7 @@
 //! the cells that make up a row.
 
 use super::*;
+use crate::views::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 
 /// The cookie dialog, read from the editor once per render. Every value shown
 /// here comes from the jar at paint time and is never copied into the draft.
@@ -704,12 +705,21 @@ pub(crate) fn cookies_modal(editor: Entity<RequestEditor>, cx: &App) -> AnyEleme
             .flex()
             .flex_col()
             .child(
-                div()
-                    .id("cookies-dialog-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(editor_ref.render_cookies(&view, &editor)),
+                scroll_frame(
+                    body_editor.clone(),
+                    "cookies-scrollbar",
+                    ScrollSource::Handle(editor_ref.cookies_scroll().clone()),
+                    Scrollbars::VERTICAL,
+                    div()
+                        .id("cookies-dialog-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(editor_ref.cookies_scroll())
+                        .child(editor_ref.render_cookies(&view, &editor)),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .children(adding.then(|| {
                 div()

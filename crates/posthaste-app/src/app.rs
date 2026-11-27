@@ -5,7 +5,8 @@ use std::cell::Cell;
 use async_channel::{Receiver, Sender, TrySendError};
 use bytes::Bytes;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Rgba, Task, WeakEntity, Window,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Rgba, ScrollHandle, Task,
+    WeakEntity, Window, point, px,
 };
 use posthaste_core::cookies::{CookieJar, has_manual_cookie_header};
 use posthaste_core::error::PosthasteError;
@@ -1851,8 +1852,17 @@ pub struct AppState {
     /// Focus for the open settings dialog. Created when it opens, so `Escape`
     /// reaches the panel while an editor field would otherwise own the key.
     settings_focus: Option<FocusHandle>,
+    /// The settings dialog's scroll position, kept across renders so its bar
+    /// reads and writes the region the wheel moves.
+    settings_scroll: ScrollHandle,
     /// The open resolved-request inspector, if any.
     inspector: Option<InspectorState>,
+    /// The inspector's scroll position, kept across renders so its bar reads
+    /// and writes the region the wheel moves.
+    inspector_scroll: ScrollHandle,
+    /// The welcome panel's scroll position, kept across renders so its bar
+    /// reads and writes the region the wheel moves.
+    welcome_scroll: ScrollHandle,
     /// Focus for the open inspector, created when it first opens, so `Escape`
     /// reaches the panel while an editor field would otherwise own the key.
     inspector_focus: Option<FocusHandle>,
@@ -2392,8 +2402,11 @@ impl AppState {
             environment_panel_slug,
             overlays: OverlayHost::new(),
             settings_focus: None,
+            settings_scroll: ScrollHandle::new(),
             settings_numbers,
             inspector: None,
+            inspector_scroll: ScrollHandle::new(),
+            welcome_scroll: ScrollHandle::new(),
             inspector_focus: None,
             inspector_generation: 0,
             save_picker_name: None,
@@ -2626,6 +2639,21 @@ impl AppState {
         self.settings_focus.as_ref()
     }
 
+    /// The settings dialog's scroll handle, shared with its bar.
+    pub(crate) fn settings_scroll(&self) -> &ScrollHandle {
+        &self.settings_scroll
+    }
+
+    /// The inspector's scroll handle, shared with its bar.
+    pub(crate) fn inspector_scroll(&self) -> &ScrollHandle {
+        &self.inspector_scroll
+    }
+
+    /// The welcome panel's scroll handle, shared with its bar.
+    pub(crate) fn welcome_scroll(&self) -> &ScrollHandle {
+        &self.welcome_scroll
+    }
+
     /// The dialog's editable number fields.
     pub(crate) fn settings_numbers(&self) -> &SettingsNumbers {
         &self.settings_numbers
@@ -2765,6 +2793,7 @@ impl AppState {
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
         window.focus(&focus);
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
         self.sync_settings_numbers(cx);
         cx.notify();
     }
@@ -2796,6 +2825,7 @@ impl AppState {
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
         window.focus(&focus);
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
         self.begin_inspection(tab_id, cx);
     }
 
@@ -8718,6 +8748,27 @@ impl AppState {
         generation
     }
 
+    /// Starts a connected WebSocket attempt whose handshake carries `headers`,
+    /// so a test can present a table long enough to overflow its section.
+    #[cfg(test)]
+    pub(crate) fn begin_test_websocket_with_handshake(
+        &mut self,
+        headers: Vec<(String, String)>,
+    ) -> u64 {
+        let generation = self.begin_test_websocket();
+        self.active_tab_mut().ws.set_connected(
+            generation,
+            WsHandshake {
+                status: 101,
+                headers,
+                protocol: None,
+                cookies: Vec::new(),
+            },
+            Instant::now(),
+        );
+        generation
+    }
+
     /// Appends `count` incoming text frames to the running test session.
     #[cfg(test)]
     pub(crate) fn push_test_websocket_frames(
@@ -8739,6 +8790,29 @@ impl AppState {
                 index as u64,
             );
         }
+        cx.notify();
+    }
+
+    /// Appends one incoming text frame carrying `payload`, so a test can
+    /// present a payload wide or tall enough to scroll.
+    #[cfg(test)]
+    pub(crate) fn push_test_websocket_payload(
+        &mut self,
+        generation: u64,
+        payload: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let payload = Bytes::from(payload.to_owned());
+        let size = payload.len();
+        self.active_tab_mut().ws.push_frame(
+            generation,
+            posthaste_core::ws::WsDirection::Incoming,
+            false,
+            payload,
+            size,
+            false,
+            0,
+        );
         cx.notify();
     }
 

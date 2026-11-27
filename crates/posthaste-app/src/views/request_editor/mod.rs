@@ -11,9 +11,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Render, Rgba,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, actions, div, px, svg,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, actions,
+    div, point, px, svg,
 };
 use posthaste_core::cookies::{
     CookieInfo, CookieJar, PersistenceState, cookie_url, draft_url, has_manual_cookie_header,
@@ -34,6 +35,7 @@ use posthaste_core::variables::{VariableCatalog, resolve_request_lossy};
 use super::cookie_selection::CookieSelection;
 use super::response_viewer::format_bytes;
 use super::script_preview::{JarCookieNote, ScriptPreview};
+use super::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use super::text_area::{Syntax, TextArea};
 use super::text_input::TextInput;
 use crate::i18n::{self, Key, MessageKey, counted};
@@ -427,6 +429,13 @@ pub struct RequestEditor {
     /// selection instead of starting a new one on every cell it crosses.
     cookies_selecting: bool,
     tab: RequestTab,
+    /// The tab body's scroll position, kept across frames and tabs so the bar
+    /// reads and writes the same region the wheel moves.
+    tab_scroll: ScrollHandle,
+    /// The cookie dialog's table scroll position, kept across frames so its
+    /// bar reads and writes the region the wheel moves. The dialog is rebuilt
+    /// from a snapshot every render, so the handle lives here.
+    cookies_scroll: ScrollHandle,
     /// Whether the command bar's transport/method dropdown is open.
     method_menu_open: bool,
     header_rows: Vec<Row>,
@@ -739,6 +748,8 @@ impl RequestEditor {
             cookies_selection: None,
             cookies_selecting: false,
             tab: RequestTab::Params,
+            tab_scroll: ScrollHandle::new(),
+            cookies_scroll: ScrollHandle::new(),
             method_menu_open: false,
             header_rows: Vec::new(),
             query_rows: Vec::new(),
@@ -1151,6 +1162,7 @@ impl RequestEditor {
             // The loaded draft offers no Body tab; keep the editor on a tab it
             // still has rather than presenting a field the protocol hides.
             self.tab = RequestTab::Params;
+            self.reset_tab_scroll();
         }
         let body_text = self.body_text.clone();
         let body_syntax = self.body_mode.syntax();
@@ -1286,6 +1298,7 @@ impl RequestEditor {
         if protocol == RequestProtocol::WebSocket {
             if self.tab == RequestTab::Body {
                 self.tab = RequestTab::Params;
+                self.reset_tab_scroll();
             }
             self.close_script_preview(cx);
         }
@@ -1325,10 +1338,23 @@ impl RequestEditor {
             return;
         }
         self.tab = tab;
+        self.reset_tab_scroll();
         self.method_menu_open = false;
         self.cookies_clear_open = false;
         self.emit_overlay_change(cx);
         cx.notify();
+    }
+
+    /// Each tab is its own document; a scroll position earned in one must not
+    /// pin the next tab's content below its top.
+    fn reset_tab_scroll(&self) {
+        self.tab_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
+    /// The jar dialog's table scroll handle. The dialog snapshots its rows on
+    /// every render, so the tracked handle has to come from the editor.
+    pub(crate) fn cookies_scroll(&self) -> &ScrollHandle {
+        &self.cookies_scroll
     }
 
     /// Opens the session jar's dialog on this editor's draft. The host and
@@ -1342,6 +1368,7 @@ impl RequestEditor {
         self.cookies_add_focus_pending = false;
         self.cookies_selection = None;
         self.cookies_selecting = false;
+        self.cookies_scroll.set_offset(point(px(0.), px(0.)));
         self.emit_overlay_change(cx);
         cx.notify();
     }
@@ -2565,15 +2592,26 @@ impl Render for RequestEditor {
             }
             RequestTab::Params => {
                 let view = TableView::build(self, RowKind::Query, generation);
-                tab_scroll_region(self.render_table(&view, &editor, window, cx)).into_any_element()
+                tab_scroll_region(
+                    editor.clone(),
+                    &self.tab_scroll,
+                    self.render_table(&view, &editor, window, cx),
+                )
+                .into_any_element()
             }
             RequestTab::Headers => {
                 let view = TableView::build(self, RowKind::Header, generation);
-                tab_scroll_region(self.render_table(&view, &editor, window, cx)).into_any_element()
+                tab_scroll_region(
+                    editor.clone(),
+                    &self.tab_scroll,
+                    self.render_table(&view, &editor, window, cx),
+                )
+                .into_any_element()
             }
             RequestTab::Options => {
                 let view = OptionsView::build(self, generation);
-                tab_scroll_region(self.render_options(&view)).into_any_element()
+                tab_scroll_region(editor.clone(), &self.tab_scroll, self.render_options(&view))
+                    .into_any_element()
             }
         };
 
@@ -2617,15 +2655,29 @@ impl Render for RequestEditor {
 ///
 /// It fills the height the request pane leaves and scrolls its content, which
 /// is what keeps the command row and the section tabs still while a long table
-/// moves under them.
-fn tab_scroll_region(content: impl IntoElement) -> impl IntoElement {
-    div()
+/// moves under them. The wrapper overlays the shared vertical bar on the
+/// region's trailing edge.
+fn tab_scroll_region(
+    editor: Entity<RequestEditor>,
+    scroll: &ScrollHandle,
+    content: impl IntoElement,
+) -> Div {
+    let scroller = div()
         .id("request-tab-scroll")
         .debug_selector(|| "request-tab-scroll".to_owned())
-        .flex_1()
-        .min_h_0()
+        .size_full()
         .overflow_y_scroll()
-        .child(content)
+        .track_scroll(scroll)
+        .child(content);
+    scroll_frame(
+        editor,
+        "request-tab-scrollbar",
+        ScrollSource::Handle(scroll.clone()),
+        Scrollbars::VERTICAL,
+        scroller,
+    )
+    .flex_1()
+    .min_h_0()
 }
 
 impl RequestEditor {

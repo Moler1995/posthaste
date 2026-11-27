@@ -198,6 +198,8 @@ impl RequestEditor {
                 // of the region holds one muted padlock instead of a sentence.
                 AuthKind::None => auth_placeholder(),
                 _ => tab_scroll_region(
+                    editor.clone(),
+                    &self.tab_scroll,
                     div()
                         .debug_selector(|| "request-auth-body".to_owned())
                         .flex()

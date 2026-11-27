@@ -19,6 +19,7 @@ use posthaste_core::script::ScriptFormat;
 
 use super::code_lines::{CodeChrome, CodeInteraction, CodeLines, code_view_with, offset_for_point};
 use super::request_editor::RequestEditor;
+use super::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use super::text_selection::{Drag, Granularity};
 use super::ui;
 use crate::i18n::{self, Key, MessageKey};
@@ -446,17 +447,31 @@ impl Render for ScriptPreview {
             .overflow_hidden()
             .rounded(radius::CONTROL)
             .bg(theme::surface::input())
-            .child(code_view_with(
-                SCRIPT_PREVIEW_CHROME,
-                "script-preview-lines",
-                self.lines.clone(),
-                None,
-                None,
-                false,
-                self.scroll.clone(),
-                None,
-                Some(interaction),
-            ))
+            .child(
+                // The script wraps, so a long one grows downward and this is
+                // the only axis that scrolls. The bar sits on the box's
+                // trailing edge, above the copy control's corner.
+                scroll_frame(
+                    view.clone(),
+                    "script-preview-scrollbar",
+                    ScrollSource::Uniform(self.scroll.clone()),
+                    Scrollbars::VERTICAL,
+                    code_view_with(
+                        SCRIPT_PREVIEW_CHROME,
+                        "script-preview-lines",
+                        self.lines.clone(),
+                        None,
+                        None,
+                        false,
+                        self.scroll.clone(),
+                        None,
+                        Some(interaction),
+                    ),
+                )
+                .flex()
+                .flex_col()
+                .size_full(),
+            )
             .child(copy_icon)
             .into_any_element();
 
@@ -701,6 +716,43 @@ mod tests {
             clipboard(cx),
             script,
             "copying keeps the original line without added breaks"
+        );
+    }
+
+    /// A script taller than its box shows a vertical bar; one that fits shows
+    /// none. The preview wraps, so width never scrolls.
+    #[gpui::test]
+    async fn a_tall_script_shows_a_vertical_bar(cx: &mut TestAppContext) {
+        let script: String = (0..80)
+            .map(|index| format!("curl -X GET 'https://example.com/{index}'\n"))
+            .collect();
+        let (_editor, _preview, cx) = preview_window(cx, &script);
+        paint(cx);
+        paint(cx);
+
+        assert!(
+            cx.debug_bounds("script-preview-scrollbar").is_some(),
+            "an overflowing script shows a bar"
+        );
+        assert!(
+            cx.debug_bounds("script-preview-scrollbar-thumb").is_some(),
+            "the bar has a thumb"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_short_script_shows_no_vertical_bar(cx: &mut TestAppContext) {
+        let (_editor, _preview, cx) = preview_window(cx, "curl -X GET 'https://example.com'\n");
+        paint(cx);
+        paint(cx);
+
+        assert!(
+            cx.debug_bounds("script-preview-scrollbar").is_none(),
+            "a script that fits shows no bar"
+        );
+        assert!(
+            cx.debug_bounds("script-preview-scrollbar-thumb").is_none(),
+            "there is no thumb to paint"
         );
     }
 }

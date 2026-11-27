@@ -11,17 +11,19 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    GlobalElementId, InspectorElementId, IntoElement, IsZero as _, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, UTF16Selection, Window,
-    actions, fill, point, prelude::*, px, relative, size,
+    DragMoveEvent, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, IsZero as _,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Render, Rgba, ScrollWheelEvent, ShapedLine, SharedString, Size, Stateful, Style,
+    Subscription, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative,
+    size,
 };
 use posthaste_core::variables::VariableCatalog;
 
 use crate::i18n::{self, Key};
 use crate::metrics::{TypeStyle as _, mono_font, resolve_type_role, space, type_role};
 use crate::theme;
+use crate::views::scrollbar::{ScrollbarAxis, ScrollbarSpec, scrollbar, scrollbar_thumb};
 use crate::views::text_engine::{TextEngine, TextMode};
 use crate::views::text_history::{EditKind, Selection};
 use crate::views::text_input::TextInput;
@@ -1006,6 +1008,101 @@ impl TextArea {
         }
     }
 
+    /// The viewport extent and the overflow along `axis`, using the same
+    /// content measures the prepaint clamps against.
+    fn scrollbar_extents(
+        &self,
+        axis: ScrollbarAxis,
+        viewport_size: Size<Pixels>,
+    ) -> (Pixels, Pixels) {
+        match axis {
+            ScrollbarAxis::Vertical => {
+                let viewport = viewport_size.height;
+                let content = self.layout.line_height() * self.layout.line_count().max(1) as f32;
+                (viewport, (content - viewport).max(px(0.)))
+            }
+            ScrollbarAxis::Horizontal => {
+                let viewport = viewport_size.width;
+                let content = self.layout.max_width() + self.layout.gutter();
+                (viewport, (content - viewport).max(px(0.)))
+            }
+        }
+    }
+
+    /// One bar for the editor's measured viewport, or `None` while that axis
+    /// fits.
+    fn scroll_bar(
+        &self,
+        axis: ScrollbarAxis,
+        id: &'static str,
+        entity: Entity<Self>,
+        viewport_size: Size<Pixels>,
+    ) -> Option<Stateful<gpui::Div>> {
+        let bounds = self.last_bounds?;
+        let (viewport, max) = self.scrollbar_extents(axis, viewport_size);
+        let press_entity = entity.clone();
+        let thumb_entity = entity;
+        scrollbar(
+            ScrollbarSpec {
+                id: SharedString::from(id),
+                axis,
+                viewport,
+                max,
+                offset: axis.along(self.layout.scroll()),
+                origin: axis.along(bounds.origin),
+                payload: TextAreaScrollDrag { axis },
+            },
+            move |magnitude, cx: &mut App| {
+                press_entity.update(cx, |area, cx| {
+                    let mut scroll = area.layout.scroll();
+                    axis.write(&mut scroll, magnitude);
+                    area.layout.set_scroll(scroll);
+                    if let Some(bounds) = area.last_bounds {
+                        area.layout.clamp_scroll(bounds.size);
+                    }
+                    area.follow = false;
+                    cx.notify();
+                });
+            },
+            move |cx: &mut App| {
+                thumb_entity.update(cx, |area, cx| {
+                    // A thumb gesture is a reader's scroll; caret-follow must
+                    // not pull the view back on the next prepaint.
+                    area.follow = false;
+                    cx.notify();
+                });
+            },
+        )
+    }
+
+    fn drag_scrollbar(
+        &mut self,
+        event: &DragMoveEvent<TextAreaScrollDrag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let axis = event.drag(cx).axis;
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let (viewport, max) = self.scrollbar_extents(axis, bounds.size);
+        let Some((thumb, travel)) = scrollbar_thumb(viewport, max) else {
+            return;
+        };
+        let local = axis.along(event.event.position) - axis.along(bounds.origin) - thumb / 2.;
+        let fraction = (f32::from(local) / f32::from(travel)).clamp(0., 1.);
+        let magnitude = px(f32::from(max) * fraction);
+        let mut scroll = self.layout.scroll();
+        if axis.along(scroll) == magnitude {
+            return;
+        }
+        axis.write(&mut scroll, magnitude);
+        self.layout.set_scroll(scroll);
+        self.layout.clamp_scroll(bounds.size);
+        self.follow = false;
+        cx.notify();
+    }
+
     fn index_for_mouse_position(&mut self, position: Point<Pixels>, window: &mut Window) -> usize {
         let line_height = self.line_height();
         if line_height <= px(0.) {
@@ -1168,6 +1265,19 @@ impl EntityInputHandler for TextArea {
     ) -> Option<usize> {
         let offset = self.index_for_mouse_position(point, window);
         Some(self.engine.offset_to_utf16(offset))
+    }
+}
+
+/// Drag payload for the editor's scrollbar thumbs, which move the layout's
+/// offset directly instead of a gpui scroll handle.
+#[derive(Clone)]
+struct TextAreaScrollDrag {
+    axis: ScrollbarAxis,
+}
+
+impl Render for TextAreaScrollDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
     }
 }
 
@@ -1586,10 +1696,17 @@ impl Element for TextAreaElement {
             );
         });
 
+        // The bars read this measurement at render time, so a first layout or
+        // a resize asks for one more frame to draw them at the right length.
+        let remeasured = self.input.read(cx).last_bounds != Some(bounds);
         self.input.update(cx, |input, _cx| {
             input.last_bounds = Some(bounds);
             input.follow = false;
         });
+        if remeasured {
+            let input = self.input.clone();
+            cx.defer(move |cx| input.update(cx, |_, cx| cx.notify()));
+        }
     }
 }
 
@@ -1629,6 +1746,42 @@ impl Render for TextArea {
             "TextArea"
         };
         let focused = self.focus_handle.is_focused(window);
+        // The padded inset and the measured viewport are separate boxes: bars
+        // hosted by the relative viewport align with the text area's own
+        // bounds, not with the shell's border. Their track lengths are that
+        // viewport's extents, so the click mapping and the drawn bar agree.
+        let input = cx.entity();
+        let (vertical_bar, horizontal_bar) = match self.last_bounds {
+            Some(bounds) => (
+                self.scroll_bar(
+                    ScrollbarAxis::Vertical,
+                    "text-area-vscroll",
+                    input.clone(),
+                    bounds.size,
+                )
+                .map(|bar| bar.absolute().top(px(0.)).right(px(0.)).into_any_element()),
+                self.scroll_bar(
+                    ScrollbarAxis::Horizontal,
+                    "text-area-hscroll",
+                    input.clone(),
+                    bounds.size,
+                )
+                .map(|bar| {
+                    bar.absolute()
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .into_any_element()
+                }),
+            ),
+            None => (None, None),
+        };
+        let viewport = div()
+            .relative()
+            .size_full()
+            .child(TextAreaElement { input })
+            .children(vertical_bar)
+            .children(horizontal_bar)
+            .on_drag_move::<TextAreaScrollDrag>(cx.listener(Self::drag_scrollbar));
         text_field_shell(focused, self.accent)
             // A hover listener needs an interactive identity; the focus handle
             // is stable per field and already identifies it.
@@ -1666,10 +1819,8 @@ impl Render for TextArea {
             .on_mouse_move(cx.listener(Self::on_pointer_move))
             .on_hover(cx.listener(Self::on_pointer_hover))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
-            .px(px(6.))
-            .py(px(3.))
             .text_role(type_role::CODE)
-            .child(TextAreaElement { input: cx.entity() })
+            .child(div().size_full().px(px(6.)).py(px(3.)).child(viewport))
             .children(overlay)
     }
 }
@@ -1686,7 +1837,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use gpui::div;
+    use gpui::{Modifiers, div};
 
     use super::*;
     use crate::views::text_engine::IME_ENTER_GRACE;
@@ -2184,6 +2335,118 @@ mod tests {
             .join("\n")
     }
 
+    /// Draws until the editor's second pass, which is the one that knows its
+    /// measured viewport and can draw the bars to that length.
+    fn draw_bars(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..3 {
+            cx.update(|window, app| window.draw(app).clear());
+        }
+    }
+
+    #[gpui::test]
+    async fn a_tall_body_shows_a_vertical_bar(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new(long_body(200), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.focus(area.read(app).focus_handle()));
+        draw_bars(cx);
+
+        let track = cx
+            .debug_bounds("text-area-vscroll")
+            .expect("a tall body shows a vertical bar");
+        let thumb = cx
+            .debug_bounds("text-area-vscroll-thumb")
+            .expect("vertical thumb");
+        assert_eq!(
+            track.size.width,
+            crate::views::scrollbar::SCROLLBAR_THICKNESS
+        );
+        assert!(
+            thumb.size.height < track.size.height,
+            "the thumb shows the visible share"
+        );
+
+        let before = cx.update(|_, app| area.read(app).layout.scroll().y);
+        cx.simulate_click(
+            point(track.center().x, track.bottom() - px(2.)),
+            Modifiers::default(),
+        );
+        draw_bars(cx);
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert!(
+                area.layout.scroll().y > before,
+                "a track press moves the viewport toward the pointer"
+            );
+            let max = (area.layout.line_height() * area.layout.line_count() as f32
+                - area.last_bounds.expect("measured").size.height)
+                .max(px(0.));
+            assert!(area.layout.scroll().y <= max);
+        });
+    }
+
+    #[gpui::test]
+    async fn a_wide_line_shows_a_horizontal_bar(cx: &mut gpui::TestAppContext) {
+        let area = cx.new(|cx| TextArea::new("x".repeat(4_000), "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.focus(area.read(app).focus_handle()));
+        draw_bars(cx);
+
+        let track = cx
+            .debug_bounds("text-area-hscroll")
+            .expect("a wide line shows a horizontal bar");
+        let thumb = cx
+            .debug_bounds("text-area-hscroll-thumb")
+            .expect("horizontal thumb");
+        assert!(
+            thumb.size.width < track.size.width,
+            "the thumb shows the visible share"
+        );
+
+        let before = cx.update(|_, app| area.read(app).layout.scroll().x);
+        cx.simulate_click(
+            point(track.right() - px(2.), track.center().y),
+            Modifiers::default(),
+        );
+        draw_bars(cx);
+        cx.update(|_, app| {
+            assert!(
+                area.read(app).layout.scroll().x > before,
+                "a track press scrolls sideways"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_bar_press_leaves_the_selection_alone(cx: &mut gpui::TestAppContext) {
+        let body = long_body(200);
+        let area = cx.new({
+            let body = body.clone();
+            move |cx| TextArea::new(body, "Body", cx)
+        });
+        let cx = area_window(cx, area.clone());
+        cx.update(|window, app| window.focus(area.read(app).focus_handle()));
+        cx.update(|_, app| {
+            area.update(app, |area, cx| {
+                area.engine.set_selection(3..8, false);
+                cx.notify();
+            });
+        });
+        draw_bars(cx);
+
+        let track = cx
+            .debug_bounds("text-area-vscroll")
+            .expect("a tall body shows a vertical bar");
+        cx.simulate_click(track.center(), Modifiers::default());
+        draw_bars(cx);
+
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert_eq!(area.engine.selected_range, 3..8);
+            assert_eq!(area.engine.cursor_offset(), 8);
+            assert_eq!(area.content(), body.as_str());
+        });
+    }
+
     #[gpui::test]
     async fn typing_past_the_height_scrolls_the_caret_into_view(cx: &mut gpui::TestAppContext) {
         cx.update(|app| app.bind_keys(key_bindings()));
@@ -2621,6 +2884,66 @@ mod tests {
             let area = area.read(app);
             assert!(area.layout.scroll().y > px(0.), "the wheel scrolled down");
             assert_eq!(area.engine.selected_range, before, "the caret did not move");
+        });
+    }
+
+    #[gpui::test]
+    async fn shift_wheel_scrolls_sideways_and_caret_follow_does_not_pull_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let wide = format!("{}\n{}", "x".repeat(4_000), long_body(200));
+        let area = cx.new(move |cx| TextArea::new(wide, "Body", cx));
+        let cx = area_window(cx, area.clone());
+        cx.update(|_, app| {
+            area.update(app, |area, cx| {
+                // The caret is on the first line, so a follow pass would pull
+                // the view back to the top after the wheel moved away.
+                area.engine.set_selection(0..0, false);
+                cx.notify();
+            });
+        });
+        cx.update(|window, app| window.draw(app).clear());
+        let bounds = cx.update(|_, app| area.read(app).last_bounds.expect("painted"));
+
+        let wheel = |dy: f32, shift: bool| ScrollWheelEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Lines(point(0., dy)),
+            modifiers: Modifiers {
+                shift,
+                ..Default::default()
+            },
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let down = wheel(-3., false);
+        cx.update(|window, app| {
+            area.update(app, |area, cx| area.on_wheel(&down, window, cx));
+        });
+        cx.update(|window, app| window.draw(app).clear());
+        let vertical = cx.update(|_, app| area.read(app).layout.scroll().y);
+        assert!(vertical > px(0.), "the wheel scrolled down");
+        assert_eq!(
+            cx.update(|_, app| area.read(app).engine.selected_range.clone()),
+            0..0,
+            "the wheel did not move the caret"
+        );
+
+        let sideways = wheel(-3., true);
+        cx.update(|window, app| {
+            area.update(app, |area, cx| area.on_wheel(&sideways, window, cx));
+        });
+        cx.update(|window, app| window.draw(app).clear());
+        cx.update(|_, app| {
+            let area = area.read(app);
+            assert!(
+                area.layout.scroll().x > px(0.),
+                "Shift+wheel scrolled right"
+            );
+            assert_eq!(
+                area.layout.scroll().y,
+                vertical,
+                "Shift+wheel left the vertical offset alone"
+            );
+            assert_eq!(area.engine.selected_range, 0..0);
         });
     }
 

@@ -24,6 +24,7 @@ use crate::theme;
 use crate::views::environment_panel::EnvironmentPanel;
 use crate::views::navigation::{NavFolder, NavRequest, NavigationModel, SidebarItem};
 use crate::views::response_pane::{format_duration, format_duration_exact};
+use crate::views::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use crate::views::text_area::TextArea;
 use crate::views::text_input::TextInput;
 use crate::views::ui::{
@@ -257,7 +258,7 @@ pub fn render(state: Entity<AppState>, app: &AppState, cx: &App) -> impl IntoEle
         let built = navigation.rows_built_counter();
         let list_rows = tree_rows.clone();
         let row_state = state.clone();
-        uniform_list(
+        let list = uniform_list(
             "sidebar-tree-list",
             list_rows.len(),
             move |range, _window, cx| {
@@ -309,9 +310,17 @@ pub fn render(state: Entity<AppState>, app: &AppState, cx: &App) -> impl IntoEle
             },
         )
         .debug_selector(|| "sidebar-tree-list".to_owned())
+        .size_full()
+        .track_scroll(list_state.clone());
+        scroll_frame(
+            state.clone(),
+            "sidebar-tree-scrollbar",
+            ScrollSource::Uniform(list_state),
+            Scrollbars::VERTICAL,
+            list,
+        )
         .flex_1()
         .min_h_0()
-        .track_scroll(list_state)
     });
 
     let middle = div()

@@ -19,6 +19,7 @@ mod resolved_request;
 pub(crate) mod response_pane;
 pub(crate) mod response_viewer;
 pub(crate) mod script_preview;
+pub(crate) mod scrollbar;
 mod settings;
 pub(crate) mod shortcuts;
 mod sidebar;
@@ -5049,6 +5050,48 @@ mod tests {
         );
     }
 
+    /// The jar dialog's table takes a bar only when its rows outgrow the
+    /// dialog's body.
+    #[gpui::test]
+    async fn a_long_cookie_jar_shows_a_bar_and_a_short_one_hides_it(cx: &mut TestAppContext) {
+        let (_dir, view, cx, _store, collection, request) = seeded_shell(cx, "Demo", "Ping");
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        click_row(cx, leaked(format!("request-row-{}", request.id)));
+        redraw(cx);
+        click(cx, "status-cookies-0");
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("cookies-dialog-body").is_some(),
+            "the empty jar still paints its table body"
+        );
+        assert!(
+            cx.debug_bounds("cookies-scrollbar").is_none(),
+            "an empty jar fits its dialog and shows no bar"
+        );
+
+        let state = shell_state(&view, cx);
+        let jar = cx.update(|_, app| state.read(app).test_cookie_jar());
+        let target =
+            posthaste_core::cookies::draft_url("https://api.example.com/").expect("cookie URL");
+        for index in 0..40 {
+            jar.add(&target, &format!("cookie-{index}"), "value")
+                .expect("store cookie");
+        }
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("cookies-scrollbar").is_some(),
+            "a jar taller than the dialog shows a bar"
+        );
+        assert!(
+            cx.debug_bounds("cookies-scrollbar-thumb").is_some(),
+            "the bar has a thumb"
+        );
+    }
+
     /// The status bar's count is cached against the jar's revision: a repaint
     /// reuses it, and every jar write shows on the next frame.
     #[gpui::test]
@@ -6569,6 +6612,227 @@ mod tests {
         );
     }
 
+    /// The tab body's bar appears exactly when the table overflows, and its
+    /// thumb drags the table to its last row.
+    #[gpui::test]
+    async fn the_request_tab_bar_tracks_the_table_it_scrolls(cx: &mut TestAppContext) {
+        use posthaste_core::model::KeyValue;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let mut long = store
+            .create_request(&collection.id, "Long request")
+            .expect("request");
+        long.headers = (0..40)
+            .map(|index| KeyValue::new(format!("X-Header-{index}"), "value"))
+            .collect();
+        store
+            .save_request(&collection.id, &long)
+            .expect("save request");
+        let mut short = store
+            .create_request(&collection.id, "Short request")
+            .expect("request");
+        short.headers = vec![KeyValue::new("X-One", "value")];
+        store
+            .save_request(&collection.id, &short)
+            .expect("save request");
+
+        let shell_store = store.clone();
+        let (_view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        click_row(cx, leaked(format!("request-row-{}", long.id)));
+        click(cx, "request-tab-headers");
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        // Metrics exist only after prepaint; the bar needs the next frame.
+        redraw(cx);
+        redraw(cx);
+
+        let track = cx
+            .debug_bounds("request-tab-scrollbar")
+            .expect("an overflowing table shows a bar");
+        let thumb = cx
+            .debug_bounds("request-tab-scrollbar-thumb")
+            .expect("the bar has a thumb");
+        assert_eq!(
+            thumb.top(),
+            track.top(),
+            "a table that has not scrolled starts with its thumb at the top"
+        );
+        let add = cx.debug_bounds("add-header").expect("add header action");
+        assert!(
+            add.top() > track.bottom(),
+            "the end of the table starts below the viewport"
+        );
+
+        // Drag the thumb to the bottom. The first move crosses gpui's drag
+        // threshold; the following moves drive the offset.
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let y = (thumb.center().y + px(100. * step as f32)).min(track.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(thumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(thumb.center().x, track.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        redraw(cx);
+
+        let thumb = cx
+            .debug_bounds("request-tab-scrollbar-thumb")
+            .expect("thumb at the end");
+        assert!(
+            (thumb.bottom() - track.bottom()).abs() <= px(2.),
+            "dragging the thumb to the bottom reaches the end of the track"
+        );
+        let add = cx
+            .debug_bounds("add-header")
+            .expect("add header action at the end");
+        assert!(
+            add.bottom() <= track.bottom() + px(0.5) && add.top() >= track.top(),
+            "the table's last row and add action are inside the viewport at the end"
+        );
+
+        // A table that fits has nothing to drag, so the bar disappears.
+        click_row(cx, leaked(format!("request-row-{}", short.id)));
+        redraw(cx);
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("request-tab-scrollbar").is_none(),
+            "a table that fits shows no bar"
+        );
+    }
+
+    /// The sidebar tree's bar appears when the tree overflows, and its thumb
+    /// drags the tree to its last request.
+    #[gpui::test]
+    async fn the_sidebar_tree_bar_tracks_the_tree_it_scrolls(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let requests: Vec<_> = (0..60)
+            .map(|index| {
+                store
+                    .create_request(&collection.id, &format!("Request {index}"))
+                    .expect("request")
+            })
+            .collect();
+        let last = requests.last().expect("last request").id;
+
+        let shell_store = store.clone();
+        let (_view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        redraw(cx);
+
+        let track = cx
+            .debug_bounds("sidebar-tree-scrollbar")
+            .expect("an overflowing tree shows a bar");
+        let thumb = cx
+            .debug_bounds("sidebar-tree-scrollbar-thumb")
+            .expect("the bar has a thumb");
+        assert_eq!(
+            thumb.top(),
+            track.top(),
+            "a tree that has not scrolled starts with its thumb at the top"
+        );
+        assert!(
+            cx.debug_bounds(leaked(format!("request-row-{last}")))
+                .is_none(),
+            "the last request starts outside the built range"
+        );
+
+        // Drag the thumb to the bottom. The first move crosses gpui's drag
+        // threshold; the following moves drive the offset.
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let y = (thumb.center().y + px(100. * step as f32)).min(track.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(thumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(thumb.center().x, track.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        redraw(cx);
+
+        let thumb = cx
+            .debug_bounds("sidebar-tree-scrollbar-thumb")
+            .expect("thumb at the end");
+        assert!(
+            (thumb.bottom() - track.bottom()).abs() <= px(2.),
+            "dragging the thumb to the bottom reaches the end of the track"
+        );
+        let last = cx
+            .debug_bounds(leaked(format!("request-row-{last}")))
+            .expect("the last request is built once the tree reaches its end");
+        assert!(
+            last.top() >= track.top() - px(1.) && last.bottom() <= track.bottom() + px(1.),
+            "the tree's last request is inside the viewport at the end"
+        );
+    }
+
+    /// A tree that fits needs no bar.
+    #[gpui::test]
+    async fn the_sidebar_tree_hides_its_bar_when_the_tree_fits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        store
+            .create_request(&collection.id, "First")
+            .expect("request");
+        store
+            .create_request(&collection.id, "Second")
+            .expect("request");
+
+        let shell_store = store.clone();
+        let (_view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("sidebar-tree-list").is_some(),
+            "the tree renders so the missing bar is about fit, not absence"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-tree-scrollbar").is_none(),
+            "a tree that fits shows no bar"
+        );
+    }
+
     #[gpui::test]
     async fn clicking_a_chip_moves_typing_to_that_tab(cx: &mut TestAppContext) {
         let (_dir, view, cx) = shell_window(cx);
@@ -7956,6 +8220,259 @@ mod tests {
         assert!(
             streamed < 100,
             "streaming frames builds only the visible rows (built {streamed})"
+        );
+    }
+
+    /// The handshake header table scrolls under a fixed status line. It used
+    /// to clamp both axes with `overflow_hidden`, which silently cancelled the
+    /// vertical scroll and left every header past the first screen unreachable.
+    #[gpui::test]
+    async fn a_long_handshake_list_scrolls_to_its_last_header(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        let headers: Vec<(String, String)> = (0..60)
+            .map(|index| (format!("x-handshake-{index}"), "value".to_owned()))
+            .collect();
+        cx.update(|_, app| {
+            state.update(app, |state, _| {
+                state.make_test_websocket_draft("ws://socket.test/live");
+                state.begin_test_websocket_with_handshake(headers);
+            });
+        });
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        click(cx, "ws-tab-headers");
+        redraw(cx);
+        redraw(cx);
+
+        let track = cx
+            .debug_bounds("ws-handshake-scrollbar")
+            .expect("an overflowing handshake shows a bar");
+        let status = cx
+            .debug_bounds("ws-handshake-status")
+            .expect("the status line");
+        let card = cx
+            .debug_bounds("ws-handshake-card")
+            .expect("the header card");
+        let region = cx
+            .debug_bounds("ws-handshake-headers")
+            .expect("the header scroll region");
+        assert!(
+            card.bottom() > track.bottom(),
+            "the header card starts taller than its viewport"
+        );
+
+        for _ in 0..8 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: region.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-1_000.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+            redraw(cx);
+        }
+
+        let card_after = cx
+            .debug_bounds("ws-handshake-card")
+            .expect("the header card after scrolling");
+        assert!(
+            card_after.origin.y < card.origin.y - px(500.),
+            "the wheel moves the handshake headers"
+        );
+        let last = cx
+            .debug_bounds("ws-handshake-row-59")
+            .expect("the last header row");
+        assert!(
+            last.top() >= track.top() - px(1.) && last.bottom() <= track.bottom() + px(1.),
+            "the last header is inside the viewport at the end"
+        );
+        assert_eq!(
+            cx.debug_bounds("ws-handshake-status")
+                .expect("the status line after scrolling"),
+            status,
+            "the status line stays put above the scrolling headers"
+        );
+        assert!(
+            status.bottom() <= track.top(),
+            "the status line stays visible above the header table"
+        );
+    }
+
+    /// A long frame log shows a bar, and its thumb drags the log to the last
+    /// frame.
+    #[gpui::test]
+    async fn a_long_web_socket_log_bar_drags_to_the_last_frame(cx: &mut TestAppContext) {
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.make_test_websocket_draft("ws://socket.test/live");
+                let generation = state.begin_test_websocket();
+                state.push_test_websocket_frames(generation, 400, cx);
+            });
+        });
+        redraw(cx);
+        redraw(cx);
+
+        let track = cx
+            .debug_bounds("ws-frame-scrollbar")
+            .expect("an overflowing log shows a bar");
+        let thumb = cx
+            .debug_bounds("ws-frame-scrollbar-thumb")
+            .expect("the bar has a thumb");
+        assert!(
+            cx.debug_bounds("ws-frame-399").is_none(),
+            "the last frame starts outside the built range"
+        );
+
+        // Drag the thumb to the bottom. The first move crosses gpui's drag
+        // threshold; the following moves drive the offset.
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let y = (thumb.center().y + px(100. * step as f32)).min(track.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(thumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(thumb.center().x, track.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        redraw(cx);
+
+        let thumb = cx
+            .debug_bounds("ws-frame-scrollbar-thumb")
+            .expect("thumb at the end");
+        assert!(
+            (thumb.bottom() - track.bottom()).abs() <= px(2.),
+            "dragging the thumb to the bottom reaches the end of the track"
+        );
+        let last = cx
+            .debug_bounds("ws-frame-399")
+            .expect("the last frame is built once the log reaches its end");
+        assert!(
+            last.top() >= track.top() - px(1.) && last.bottom() <= track.bottom() + px(1.),
+            "the log's last frame is inside the viewport at the end"
+        );
+    }
+
+    /// An expanded payload that is both tall and wide scrolls on both axes,
+    /// and each bar moves only its own axis.
+    #[gpui::test]
+    async fn an_expanded_payload_scrolls_on_both_axes_independently(cx: &mut TestAppContext) {
+        let mut payload = "wide-".repeat(400);
+        for index in 1..100 {
+            payload.push_str(&format!("\nline {index}"));
+        }
+
+        let (_dir, view, cx) = shell_window(cx);
+        let state = shell_state(&view, cx);
+        cx.update(|_, app| {
+            state.update(app, |state, cx| {
+                state.make_test_websocket_draft("ws://socket.test/live");
+                let generation = state.begin_test_websocket();
+                state.push_test_websocket_payload(generation, &payload, cx);
+            });
+        });
+        redraw(cx);
+        click(cx, "ws-frame-0");
+        redraw(cx);
+        redraw(cx);
+
+        let vtrack = cx
+            .debug_bounds("ws-payload-scrollbar")
+            .expect("a tall payload shows a vertical bar");
+        let vthumb = cx
+            .debug_bounds("ws-payload-scrollbar-thumb")
+            .expect("the vertical bar has a thumb");
+        let htrack = cx
+            .debug_bounds("ws-payload-scrollbar-h")
+            .expect("a wide payload shows a horizontal bar");
+        let hthumb = cx
+            .debug_bounds("ws-payload-scrollbar-h-thumb")
+            .expect("the horizontal bar has a thumb");
+
+        // Drag the vertical thumb down; the horizontal thumb must not move.
+        cx.simulate_mouse_down(vthumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            vthumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=10 {
+            let y = (vthumb.center().y + px(40. * step as f32)).min(vtrack.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(vthumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(vthumb.center().x, vtrack.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        redraw(cx);
+
+        let v_moved = cx
+            .debug_bounds("ws-payload-scrollbar-thumb")
+            .expect("the vertical thumb after its drag");
+        assert!(
+            v_moved.top() > vthumb.top() + px(4.),
+            "the vertical drag moves the payload down"
+        );
+        assert_eq!(
+            cx.debug_bounds("ws-payload-scrollbar-h-thumb")
+                .expect("the horizontal thumb after the vertical drag"),
+            hthumb,
+            "the vertical drag leaves the horizontal offset alone"
+        );
+
+        // Drag the horizontal thumb right; the vertical thumb must not move.
+        cx.simulate_mouse_down(hthumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            hthumb.center() + point(px(4.), px(0.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=10 {
+            let x = (hthumb.center().x + px(80. * step as f32)).min(htrack.right() - px(2.));
+            cx.simulate_mouse_move(
+                point(x, hthumb.center().y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(htrack.right() - px(2.), hthumb.center().y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        redraw(cx);
+
+        let h_moved = cx
+            .debug_bounds("ws-payload-scrollbar-h-thumb")
+            .expect("the horizontal thumb after its drag");
+        assert!(
+            h_moved.left() > hthumb.left() + px(4.),
+            "the horizontal drag moves the payload sideways"
+        );
+        assert_eq!(
+            cx.debug_bounds("ws-payload-scrollbar-thumb")
+                .expect("the vertical thumb after the horizontal drag"),
+            v_moved,
+            "the horizontal drag leaves the vertical offset alone"
         );
     }
 
@@ -12600,6 +13117,95 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn an_empty_welcome_panel_shows_no_bar(cx: &mut TestAppContext) {
+        let (_dir, _view, cx) = welcome_window(cx);
+        redraw(cx);
+        redraw(cx);
+
+        assert!(cx.debug_bounds("welcome-panel").is_some());
+        assert!(
+            cx.debug_bounds("welcome-scrollbar").is_none(),
+            "the empty cover sheet fits the panel and takes no bar"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_busy_welcome_panel_shows_a_bar(cx: &mut TestAppContext) {
+        use bytes::Bytes;
+        use posthaste_core::history::HistoryEntry;
+        use posthaste_core::model::{HttpMethod, RequestSpec, ResponseRecord};
+
+        bind_editor_keys(cx);
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let requests: Vec<_> = (0..5)
+            .map(|index| {
+                store
+                    .create_request(&collection.id, &format!("Saved {index}"))
+                    .expect("request")
+            })
+            .collect();
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_on_boot(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+
+        // Opening each request fills the Recent list; closing them all returns
+        // to the welcome screen without leaving a tab.
+        for request in &requests {
+            cx.update(|_, app| {
+                state.update(app, |state, cx| state.open_saved_request(request.id, cx));
+            });
+        }
+        for _ in &requests {
+            cx.update(|_, app| {
+                state.update(app, |state, cx| state.close_active_tab(cx));
+            });
+        }
+        cx.update(|_, app| {
+            state.update(app, |state, _| {
+                for index in 0..5u64 {
+                    let mut spec = RequestSpec::new(format!("History {index}"));
+                    spec.method = HttpMethod::Get;
+                    spec.url = format!("http://example.test/{index}");
+                    state.record_test_history(HistoryEntry::completed(
+                        1_700_000_000_000 + index,
+                        &spec,
+                        &ResponseRecord {
+                            status: 200,
+                            headers: Vec::new(),
+                            body: Bytes::from_static(b"{}"),
+                            duration: Duration::from_millis(5),
+                            truncated: false,
+                            cookies: Vec::new(),
+                        },
+                    ));
+                }
+            });
+        });
+
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("welcome-recent").is_some(),
+            "the panel shows its Recent section"
+        );
+        assert!(
+            cx.debug_bounds("welcome-scrollbar").is_some(),
+            "a busy welcome outgrows the panel and shows a bar"
+        );
+        assert!(
+            cx.debug_bounds("welcome-scrollbar-thumb").is_some(),
+            "the bar has a thumb"
+        );
+    }
+
+    #[gpui::test]
     async fn a_recent_section_keeps_the_welcome_block_at_the_top(cx: &mut TestAppContext) {
         use bytes::Bytes;
         use posthaste_core::history::HistoryEntry;
@@ -14177,6 +14783,94 @@ mod tests {
         assert!(
             !copied.contains("cookie-secret"),
             "the cookie value is never copied: {copied}"
+        );
+    }
+
+    /// The inspector's body is capped at `TALL_BODY`, so a request with a full
+    /// header list outgrows it and takes a bar.
+    #[gpui::test]
+    async fn a_long_inspector_shows_a_bar(cx: &mut TestAppContext) {
+        use posthaste_core::model::KeyValue;
+
+        let dir = tempfile::tempdir().expect("temp workspace");
+        let store = WorkspaceStore::at(dir.path());
+        store.load().expect("bootstrap");
+        let collection = store.create_collection("Demo", 0).expect("collection");
+        let mut request = store
+            .create_request(&collection.id, "Long request")
+            .expect("request");
+        request.url = "https://example.test/items".to_owned();
+        request.headers = (0..40)
+            .map(|index| KeyValue::new(format!("X-Header-{index}"), "value"))
+            .collect();
+        store
+            .save_request(&collection.id, &request)
+            .expect("save request");
+
+        let shell_store = store.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppShell::new_with_store(window, cx, shell_store));
+        let state = shell_state(&view, cx);
+        click_row(cx, leaked(format!("collection-row-{}", collection.id)));
+        click_row(cx, leaked(format!("request-row-{}", request.id)));
+        assert_eq!(
+            cx.update(|_, app| state.read(app).opened_request()),
+            Some(request.id),
+            "the long request is the tab the inspector describes"
+        );
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+
+        open_inspector(cx);
+        cx.run_until_parked();
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("inspector-scrollbar").is_some(),
+            "a long description outgrows the dialog and shows a bar"
+        );
+        assert!(
+            cx.debug_bounds("inspector-scrollbar-thumb").is_some(),
+            "the bar has a thumb"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_settings_dialog_shows_a_bar_only_when_its_sections_overflow(
+        cx: &mut TestAppContext,
+    ) {
+        let preferences_dir = tempfile::tempdir().expect("temp preferences");
+        let (_workspace, view, cx) = settings_window(
+            cx,
+            posthaste_core::preferences::PreferencesStore::at(preferences_dir.path()),
+        );
+        let state = shell_state(&view, cx);
+
+        // A tall window gives every section room; the dialog needs no bar.
+        cx.simulate_resize(gpui::size(px(1080.), px(1200.)));
+        cx.run_until_parked();
+        open_settings(&state, cx);
+        redraw(cx);
+        assert!(cx.debug_bounds("settings-content").is_some());
+        assert!(
+            cx.debug_bounds("settings-scrollbar").is_none(),
+            "the sections fit a tall window and take no bar"
+        );
+
+        // The minimum window cuts the sections short, so the bar appears.
+        cx.simulate_resize(gpui::size(px(1080.), px(600.)));
+        cx.run_until_parked();
+        redraw(cx);
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("settings-scrollbar").is_some(),
+            "a short window outgrows the sections and shows a bar"
+        );
+        assert!(
+            cx.debug_bounds("settings-scrollbar-thumb").is_some(),
+            "the bar has a thumb"
         );
     }
 

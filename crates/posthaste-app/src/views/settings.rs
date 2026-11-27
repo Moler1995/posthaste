@@ -14,6 +14,7 @@ use crate::i18n::{self, Key, Lang};
 use crate::metrics::{TypeStyle as _, layout, space, type_role};
 use crate::theme;
 
+use super::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use super::text_input::TextInput;
 use super::ui;
 
@@ -49,22 +50,35 @@ pub(crate) fn settings_modal(state: Entity<AppState>, app: &AppState) -> AnyElem
     .close_selector("settings-close")
     .body(div().h(px(1.)).bg(theme::border::subtle()))
     .body(
-        div()
-            .id("settings-content")
-            .flex()
-            .flex_col()
-            .min_h_0()
-            .gap(layout::SECTION_GAP)
-            .overflow_y_scroll()
-            .child(appearance_section(section_state.clone(), &preferences))
-            .child(language_section(section_state.clone(), &preferences))
-            .child(requests_section(section_state.clone(), &numbers))
-            .child(editing_section(
-                section_state.clone(),
-                &preferences,
-                &numbers,
-            ))
-            .child(history_section(section_state, &numbers)),
+        // The sections grow past a short window; the wrapper gives the
+        // scrolling section a measured viewport for its bar.
+        scroll_frame(
+            state.clone(),
+            "settings-scrollbar",
+            ScrollSource::Handle(app.settings_scroll().clone()),
+            Scrollbars::VERTICAL,
+            div()
+                .id("settings-content")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap(layout::SECTION_GAP)
+                .overflow_y_scroll()
+                .track_scroll(app.settings_scroll())
+                .child(appearance_section(section_state.clone(), &preferences))
+                .child(language_section(section_state.clone(), &preferences))
+                .child(requests_section(section_state.clone(), &numbers))
+                .child(editing_section(
+                    section_state.clone(),
+                    &preferences,
+                    &numbers,
+                ))
+                .child(history_section(section_state, &numbers)),
+        )
+        .flex()
+        .flex_col()
+        .min_h_0(),
     )
     .body(div().h(px(1.)).bg(theme::border::subtle()))
     .body(

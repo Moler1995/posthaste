@@ -18,12 +18,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use gpui::{
-    AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
-    FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyBinding,
-    ListHorizontalSizingBehavior, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, Rgba, ScrollStrategy, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Task, UniformListScrollHandle, Window, actions, div, point,
-    px, uniform_list,
+    AnyElement, AppContext as _, ClipboardItem, Context, Div, DragMoveEvent, Entity, FocusHandle,
+    FontWeight, InteractiveElement, IntoElement, KeyBinding, ListHorizontalSizingBehavior,
+    MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Rgba,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Task, UniformListScrollHandle, Window, actions, div, point, px, uniform_list,
 };
 use posthaste_core::binary::{
     BinaryMeta, SNIFF_LIMIT as BINARY_SNIFF_LIMIT, attachment_name, classify, declared_binary,
@@ -43,6 +42,10 @@ use super::event_stream::{
     is_event_stream, sniff_event_stream,
 };
 use super::response_pane::BodyPreview;
+use super::scrollbar::{
+    ScrollSource, ScrollbarAxis, ScrollbarSpec, Scrollbars, scroll_frame, scrollbar,
+    scrollbar_thumb,
+};
 use super::text_input::TextInput;
 use super::text_selection::{Drag, Granularity};
 use super::ui::{EmptyStateScale, empty_state};
@@ -80,13 +83,6 @@ const TABLE_CELL_LIMIT: usize = 200;
 /// Width of one table column, in pixels.
 const TABLE_CELL_WIDTH: f32 = 180.;
 
-/// Height of the horizontal scrollbar strip under a code or table view.
-const HSCROLL_HEIGHT: Pixels = px(8.);
-
-/// Narrowest scrollbar thumb, so a very long line still leaves a grabbable
-/// control.
-const HSCROLL_MIN_THUMB: f32 = 24.;
-
 /// Most matching display rows a body search reports.
 const BODY_MATCH_LIMIT: usize = 10_000;
 
@@ -114,9 +110,9 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 /// cap only keeps a body with no line breaks from buffering the whole stream.
 const SNIFF_LIMIT: usize = 64 * 1024;
 
-/// A body list that can be scrolled sideways and whose text can be selected.
-/// The view mode decides most cases; a stream is its own target because its
-/// list exists only while the response is arriving.
+/// A body list that owns scroll state. The view mode decides most cases; a
+/// stream is its own target because its list exists only while the response is
+/// arriving. The Tree has a list but no selectable text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollTarget {
     Pretty,
@@ -128,6 +124,9 @@ enum ScrollTarget {
     /// The lossy text fallback of a binary body, shown only while View as text
     /// is active.
     BinaryText,
+    /// The JSON tree's virtualized rows. Its rows ellipsize, so it only ever
+    /// has vertical overflow.
+    Tree,
 }
 
 /// The selected text of one body view. Ranges index that view's [`CodeLines`],
@@ -169,18 +168,23 @@ struct HScrollDragState {
     start_offset: Pixels,
 }
 
-/// Width of the thumb and the distance it can travel along the track for a
-/// body whose content overflows the viewport by `max`. `None` when the content
-/// fits, which is also when the bar is not shown.
-fn hscroll_thumb(viewport: Pixels, max: Pixels) -> Option<(Pixels, Pixels)> {
-    if viewport <= px(0.) || max <= px(0.) {
-        return None;
-    }
-    let visible_share = f32::from(viewport) / f32::from(viewport + max);
-    let thumb = (viewport * visible_share)
-        .max(px(HSCROLL_MIN_THUMB))
-        .min(viewport);
-    Some((thumb, viewport - thumb))
+/// Measured vertical overflow of the active body list. Only populated after a
+/// frame has laid the list out, so the scrollbar appears on the following
+/// frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VScrollMetrics {
+    target: ScrollTarget,
+    viewport: Pixels,
+    max: Pixels,
+}
+
+/// The active vertical drag, the counterpart of [`HScrollDragState`]. Every
+/// move maps from the drag's origin so the thumb keeps pace with the pointer.
+#[derive(Debug, Clone, Copy)]
+struct VScrollDragState {
+    target: ScrollTarget,
+    start_y: Pixels,
+    start_offset: Pixels,
 }
 
 /// Columns a wrapped row may hold at `width`: the measured list width minus
@@ -273,11 +277,24 @@ pub(crate) fn scroll_drag_into_view(
 
 /// Drag payload for the scrollbar thumb. The preview is a zero-size view; the
 /// thumb itself stays in place while the list scrolls.
+#[derive(Clone)]
 struct HScrollDrag {
     target: ScrollTarget,
 }
 
 impl Render for HScrollDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
+    }
+}
+
+/// Drag payload for the vertical scrollbar thumb, mirroring [`HScrollDrag`].
+#[derive(Clone)]
+struct VScrollDrag {
+    target: ScrollTarget,
+}
+
+impl Render for VScrollDrag {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size(px(0.))
     }
@@ -993,6 +1010,12 @@ pub struct ResponseViewer {
     pretty_scroll: UniformListScrollHandle,
     raw_scroll: UniformListScrollHandle,
     table_scroll: UniformListScrollHandle,
+    tree_scroll: UniformListScrollHandle,
+    /// The Headers table's scroll position, kept so its bar reads and writes
+    /// the same region the wheel moves.
+    headers_scroll: ScrollHandle,
+    /// The Cookies table's scroll position, for the same reason.
+    cookies_scroll: ScrollHandle,
     /// Focused by a press in the body, so the copy shortcut reaches the
     /// selection.
     body_focus: FocusHandle,
@@ -1008,6 +1031,10 @@ pub struct ResponseViewer {
     /// layout so the scrollbar reflects the real content width.
     hscroll: Option<HScrollMetrics>,
     hscroll_drag: Option<HScrollDragState>,
+    /// Measured vertical overflow of the active body list, refreshed in the
+    /// same prepaint pass as the horizontal metrics.
+    vscroll: Option<VScrollMetrics>,
+    vscroll_drag: Option<VScrollDragState>,
     /// Display rows for the Raw view, rebuilt when a response arrives.
     raw_lines: Rc<CodeLines>,
     /// Whether long body lines wrap to the viewport.
@@ -1144,12 +1171,17 @@ impl ResponseViewer {
             pretty_scroll: UniformListScrollHandle::new(),
             raw_scroll: UniformListScrollHandle::new(),
             table_scroll: UniformListScrollHandle::new(),
+            tree_scroll: UniformListScrollHandle::new(),
+            headers_scroll: ScrollHandle::new(),
+            cookies_scroll: ScrollHandle::new(),
             body_focus: cx.focus_handle(),
             selection: None,
             selection_anchor: None,
             selection_drag: None,
             hscroll: None,
             hscroll_drag: None,
+            vscroll: None,
+            vscroll_drag: None,
             raw_lines: Rc::new(CodeLines::new("")),
             wrap_long_lines,
             wrap_width: None,
@@ -1329,6 +1361,8 @@ impl ResponseViewer {
         self.wrapped_pretty = None;
         self.hscroll = None;
         self.hscroll_drag = None;
+        self.vscroll = None;
+        self.vscroll_drag = None;
         self.streaming = None;
         self.completed = Some(Completed {
             headers,
@@ -1545,6 +1579,8 @@ impl ResponseViewer {
         self.cookies_selecting = false;
         self.hscroll = None;
         self.hscroll_drag = None;
+        self.vscroll = None;
+        self.vscroll_drag = None;
         self.tree_search.update(cx, |input, cx| {
             input.set_content_quiet("");
             input.set_accent(accent, cx);
@@ -1573,6 +1609,9 @@ impl ResponseViewer {
                 .base_handle
                 .set_offset(point(px(0.), px(0.)));
             scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        for scroll in [&self.headers_scroll, &self.cookies_scroll] {
+            scroll.set_offset(point(px(0.), px(0.)));
         }
     }
 
@@ -2038,6 +2077,16 @@ impl ResponseViewer {
             (ViewMode::Frames, _) => self
                 .frames_body()
                 .map(|_| (ScrollTarget::Frames, self.frames_scroll.clone())),
+            // A filtered tree with no matches renders no list, so the handle's
+            // stale metrics must not leave a bar floating over the notice.
+            (ViewMode::Tree, Some(parsed))
+                if !parsed
+                    .tree
+                    .filtered_rows(&self.search, &self.expanded)
+                    .is_empty() =>
+            {
+                Some((ScrollTarget::Tree, self.tree_scroll.clone()))
+            }
             (ViewMode::Tree, _) => None,
             (ViewMode::Table, Some(parsed)) if parsed.table.is_some() => {
                 Some((ScrollTarget::Table, self.table_scroll.clone()))
@@ -2063,7 +2112,7 @@ impl ResponseViewer {
                 .and_then(|stream| stream.frames.as_ref())
                 .map(|frames| frames.lines()),
             ScrollTarget::BinaryText => Some(self.binary_display_lines()),
-            ScrollTarget::Table => None,
+            ScrollTarget::Table | ScrollTarget::Tree => None,
         }
     }
 
@@ -2074,6 +2123,7 @@ impl ResponseViewer {
             ScrollTarget::Raw => Some(self.raw_scroll.clone()),
             ScrollTarget::Frames => Some(self.frames_scroll.clone()),
             ScrollTarget::Table => Some(self.table_scroll.clone()),
+            ScrollTarget::Tree => Some(self.tree_scroll.clone()),
             ScrollTarget::Streaming => self.streaming.as_ref().map(|stream| stream.scroll.clone()),
             ScrollTarget::StreamingFrames => self
                 .streaming
@@ -2083,22 +2133,32 @@ impl ResponseViewer {
         }
     }
 
-    /// Reads the active list's measured overflow after layout and repaints only
-    /// when the scrollbar's presence or geometry changed. The first frame after
-    /// a body appears has no scroll state yet, so the bar shows one frame later.
-    fn refresh_hscroll(&mut self, cx: &mut Context<Self>) {
+    /// Reads the active list's measured overflow on both axes after layout and
+    /// repaints only when either scrollbar's presence or geometry changed. The
+    /// first frame after a body appears has no scroll state yet, so the bars
+    /// show one frame later.
+    fn refresh_scrollbars(&mut self, cx: &mut Context<Self>) {
         let measured = self.active_hscroll().map(|(target, scroll)| {
             let state = scroll.0.borrow();
-            let viewport = state.base_handle.bounds().size.width;
-            let max = state.base_handle.max_offset().width;
-            (target, viewport, max)
+            let base = &state.base_handle;
+            (target, base.bounds().size, base.max_offset())
         });
-        let next = match measured {
-            Some((target, viewport, max)) if viewport > px(0.) && max > px(0.) => {
+        let next_h = match measured {
+            Some((target, viewport, max)) if viewport.width > px(0.) && max.width > px(0.) => {
                 Some(HScrollMetrics {
                     target,
-                    viewport,
-                    max,
+                    viewport: viewport.width,
+                    max: max.width,
+                })
+            }
+            _ => None,
+        };
+        let next_v = match measured {
+            Some((target, viewport, max)) if viewport.height > px(0.) && max.height > px(0.) => {
+                Some(VScrollMetrics {
+                    target,
+                    viewport: viewport.height,
+                    max: max.height,
                 })
             }
             _ => None,
@@ -2111,13 +2171,14 @@ impl ResponseViewer {
                 ScrollTarget::Pretty | ScrollTarget::Raw | ScrollTarget::BinaryText,
                 viewport,
                 _,
-            )) if viewport > px(0.) => Some(viewport),
+            )) if viewport.width > px(0.) => Some(viewport.width),
             _ => self.wrap_width,
         };
         let width_changed = self.wrap_long_lines && wrap_width != self.wrap_width;
         self.wrap_width = wrap_width;
-        if self.hscroll != next || width_changed {
-            self.hscroll = next;
+        if self.hscroll != next_h || self.vscroll != next_v || width_changed {
+            self.hscroll = next_h;
+            self.vscroll = next_v;
             cx.notify();
         }
     }
@@ -2146,74 +2207,106 @@ impl ResponseViewer {
         let metrics = self.hscroll.filter(|metrics| metrics.target == target)?;
         let viewport = metrics.viewport;
         let max = metrics.max;
-        let (thumb, travel) = hscroll_thumb(viewport, max)?;
-        let offset = scroll.0.borrow().base_handle.offset().x;
-        let progress = (f32::from(-offset) / f32::from(max)).clamp(0., 1.);
-        let left = px(f32::from(travel) * progress);
+        let (offset, origin) = {
+            let state = scroll.0.borrow();
+            let base = &state.base_handle;
+            (-base.offset().x, base.bounds().origin.x)
+        };
 
-        let click_scroll = scroll.clone();
-        let click_viewer = viewer.clone();
+        let press_scroll = scroll.clone();
+        let press_viewer = viewer.clone();
         // A press on the thumb starts the drag from a clean state, so a drag
         // that ended without a mouse-up cannot move the next one.
         let down_viewer = viewer;
-        let track = div()
-            .id("response-hscroll")
-            .debug_selector(|| "response-hscroll".to_owned())
-            .flex_none()
+        scrollbar(
+            ScrollbarSpec {
+                id: SharedString::from("response-hscroll"),
+                axis: ScrollbarAxis::Horizontal,
+                viewport,
+                max,
+                offset,
+                origin,
+                payload: HScrollDrag { target },
+            },
+            move |magnitude, cx| {
+                let state = press_scroll.0.borrow();
+                let y = state.base_handle.offset().y;
+                state.base_handle.set_offset(point(-magnitude, y));
+                drop(state);
+                press_viewer.update(cx, |_, cx| cx.notify());
+            },
+            move |cx| {
+                down_viewer.update(cx, |viewer, _| viewer.hscroll_drag = None);
+            },
+        )
+        .map(|bar| bar.into_any_element())
+    }
+
+    /// Wraps a body element so the vertical bar can float over its trailing
+    /// edge without taking part in the body's layout. The wrapper is the body's
+    /// own flex box, so a code list or a scrolling card fills it exactly as it
+    /// filled the viewport before.
+    fn with_vscrollbar(&self, body: AnyElement, viewer: Entity<ResponseViewer>) -> AnyElement {
+        div()
             .relative()
-            .w_full()
-            .h(HSCROLL_HEIGHT)
-            .rounded(px(4.))
-            .bg(theme::border::subtle())
-            .child(
-                div()
-                    .id("response-hscroll-thumb")
-                    .debug_selector(|| "response-hscroll-thumb".to_owned())
-                    .absolute()
-                    .left(left)
-                    .top(px(1.))
-                    .w(thumb)
-                    .h(HSCROLL_HEIGHT - px(2.))
-                    .rounded(px(3.))
-                    .bg(theme::border::strong())
-                    .hover(|style| style.bg(theme::text::tertiary()))
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        down_viewer.update(cx, |viewer, _| viewer.hscroll_drag = None);
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .on_drag(HScrollDrag { target }, |drag: &HScrollDrag, _, _, cx| {
-                        cx.new(|_| HScrollDrag {
-                            target: drag.target,
-                        })
-                    }),
-            )
-            .on_click(move |event: &ClickEvent, _, cx| {
-                let ClickEvent::Mouse(event) = event else {
-                    return;
-                };
-                let (track_left, y) = {
-                    let state = click_scroll.0.borrow();
-                    let base = &state.base_handle;
-                    (base.bounds().origin.x, base.offset().y)
-                };
-                // A press outside the track's own span is not a track press;
-                // ignoring it keeps a misfiring click from pinning the body to
-                // its start.
-                let local = event.down.position.x - track_left;
-                if local < px(0.) || local > viewport {
-                    return;
-                }
-                let x = (local - thumb / 2.).clamp(px(0.), travel);
-                let target = px(-f32::from(max) * (f32::from(x) / f32::from(travel)));
-                click_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .set_offset(point(target, y));
-                click_viewer.update(cx, |_, cx| cx.notify());
-            });
-        Some(track.into_any_element())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(body)
+            .children(self.vscrollbar(viewer))
+            .into_any_element()
+    }
+
+    /// The vertical scrollbar for the active body list, or `None` while the
+    /// content fits. The track is as tall as the list's measured viewport and
+    /// starts at the code body's top inset, so it stops above the horizontal
+    /// bar. The thumb reflects the visible share and the current offset;
+    /// pressing the track centers the thumb under the pointer, and dragging
+    /// the thumb keeps it under the pointer through `on_drag`.
+    fn vscrollbar(&self, viewer: Entity<ResponseViewer>) -> Option<AnyElement> {
+        let (target, scroll) = self.active_hscroll()?;
+        let metrics = self.vscroll.filter(|metrics| metrics.target == target)?;
+        let viewport = metrics.viewport;
+        let max = metrics.max;
+        let (offset, origin) = {
+            let state = scroll.0.borrow();
+            let base = &state.base_handle;
+            (-base.offset().y, base.bounds().origin.y)
+        };
+
+        let press_scroll = scroll.clone();
+        let press_viewer = viewer.clone();
+        // A press on the thumb starts the drag from a clean state, so a drag
+        // that ended without a mouse-up cannot move the next one.
+        let down_viewer = viewer;
+        scrollbar(
+            ScrollbarSpec {
+                id: SharedString::from("response-vscroll"),
+                axis: ScrollbarAxis::Vertical,
+                viewport,
+                max,
+                offset,
+                origin,
+                payload: VScrollDrag { target },
+            },
+            move |magnitude, cx| {
+                let state = press_scroll.0.borrow();
+                let x = state.base_handle.offset().x;
+                state.base_handle.set_offset(point(x, -magnitude));
+                drop(state);
+                press_viewer.update(cx, |_, cx| cx.notify());
+            },
+            move |cx| {
+                down_viewer.update(cx, |viewer, _| viewer.vscroll_drag = None);
+            },
+        )
+        .map(|bar| {
+            bar.absolute()
+                .top(space::S4)
+                .right(space::S4)
+                .into_any_element()
+        })
     }
 
     /// Turns thumb movement into a horizontal offset. `on_drag` keeps the moves
@@ -2238,7 +2331,7 @@ impl ResponseViewer {
         let Some(metrics) = self.hscroll.filter(|metrics| metrics.target == target) else {
             return;
         };
-        let Some((_, travel)) = hscroll_thumb(metrics.viewport, metrics.max) else {
+        let Some((_, travel)) = scrollbar_thumb(metrics.viewport, metrics.max) else {
             return;
         };
         let x = event.event.position.x;
@@ -2271,6 +2364,62 @@ impl ResponseViewer {
                 .borrow()
                 .base_handle
                 .set_offset(point(next, offset.y));
+            cx.notify();
+        }
+    }
+
+    /// Turns vertical thumb movement into a vertical offset, mirroring
+    /// [`Self::drag_hscroll`]. The offset is stored on the same axis the wheel
+    /// uses, so the thumb follows both gestures without a metric change.
+    fn drag_vscroll(
+        &mut self,
+        event: &DragMoveEvent<VScrollDrag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drag_target = event.drag(cx).target;
+        let Some((target, scroll)) = self.active_hscroll() else {
+            return;
+        };
+        if target != drag_target {
+            return;
+        }
+        let Some(metrics) = self.vscroll.filter(|metrics| metrics.target == target) else {
+            return;
+        };
+        let Some((_, travel)) = scrollbar_thumb(metrics.viewport, metrics.max) else {
+            return;
+        };
+        let y = event.event.position.y;
+        let (offset, max) = {
+            let state = scroll.0.borrow();
+            let base = &state.base_handle;
+            (base.offset(), base.max_offset().height)
+        };
+        if max <= px(0.) {
+            return;
+        }
+        let state = match self.vscroll_drag {
+            Some(state) if state.target == target => state,
+            // The first move of a drag only records where it began; the thumb's
+            // mouse-down cleared the previous drag's state.
+            _ => {
+                self.vscroll_drag = Some(VScrollDragState {
+                    target,
+                    start_y: y,
+                    start_offset: offset.y,
+                });
+                return;
+            }
+        };
+        let scale = f32::from(max) / f32::from(travel);
+        let next = (state.start_offset - (y - state.start_y) * scale).clamp(-max, px(0.));
+        if next != offset.y {
+            scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(offset.x, next));
             cx.notify();
         }
     }
@@ -4007,6 +4156,7 @@ fn tree_view(
     rows: Vec<VisibleRow>,
     viewer: Entity<ResponseViewer>,
     copied: Option<CopyTarget>,
+    scroll: UniformListScrollHandle,
 ) -> AnyElement {
     let rows = Rc::new(rows);
     let count = rows.len();
@@ -4017,7 +4167,8 @@ fn tree_view(
     })
     .debug_selector(|| "response-tree".to_owned())
     .flex_1()
-    .min_h_0();
+    .min_h_0()
+    .track_scroll(scroll);
 
     div()
         .id("response-body")
@@ -4154,18 +4305,19 @@ fn headers_view(
     header_key: Rgba,
     copied: Option<CopyTarget>,
     viewer: Entity<ResponseViewer>,
+    scroll: &ScrollHandle,
 ) -> AnyElement {
-    let scroll = div()
+    let scroller = div()
         .id("response-headers")
         .debug_selector(|| "response-headers".to_owned())
-        .flex_1()
-        .min_h_0()
+        .size_full()
         .overflow_scroll()
+        .track_scroll(scroll)
         .px(layout::PANE_PADDING)
         .py(space::S4);
 
-    if headers.is_empty() {
-        scroll
+    let body: AnyElement = if headers.is_empty() {
+        scroller
             .child(
                 empty_state("response-headers-empty", EmptyStateScale::Table)
                     .title(i18n::t(Key::ResponseHeadersEmpty))
@@ -4178,7 +4330,7 @@ fn headers_view(
         // rather than wrap, so a long header never overlaps the
         // row below or runs into the copy action; the row's
         // tooltip carries the full text.
-        scroll
+        scroller
             .child(
                 div()
                     .flex()
@@ -4254,7 +4406,17 @@ fn headers_view(
                     })),
             )
             .into_any_element()
-    }
+    };
+    scroll_frame(
+        viewer,
+        "response-headers-scrollbar",
+        ScrollSource::Handle(scroll.clone()),
+        Scrollbars::VERTICAL,
+        body,
+    )
+    .flex_1()
+    .min_h_0()
+    .into_any_element()
 }
 
 /// The response's cookie table in display order. The domain is not a column:
@@ -4512,15 +4674,16 @@ fn cookies_view(
     selection: Option<CookieSelection>,
     focus: &FocusHandle,
     viewer: &Entity<ResponseViewer>,
+    scroll: &ScrollHandle,
 ) -> AnyElement {
     let accent = theme::http_method(method);
     let copy_viewer = viewer.clone();
-    let scroll = div()
+    let scroller = div()
         .id("response-cookies")
         .debug_selector(|| "response-cookies".to_owned())
-        .flex_1()
-        .min_h_0()
+        .size_full()
         .overflow_scroll()
+        .track_scroll(scroll)
         .track_focus(focus)
         .on_key_down(move |event, _, cx| {
             // Cells cannot host a text selection, so the table owns the
@@ -4543,13 +4706,23 @@ fn cookies_view(
         .py(space::S4);
 
     if cookies.is_empty() {
-        return scroll
+        let body = scroller
             .child(
                 empty_state("response-cookies-empty", EmptyStateScale::Table)
                     .title(i18n::t(Key::ResponseCookiesEmpty))
                     .into_any_element(),
             )
             .into_any_element();
+        return scroll_frame(
+            viewer.clone(),
+            "response-cookies-scrollbar",
+            ScrollSource::Handle(scroll.clone()),
+            Scrollbars::VERTICAL,
+            body,
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element();
     }
 
     let floors = cookie_column_floors();
@@ -4605,7 +4778,17 @@ fn cookies_view(
                 .child(i18n::t(Key::CookiesHistoryValuesNote)),
         );
     }
-    scroll.child(content).into_any_element()
+    let body = scroller.child(content).into_any_element();
+    scroll_frame(
+        viewer.clone(),
+        "response-cookies-scrollbar",
+        ScrollSource::Handle(scroll.clone()),
+        Scrollbars::VERTICAL,
+        body,
+    )
+    .flex_1()
+    .min_h_0()
+    .into_any_element()
 }
 
 /// One cookie row: six selectable cells sharing the table's selection state.
@@ -5017,6 +5200,7 @@ impl ResponseViewer {
                 };
                 let prepaint_viewer = viewer.clone();
                 let drag_viewer = viewer.clone();
+                let vdrag_viewer = viewer.clone();
                 let wheel_viewer = viewer.clone();
                 div()
                     .id("response-streaming-region")
@@ -5032,7 +5216,7 @@ impl ResponseViewer {
                                 let viewer = prepaint_viewer.clone();
                                 cx.defer(move |cx| {
                                     viewer.update(cx, |viewer, cx| {
-                                        viewer.refresh_hscroll(cx);
+                                        viewer.refresh_scrollbars(cx);
                                     });
                                 });
                             })
@@ -5048,6 +5232,11 @@ impl ResponseViewer {
                             .on_drag_move::<HScrollDrag>(move |event, window, cx| {
                                 drag_viewer.update(cx, |viewer, cx| {
                                     viewer.drag_hscroll(event, window, cx);
+                                });
+                            })
+                            .on_drag_move::<VScrollDrag>(move |event, window, cx| {
+                                vdrag_viewer.update(cx, |viewer, cx| {
+                                    viewer.drag_vscroll(event, window, cx);
                                 });
                             })
                             .on_scroll_wheel(move |event, window, cx| {
@@ -5071,13 +5260,17 @@ impl ResponseViewer {
                                     });
                                 }
                             })
-                            .child(body),
+                            .child(self.with_vscrollbar(body, viewer.clone())),
                     )
                     .into_any_element()
             }
-            ResponseSection::Headers => {
-                headers_view(&stream.headers, accent, self.copied, viewer.clone())
-            }
+            ResponseSection::Headers => headers_view(
+                &stream.headers,
+                accent,
+                self.copied,
+                viewer.clone(),
+                &self.headers_scroll,
+            ),
             // The headers may set cookies, but the jar only reports them once
             // the response ends, so the tab explains the wait.
             ResponseSection::Cookies => cookies_waiting_view(),
@@ -5563,6 +5756,7 @@ impl ResponseViewer {
                 theme::http_method(self.method),
                 self.copied,
                 viewer.clone(),
+                &self.headers_scroll,
             ),
             ResponseSection::Cookies => cookies_view(
                 &view.completed.cookies,
@@ -5571,6 +5765,7 @@ impl ResponseViewer {
                 self.cookies_selection,
                 &self.cookies_focus,
                 &viewer,
+                &self.cookies_scroll,
             ),
         }
     }
@@ -5665,6 +5860,7 @@ impl ResponseViewer {
 
         let prepaint_viewer = viewer.clone();
         let drag_viewer = viewer.clone();
+        let vdrag_viewer = viewer.clone();
         let wheel_viewer = viewer.clone();
         div()
             .id("response-body-region")
@@ -5680,7 +5876,7 @@ impl ResponseViewer {
                         let viewer = prepaint_viewer.clone();
                         cx.defer(move |cx| {
                             viewer.update(cx, |viewer, cx| {
-                                viewer.refresh_hscroll(cx);
+                                viewer.refresh_scrollbars(cx);
                             });
                         });
                     })
@@ -5696,6 +5892,11 @@ impl ResponseViewer {
                     .on_drag_move::<HScrollDrag>(move |event, window, cx| {
                         drag_viewer.update(cx, |viewer, cx| {
                             viewer.drag_hscroll(event, window, cx);
+                        });
+                    })
+                    .on_drag_move::<VScrollDrag>(move |event, window, cx| {
+                        vdrag_viewer.update(cx, |viewer, cx| {
+                            viewer.drag_vscroll(event, window, cx);
                         });
                     })
                     .on_scroll_wheel(move |event, window, cx| {
@@ -5720,7 +5921,7 @@ impl ResponseViewer {
                         }
                     })
                     .children(file_bar)
-                    .child(body),
+                    .child(self.with_vscrollbar(body, viewer.clone())),
             )
             .into_any_element()
     }
@@ -5794,7 +5995,7 @@ impl ResponseViewer {
                         .child(i18n::t(Key::CommonNoMatches))
                         .into_any_element()
                 } else {
-                    tree_view(rows, viewer.clone(), self.copied)
+                    tree_view(rows, viewer.clone(), self.copied, self.tree_scroll.clone())
                 }
             }
             (ViewMode::Table, Some(parsed)) => match &parsed.table {
@@ -5844,10 +6045,12 @@ fn format_count(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::scrollbar::SCROLLBAR_THICKNESS;
     use std::time::Duration;
 
     use gpui::{
-        Modifiers, Point, ScrollDelta, Size, TestAppContext, TouchPhase, VisualTestContext,
+        Modifiers, MouseDownEvent, Point, ScrollDelta, Size, TestAppContext, TouchPhase,
+        VisualTestContext,
     };
     use posthaste_core::history::StoredResponse;
     use posthaste_core::model::ResponseRecord;
@@ -6017,11 +6220,12 @@ mod tests {
         response: &ResponseRecord,
     ) {
         let headers = response.headers.clone();
+        let cookies = response.cookies.clone();
         let preview = preview_body(response);
         let retained = response.body.clone();
         cx.update(|_, app| {
             viewer.update(app, |viewer, cx| {
-                viewer.show(headers, Vec::new(), preview, retained, HttpMethod::Get, cx);
+                viewer.show(headers, cookies, preview, retained, HttpMethod::Get, cx);
             });
         });
         redraw(cx);
@@ -6606,6 +6810,76 @@ mod tests {
         assert!(
             cx.debug_bounds("response-cookies-empty").is_some(),
             "a response that set no cookies has an empty state"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_long_headers_table_shows_a_bar_and_a_short_one_hides_it(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let many: Vec<(String, String)> = (0..60)
+            .map(|index| (format!("x-header-{index}"), "value".to_owned()))
+            .collect();
+        show_with_headers(&viewer, cx, many, b"ok", false);
+        click(cx, "response-tab-headers");
+        settle(cx);
+
+        let track = cx
+            .debug_bounds("response-headers-scrollbar")
+            .expect("an overflowing header table shows a bar");
+        let thumb = cx
+            .debug_bounds("response-headers-scrollbar-thumb")
+            .expect("the bar has a thumb");
+        assert_eq!(
+            thumb.top(),
+            track.top(),
+            "a table that has not scrolled starts with its thumb at the top"
+        );
+
+        show_with_headers(
+            &viewer,
+            cx,
+            vec![("content-type".into(), "text/plain".into())],
+            b"ok",
+            false,
+        );
+        click(cx, "response-tab-headers");
+        settle(cx);
+        assert!(
+            cx.debug_bounds("response-headers-scrollbar").is_none(),
+            "a header table that fits shows no bar"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_long_cookies_table_shows_a_bar_and_a_short_one_hides_it(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let mut record = response(b"ok", false);
+        record.cookies = (0..40)
+            .map(|index| cookie(&format!("c{index}"), Some("value"), None, false))
+            .collect();
+        present(&viewer, cx, &record);
+        click(cx, "response-tab-cookies");
+        settle(cx);
+
+        let track = cx
+            .debug_bounds("response-cookies-scrollbar")
+            .expect("an overflowing cookie table shows a bar");
+        let thumb = cx
+            .debug_bounds("response-cookies-scrollbar-thumb")
+            .expect("the bar has a thumb");
+        assert_eq!(
+            thumb.top(),
+            track.top(),
+            "a table that has not scrolled starts with its thumb at the top"
+        );
+
+        record.cookies = vec![cookie("session", Some("abc"), None, false)];
+        present(&viewer, cx, &record);
+        click(cx, "response-tab-cookies");
+        settle(cx);
+        assert!(
+            cx.debug_bounds("response-cookies-scrollbar").is_none(),
+            "a cookie table that fits shows no bar"
         );
     }
 
@@ -7803,6 +8077,11 @@ mod tests {
         let first = cx
             .debug_bounds("response-raw-body-gutter-0")
             .expect("gutter on the first line");
+        let viewport = cx.debug_bounds("response-viewport").expect("body viewport");
+        assert_eq!(
+            first.origin.x, viewport.origin.x,
+            "the gutter meets the surface's leading edge"
+        );
         for selector in [
             "response-raw-body-gutter-1",
             "response-raw-body-gutter-2",
@@ -7844,7 +8123,7 @@ mod tests {
         let track = cx
             .debug_bounds("response-hscroll")
             .expect("wide raw body scrollbar");
-        assert_eq!(track.size.height, HSCROLL_HEIGHT);
+        assert_eq!(track.size.height, SCROLLBAR_THICKNESS);
         let thumb = cx
             .debug_bounds("response-hscroll-thumb")
             .expect("scrollbar thumb");
@@ -7919,14 +8198,456 @@ mod tests {
             cx.debug_bounds("response-hscroll").is_none(),
             "a body that fits shows no scrollbar"
         );
+        assert!(
+            cx.debug_bounds("response-vscroll").is_none(),
+            "a body that fits in height shows no vertical scrollbar"
+        );
         let viewport = cx.debug_bounds("response-viewport").expect("body viewport");
         let line = cx
             .debug_bounds("response-raw-body-line-0")
             .expect("first text row");
         assert_eq!(
-            line.origin.x - viewport.origin.x,
-            space::S12,
-            "the text keeps its inset from the code surface"
+            line.origin.x, viewport.origin.x,
+            "the gutter meets the code surface's leading edge"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_tall_body_gets_a_draggable_vertical_scrollbar(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let body = "line\n".repeat(200);
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+
+        let track = cx
+            .debug_bounds("response-vscroll")
+            .expect("tall raw body scrollbar");
+        assert_eq!(track.size.width, SCROLLBAR_THICKNESS);
+        assert_eq!(
+            track.origin.y,
+            cx.debug_bounds("response-raw-body").unwrap().origin.y
+        );
+        let thumb = cx
+            .debug_bounds("response-vscroll-thumb")
+            .expect("vertical thumb");
+        assert_eq!(thumb.origin.x, track.origin.x + px(1.));
+        assert!(
+            thumb.size.height < track.size.height,
+            "the thumb is shorter than its track"
+        );
+        let metrics = cx
+            .update(|_, app| viewer.read(app).vscroll)
+            .expect("vertical metrics");
+        let expected = f32::from(metrics.viewport)
+            * (f32::from(metrics.viewport) / f32::from(metrics.viewport + metrics.max));
+        assert!(
+            (f32::from(thumb.size.height) - expected).abs() < 1.,
+            "the thumb shows the visible share of the body"
+        );
+        let max = cx.update(|_, app| list_max(&viewer.read(app).raw_scroll).height);
+        assert!(max > px(0.), "the rows overflow the viewport");
+
+        // Pressing the track near its bottom jumps to the end.
+        cx.simulate_click(
+            point(track.center().x, track.bottom() - px(2.)),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| list_offset(&viewer.read(app).raw_scroll).y),
+            -max,
+            "the track click reaches the last row"
+        );
+
+        // With the thumb at the far bottom, a press near the top is track.
+        cx.simulate_click(
+            point(track.center().x, track.top() + px(2.)),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| list_offset(&viewer.read(app).raw_scroll).y),
+            px(0.)
+        );
+
+        // Drag the thumb to the bottom. The first move crosses gpui's drag
+        // threshold; the following moves drive the offset.
+        let thumb = cx
+            .debug_bounds("response-vscroll-thumb")
+            .expect("thumb at the start");
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let y = (thumb.center().y + px(100. * step as f32)).min(track.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(thumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(thumb.center().x, track.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| list_offset(&viewer.read(app).raw_scroll).y),
+            -max,
+            "dragging the thumb to the bottom reaches the last row"
+        );
+    }
+
+    #[gpui::test]
+    async fn both_bars_can_show_and_move_independently(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let line = "x".repeat(600);
+        let body = format!("{line}\n").repeat(200);
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+
+        let htrack = cx.debug_bounds("response-hscroll").expect("horizontal bar");
+        let vtrack = cx.debug_bounds("response-vscroll").expect("vertical bar");
+        assert!(
+            htrack.top() >= vtrack.bottom(),
+            "the vertical track stops above the horizontal bar"
+        );
+        let max = cx.update(|_, app| list_max(&viewer.read(app).raw_scroll));
+
+        // Drag the vertical thumb to the end; the x offset must not follow.
+        let thumb = cx
+            .debug_bounds("response-vscroll-thumb")
+            .expect("vertical thumb");
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(0.), px(4.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let y = (thumb.center().y + px(100. * step as f32)).min(vtrack.bottom() - px(2.));
+            cx.simulate_mouse_move(
+                point(thumb.center().x, y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(thumb.center().x, vtrack.bottom() - px(2.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        let offset = cx.update(|_, app| list_offset(&viewer.read(app).raw_scroll));
+        assert_eq!(offset.y, -max.height, "the vertical drag reaches the end");
+        assert_eq!(
+            offset.x,
+            px(0.),
+            "the vertical drag leaves the horizontal offset alone"
+        );
+
+        // Drag the horizontal thumb to the end; the y offset must not follow.
+        let thumb = cx
+            .debug_bounds("response-hscroll-thumb")
+            .expect("horizontal thumb");
+        cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            thumb.center() + point(px(4.), px(0.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        for step in 1..=20 {
+            let x = (thumb.center().x + px(100. * step as f32)).min(htrack.right() - px(2.));
+            cx.simulate_mouse_move(
+                point(x, thumb.center().y),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+        }
+        cx.simulate_mouse_up(
+            point(htrack.right() - px(2.), thumb.center().y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        redraw(cx);
+        let offset = cx.update(|_, app| list_offset(&viewer.read(app).raw_scroll));
+        assert_eq!(offset.x, -max.width, "the horizontal drag reaches the end");
+        assert_eq!(
+            offset.y, -max.height,
+            "the horizontal drag leaves the vertical offset alone"
+        );
+    }
+
+    #[gpui::test]
+    async fn every_list_view_offers_the_vertical_bar(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let items: Vec<String> = (0..200).map(|n| format!("{{\"n\":{n}}}")).collect();
+        let body = format!("[{}]", items.join(","));
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).mode()),
+            ViewMode::Pretty
+        );
+        assert!(
+            cx.debug_bounds("response-vscroll").is_some(),
+            "Pretty offers the vertical bar"
+        );
+
+        click(cx, "response-view-table");
+        settle(cx);
+        assert!(
+            cx.debug_bounds("response-vscroll").is_some(),
+            "Table offers the vertical bar"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).vscroll.map(|metrics| metrics.target)),
+            Some(ScrollTarget::Table),
+            "the bar follows the active view's list"
+        );
+
+        click(cx, "response-view-raw");
+        settle(cx);
+        assert!(
+            cx.debug_bounds("response-vscroll").is_some(),
+            "Raw offers the vertical bar"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_streaming_body_offers_the_vertical_bar(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let headers = vec![("content-type".into(), "text/plain".into())];
+        start_streaming(&viewer, cx, 200, headers);
+        append(&viewer, cx, "line\n".repeat(200).as_bytes());
+        settle(cx);
+
+        assert!(
+            cx.debug_bounds("response-vscroll").is_some(),
+            "the live body shows the vertical bar"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).vscroll.map(|metrics| metrics.target)),
+            Some(ScrollTarget::Streaming)
+        );
+    }
+
+    #[gpui::test]
+    async fn a_tall_tree_offers_only_the_vertical_bar(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let items: Vec<String> = (0..100).map(|n| format!("\"k{n}\":{n}")).collect();
+        let body = format!("{{{}}}", items.join(","));
+        show(&viewer, cx, body.as_bytes(), false);
+        click(cx, "response-view-tree");
+        settle(cx);
+
+        assert_eq!(cx.update(|_, app| viewer.read(app).mode()), ViewMode::Tree);
+        assert!(
+            cx.debug_bounds("response-vscroll").is_some(),
+            "a tall tree shows the vertical bar"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).vscroll.map(|metrics| metrics.target)),
+            Some(ScrollTarget::Tree),
+            "the tree has its own scroll handle"
+        );
+        assert!(
+            cx.debug_bounds("response-hscroll").is_none(),
+            "tree rows ellipsize, so there is no horizontal bar"
+        );
+        let max = cx.update(|_, app| list_max(&viewer.read(app).tree_scroll).height);
+        assert!(max > px(0.), "the tree rows overflow the viewport");
+    }
+
+    /// Scrolls the list sideways without a click, so the pinned gutter can be
+    /// checked at an offset the text has moved under.
+    fn set_x_offset(scroll: &UniformListScrollHandle, x: Pixels) {
+        let state = scroll.0.borrow();
+        let y = state.base_handle.offset().y;
+        state.base_handle.set_offset(point(x, y));
+    }
+
+    #[gpui::test]
+    async fn the_gutter_stays_at_the_leading_edge_while_the_body_scrolls(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let long = "x".repeat(1_200);
+        let body = format!("alpha\n{long}\nomega");
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+
+        let viewport = cx.debug_bounds("response-viewport").expect("body viewport");
+        let rest = cx
+            .debug_bounds("response-raw-body-gutter-0")
+            .expect("gutter at rest");
+        assert_eq!(
+            rest.origin.x, viewport.origin.x,
+            "the gutter meets the surface's leading edge at rest"
+        );
+
+        cx.update(|_, app| {
+            set_x_offset(&viewer.read(app).raw_scroll, px(-200.));
+        });
+        redraw(cx);
+
+        let scrolled = cx
+            .debug_bounds("response-raw-body-gutter-0")
+            .expect("gutter while scrolled");
+        assert_eq!(
+            scrolled.origin.x, viewport.origin.x,
+            "the gutter stays at the leading edge while the text scrolls"
+        );
+        let line = cx
+            .debug_bounds("response-raw-body-line-1")
+            .expect("second text row");
+        assert_eq!(
+            line.origin.x,
+            viewport.origin.x - px(200.),
+            "the text moves beneath the pinned gutter"
+        );
+        let code = cx
+            .debug_bounds("response-raw-body-code-1")
+            .expect("second text cell");
+        assert_eq!(
+            code.origin.x - line.origin.x,
+            scrolled.size.width,
+            "the text still starts after the gutter in the row's flow"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_press_in_the_pinned_gutter_leaves_the_selection_alone(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let body = "a".repeat(6_000);
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+
+        // Start with a real selection, so a gutter press has something to
+        // leave alone rather than merely failing to create one.
+        let before = press_body(&viewer, cx, ScrollTarget::Raw, 120, 3)
+            .expect("a triple click selects the logical line");
+        assert_eq!(before.range, 0..body.len());
+
+        cx.update(|_, app| {
+            set_x_offset(&viewer.read(app).raw_scroll, px(-600.));
+        });
+        redraw(cx);
+        let gutter = cx
+            .debug_bounds("response-raw-body-gutter-0")
+            .expect("pinned gutter");
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: gutter.center(),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        redraw(cx);
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).selection.clone()),
+            Some(before),
+            "a gutter press neither starts nor extends a selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_drag_across_the_pinned_gutter_stays_on_visible_text(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let body = "a".repeat(6_000);
+        show(&viewer, cx, body.as_bytes(), false);
+        settle(cx);
+        cx.update(|_, app| {
+            set_x_offset(&viewer.read(app).raw_scroll, px(-600.));
+        });
+        redraw(cx);
+
+        let gutter = cx
+            .debug_bounds("response-raw-body-gutter-0")
+            .expect("pinned gutter");
+        // The byte at the gutter's trailing edge is the first one the text
+        // shows once the pinned column is accounted for.
+        let first_visible = cx.update(|window, app| {
+            let viewer = viewer.read(app);
+            let lines = viewer.active_code_lines().expect("raw rows");
+            let state = viewer.raw_scroll.0.borrow();
+            let base = &state.base_handle;
+            offset_for_point(
+                &lines,
+                base.bounds(),
+                base.offset(),
+                point(gutter.right(), gutter.center().y),
+                window,
+            )
+        });
+        assert!(
+            first_visible > 0,
+            "the text has scrolled away from byte zero"
+        );
+
+        let press = point(gutter.right() + px(120.), gutter.center().y);
+        cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            gutter.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(gutter.center(), MouseButton::Left, Modifiers::default());
+        redraw(cx);
+
+        let selection = cx
+            .update(|_, app| viewer.read(app).selection.clone())
+            .expect("a drag that starts on the text selects");
+        assert_eq!(selection.target, ScrollTarget::Raw);
+        assert_eq!(
+            selection.range.start, first_visible,
+            "the drag clamps to the first visible byte instead of selecting under the gutter"
+        );
+        assert!(selection.range.end > first_visible);
+    }
+
+    #[gpui::test]
+    async fn a_wrapped_body_resplits_at_the_lists_wider_width(cx: &mut TestAppContext) {
+        let (viewer, cx) = viewer_window(cx);
+        let body = "x".repeat(4_000);
+        show(&viewer, cx, body.as_bytes(), false);
+        set_wrap(&viewer, cx, true);
+
+        let viewport = cx.debug_bounds("response-viewport").expect("body viewport");
+        let list = cx.debug_bounds("response-raw-body").expect("raw body list");
+        assert_eq!(
+            list.origin.x, viewport.origin.x,
+            "the list has no leading inset"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).wrap_width),
+            Some(list.size.width),
+            "the refresh records the list's full width for wrapping"
+        );
+        let narrow_rows = display_rows(&viewer, cx).row_count();
+
+        let window = cx.update(|window, _| window.viewport_size());
+        cx.simulate_resize(gpui::size(window.width + px(600.), window.height));
+        settle(cx);
+
+        let wider = cx
+            .debug_bounds("response-raw-body")
+            .expect("widened raw list");
+        assert_eq!(
+            wider.size.width,
+            list.size.width + px(600.),
+            "the list grows with the window"
+        );
+        assert_eq!(
+            cx.update(|_, app| viewer.read(app).wrap_width),
+            Some(wider.size.width),
+            "the next refresh records the wider list"
+        );
+        assert!(
+            display_rows(&viewer, cx).row_count() < narrow_rows,
+            "the wrapped rows re-split at the wider list"
         );
     }
 

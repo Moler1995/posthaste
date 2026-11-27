@@ -474,9 +474,10 @@ pub(crate) const RESPONSE_BODY_CHROME: CodeChrome = CodeChrome {
 ///
 /// The wrapper keeps the `response-body` selector used by the shared body
 /// layout; the list carries the mode-specific selector
-/// (`response-pretty-body` / `response-raw-body`). A view that passes
-/// [`RowLabels`] gains its label/payload text hierarchy and a hover affordance
-/// on its rows; the other views pass `None`.
+/// (`response-pretty-body` / `response-raw-body`). The body has no left inset,
+/// so the line-number gutter meets the code surface's leading edge. A view that
+/// passes [`RowLabels`] gains its label/payload text hierarchy and a hover
+/// affordance on its rows; the other views pass `None`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn code_view(
     id: &'static str,
@@ -524,9 +525,17 @@ pub(crate) fn code_view_with(
         .as_ref()
         .and_then(|interaction| interaction.caret);
     let press_lines = lines.clone();
+    // Read once per visible range, not per row: every row in one paint shares
+    // the list's current horizontal offset, which pins the gutter.
+    let row_scroll = scroll.clone();
 
     let list = uniform_list(id, count, move |range, window, _cx| {
         let gutter = gutter_width(window, lines.line_count());
+        let offset_x = row_scroll
+            .0
+            .try_borrow()
+            .map(|state| state.base_handle.offset().x)
+            .unwrap_or(px(0.));
         range
             .map(|index| {
                 row(
@@ -539,6 +548,7 @@ pub(crate) fn code_view_with(
                     selection.clone(),
                     caret,
                     gutter,
+                    offset_x,
                     window,
                 )
             })
@@ -562,8 +572,10 @@ pub(crate) fn code_view_with(
         .flex_col()
         .gap(space::S2)
         // The viewport supplies the pane inset; this is the text's own inset
-        // from the code surface.
-        .px(space::S12)
+        // from the code surface. The left inset is zero so the line-number
+        // gutter meets the surface's leading edge; the gutter itself supplies
+        // the text's gap.
+        .pr(space::S12)
         .py(space::S4);
 
     if let Some(interaction) = &interaction {
@@ -591,6 +603,12 @@ pub(crate) fn code_view_with(
                 // Only the list's own surface starts a selection; a press on the
                 // scrollbar or the padding around it belongs to them.
                 if !bounds.contains(&event.position) {
+                    return;
+                }
+                // The gutter is pinned above the scrolling text, so a press in
+                // its strip must not select the bytes hidden beneath it.
+                let gutter = gutter_width(window, press_lines.line_count());
+                if event.position.x - bounds.left() < gutter {
                     return;
                 }
                 let at = offset_for_point(&press_lines, bounds, offset, event.position, window);
@@ -648,7 +666,9 @@ pub(crate) fn offset_for_point(
     let range = lines.row_range(index);
     let row = &lines.text[range.clone()];
     let gutter = gutter_width(window, lines.line_count());
-    let x = position.x - bounds.left() - offset.x - gutter;
+    // The gutter is pinned, so a pointer over it maps to the text hidden
+    // beneath; clamp to the first column the scrolled text actually shows.
+    let x = (position.x - bounds.left() - offset.x - gutter).max(-offset.x);
     if x <= px(0.) || row.is_empty() {
         return range.start;
     }
@@ -694,10 +714,13 @@ pub(crate) fn gutter_width(window: &mut Window, line_count: usize) -> Pixels {
 }
 
 /// One display row. The gutter carries the physical line's number on the first
-/// row of that line; continuation rows keep an empty gutter cell. A labelled
-/// view splits the row into its label and payload tones. Rows share the code
-/// role, so their heights are uniform, which is what the list requires.
-/// Highlight runs are built only here, for the rows the list actually paints.
+/// row of that line; continuation rows keep an empty gutter cell. Its width is
+/// reserved by a flow spacer, and a second copy is painted absolutely at
+/// `-offset_x` so it stays at the viewport's leading edge while the row scrolls
+/// sideways. A labelled view splits the row into its label and payload tones.
+/// Rows share the code role, so their heights are uniform, which is what the
+/// list requires. Highlight runs are built only here, for the rows the list
+/// actually paints.
 #[allow(clippy::too_many_arguments)]
 fn row(
     id: &'static str,
@@ -709,6 +732,7 @@ fn row(
     selection: SelectionPaint,
     caret: Option<(usize, Rgba)>,
     gutter: Pixels,
+    offset_x: Pixels,
     window: &mut Window,
 ) -> AnyElement {
     let selector = format!("{id}-line-{index}");
@@ -816,11 +840,13 @@ fn row(
         None => code.child(text),
     };
 
+    let row_height = resolve_type_role(type_role::CODE).line_height();
     let mut line = div()
         .debug_selector(move || selector)
+        .relative()
         .flex()
         .items_center()
-        .h(resolve_type_role(type_role::CODE).line_height());
+        .h(row_height);
     if labels.is_some() {
         // Every row of a labelled view opens or collapses the block it belongs
         // to, so the row itself is the control: the hover wash and pointer say
@@ -829,19 +855,30 @@ fn row(
             .cursor_pointer()
             .hover(|style| style.bg(theme::interaction::hover_wash()));
     }
-    line.child(
-        div()
-            .debug_selector(move || gutter_selector)
-            .flex_none()
-            .w(gutter)
-            .pr(space::S12)
-            .text_role(type_role::CODE)
-            .text_color(theme::text::tertiary())
-            .text_right()
-            .child(number),
-    )
-    .child(cell.child(code))
-    .into_any_element()
+    line.child(div().flex_none().w(gutter))
+        .child(cell.child(code))
+        // The gutter is painted twice: the spacer above reserves its width in
+        // the row, and this copy cancels the list's horizontal translation so
+        // the numbers stay at the viewport's leading edge while the code
+        // scrolls beneath it.
+        .child(
+            div()
+                .debug_selector(move || gutter_selector)
+                .absolute()
+                .top(px(0.))
+                .left(-offset_x)
+                .h(row_height)
+                .w(gutter)
+                .flex()
+                .items_center()
+                .justify_end()
+                .pr(space::S12)
+                .bg(theme::surface::input())
+                .text_role(type_role::CODE)
+                .text_color(theme::text::tertiary())
+                .child(number),
+        )
+        .into_any_element()
 }
 
 /// Splits one row into plain and highlighted runs. Returns `None` when the row

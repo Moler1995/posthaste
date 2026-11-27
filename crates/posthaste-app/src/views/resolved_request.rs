@@ -20,6 +20,7 @@ use crate::i18n::{self, Key, MessageKey};
 use crate::metrics::{TypeStyle as _, layout, space, type_role};
 use crate::theme;
 
+use super::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use super::ui;
 
 /// Paint priority among the window-level dialogs. Above the script preview and
@@ -37,20 +38,31 @@ pub(crate) fn inspector_modal(state: Entity<AppState>, app: &AppState) -> Option
     });
 
     let body: AnyElement = match result.as_ref() {
-        Some(result) => div()
-            .id("inspector-content")
-            .debug_selector(|| "inspector-content".to_owned())
-            .flex()
-            .flex_col()
-            .min_h_0()
-            .gap(layout::SECTION_GAP)
-            .overflow_y_scroll()
-            .child(request_section(result))
-            .child(headers_section(result))
-            .child(body_section(result))
-            .child(cookies_section(result))
-            .child(problems_section(result))
-            .into_any_element(),
+        Some(result) => scroll_frame(
+            state.clone(),
+            "inspector-scrollbar",
+            ScrollSource::Handle(app.inspector_scroll().clone()),
+            Scrollbars::VERTICAL,
+            div()
+                .id("inspector-content")
+                .debug_selector(|| "inspector-content".to_owned())
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap(layout::SECTION_GAP)
+                .overflow_y_scroll()
+                .track_scroll(app.inspector_scroll())
+                .child(request_section(result))
+                .child(headers_section(result))
+                .child(body_section(result))
+                .child(cookies_section(result))
+                .child(problems_section(result)),
+        )
+        .flex()
+        .flex_col()
+        .min_h_0()
+        .into_any_element(),
         None => div()
             .id("inspector-preparing")
             .debug_selector(|| "inspector-preparing".to_owned())

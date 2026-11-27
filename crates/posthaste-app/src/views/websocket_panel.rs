@@ -22,8 +22,8 @@ use std::time::Duration;
 use gpui::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement,
     IntoElement, KeyBinding, ListAlignment, ListState, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Point, Render, Rgba, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
-    WeakEntity, Window, actions, div, list, px,
+    Point, Render, Rgba, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, WeakEntity, Window, actions, div, list, point, px,
 };
 use posthaste_core::model::{HttpMethod, RequestProtocol, ResponseCookie};
 use posthaste_core::ws::{
@@ -36,6 +36,7 @@ use super::response_viewer::{
     COOKIE_STATE_WIDTH, cookie_column, cookie_column_floors, cookie_expiry, cookie_flags,
     cookie_group_header, format_bytes, scroll_drag_into_view,
 };
+use super::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use super::text_area::TextArea;
 use super::text_selection::{Drag, Granularity};
 use super::ui;
@@ -168,6 +169,9 @@ pub struct WebSocketPanel {
     /// The section the pane shows. It follows the user's tab choice until a
     /// new session starts, which returns to the messages.
     section: WsSection,
+    /// The handshake header table's scroll position, kept so its bar reads and
+    /// writes the same region the wheel moves.
+    handshake_scroll: ScrollHandle,
     /// The handshake header whose copy control shows `Copied`.
     copied_header: Option<usize>,
     /// Bumped on every copy, so an older timer cannot clear a newer label.
@@ -204,6 +208,7 @@ impl WebSocketPanel {
             payload_scrolls: HashMap::new(),
             focus: cx.focus_handle(),
             section: WsSection::Frames,
+            handshake_scroll: ScrollHandle::new(),
             copied_header: None,
             copy_generation: 0,
         }
@@ -357,6 +362,9 @@ impl WebSocketPanel {
         }
         if !self.synced || generation != self.generation {
             self.generation = generation;
+            // A new handshake is a new table; it opens at its top instead of
+            // wherever the previous session's headers were left.
+            self.handshake_scroll.set_offset(point(px(0.), px(0.)));
             self.expanded.clear();
             self.payload_selection = None;
             self.payload_scrolls.clear();
@@ -763,11 +771,11 @@ impl WebSocketPanel {
             let render_rows = rows.clone();
             let render_panel = panel.clone();
 
-            div()
+            let list_state = self.list.clone();
+            let scrolled = div()
                 .id("ws-frame-scroll")
                 .debug_selector(|| "ws-frame-scroll".to_owned())
-                .flex_1()
-                .min_h_0()
+                .size_full()
                 .overflow_hidden()
                 .rounded(radius::ROW)
                 .bg(theme::surface::input())
@@ -791,8 +799,17 @@ impl WebSocketPanel {
                     })
                     .w_full()
                     .h_full(),
-                )
-                .into_any_element()
+                );
+            scroll_frame(
+                panel.clone(),
+                "ws-frame-scrollbar",
+                ScrollSource::List(list_state),
+                Scrollbars::VERTICAL,
+                scrolled,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
         };
 
         let mut log = div().flex().flex_col().flex_1().min_h_0().gap(space::S4);
@@ -1006,17 +1023,32 @@ impl WebSocketPanel {
                     .border_l(px(2.))
                     .border_color(accent)
                     .bg(theme::surface::surface())
-                    .child(code_view_with(
-                        PAYLOAD_CHROME,
-                        "ws-payload-lines",
-                        lines,
-                        None,
-                        None,
-                        false,
-                        scroll,
-                        None,
-                        Some(interaction),
-                    )),
+                    .child(
+                        // The block is its own scrolling region: a long payload
+                        // scrolls in place instead of stretching the log, and a
+                        // wide one scrolls sideways. Both bars sit on the
+                        // block's trailing and bottom edges.
+                        scroll_frame(
+                            panel.clone(),
+                            "ws-payload-scrollbar",
+                            ScrollSource::Uniform(scroll.clone()),
+                            Scrollbars::BOTH,
+                            code_view_with(
+                                PAYLOAD_CHROME,
+                                "ws-payload-lines",
+                                lines,
+                                None,
+                                None,
+                                false,
+                                scroll,
+                                None,
+                                Some(interaction),
+                            ),
+                        )
+                        .flex()
+                        .flex_col()
+                        .size_full(),
+                    ),
             );
             if row.truncated {
                 body = body.child(
@@ -1394,15 +1426,26 @@ impl WebSocketPanel {
                 .title(i18n::t(Key::ResponseHeadersEmpty))
                 .into_any_element()
         } else {
-            div()
+            let scroller = div()
                 .id("ws-handshake-scroll")
                 .debug_selector(|| "ws-handshake-headers".to_owned())
-                .flex_1()
-                .min_h_0()
+                .size_full()
                 .overflow_y_scroll()
-                .overflow_hidden()
-                .child(card)
-                .into_any_element()
+                // `overflow_hidden` would set both axes, quietly cancelling the
+                // vertical scroll above and leaving the headers unreachable.
+                .overflow_x_hidden()
+                .track_scroll(&self.handshake_scroll)
+                .child(card);
+            scroll_frame(
+                panel.clone(),
+                "ws-handshake-scrollbar",
+                ScrollSource::Handle(self.handshake_scroll.clone()),
+                Scrollbars::VERTICAL,
+                scroller,
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
         };
 
         div()
@@ -1414,6 +1457,7 @@ impl WebSocketPanel {
             .gap(space::S8)
             .child(
                 div()
+                    .debug_selector(|| "ws-handshake-status".to_owned())
                     .flex()
                     .items_center()
                     .gap(space::S8)

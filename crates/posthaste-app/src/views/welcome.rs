@@ -25,6 +25,7 @@ use crate::history::{format_timestamp_ms, outcome_label};
 use crate::i18n::{self, Key};
 use crate::metrics::{TypeStyle as _, layout, radius, space, type_role};
 use crate::theme;
+use crate::views::scrollbar::{ScrollSource, Scrollbars, scroll_frame};
 use crate::views::{shortcuts, sidebar, ui};
 use posthaste_core::history::{HistoryEntry, HistoryOutcome};
 use posthaste_core::model::{HttpMethod, RequestId, RequestProtocol};
@@ -45,6 +46,9 @@ const BRAND_MARK: f32 = 80.;
 
 /// The welcome panel shown in place of the request/response split.
 pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
+    // The bar's wrapper outlives the content branches below, which consume the
+    // original handle to build their actions.
+    let scroll_state = state.clone();
     // A workspace that failed to load has no requests to start and no
     // collections to add, so the standing actions would only fail. The panel
     // reports why instead, and offers the recovery paths that can succeed.
@@ -99,20 +103,37 @@ pub(super) fn render(state: Entity<AppState>, app: &AppState) -> AnyElement {
         content = content.justify_center();
     }
 
-    div()
-        .id("welcome-panel")
-        .debug_selector(|| "welcome-panel".to_owned())
-        .flex_1()
-        .min_h_0()
-        .min_w(px(0.))
-        .overflow_y_scroll()
-        .bg(theme::surface::surface())
-        .rounded(radius::PANEL)
-        .flex()
-        .flex_col()
-        .items_center()
-        .child(content.child(column))
-        .into_any_element()
+    scroll_frame(
+        scroll_state,
+        "welcome-scrollbar",
+        ScrollSource::Handle(app.welcome_scroll().clone()),
+        Scrollbars::VERTICAL,
+        div()
+            .id("welcome-scroll")
+            .debug_selector(|| "welcome-scroll".to_owned())
+            .flex_1()
+            .min_h_0()
+            // The wrapper centers its child, so without this the wheel would
+            // only reach the column's own width instead of the whole panel.
+            .w_full()
+            .overflow_y_scroll()
+            .track_scroll(app.welcome_scroll())
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(content.child(column)),
+    )
+    .id("welcome-panel")
+    .debug_selector(|| "welcome-panel".to_owned())
+    .flex_1()
+    .min_h_0()
+    .min_w(px(0.))
+    .bg(theme::surface::surface())
+    .rounded(radius::PANEL)
+    .flex()
+    .flex_col()
+    .items_center()
+    .into_any_element()
 }
 
 /// The panel's opening, centred as one block: the brand mark, the title and its

@@ -112,7 +112,7 @@ impl RequestEditor {
                 .flex_col()
                 .child(body_area)
                 .into_any_element(),
-            _ => tab_scroll_region(body_area).into_any_element(),
+            _ => tab_scroll_region(editor.clone(), &self.tab_scroll, body_area).into_any_element(),
         };
 
         // The mode row is the body tab's toolbar: it stays put while the
